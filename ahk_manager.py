@@ -165,13 +165,15 @@ class TemplatePlaceholder:
 class RenderedExpansion:
     lines: list[str]
     needs_select_helper: bool = False
+    needs_image_helper: bool = False
 
 
 SECTION_RE = re.compile(r"^\s*;\s*=+\s*(?P<section>.*?)\s*=+\s*$")
 HOTSTRING_RE = re.compile(r"^\s*(?P<disabled>;\s*)?:(?P<options>[^:]*)?:(?P<trigger>[^:\s][^:]*)::(?P<replacement>.*)$")
-PLACEHOLDER_RE = re.compile(r"\{(AHK_EXPR|AHK_INPUT|AHK_SELECT):([^{}]*)\}")
-PLACEHOLDER_START_RE = re.compile(r"\{AHK_(?:EXPR|INPUT|SELECT):")
+PLACEHOLDER_RE = re.compile(r"\{(AHK_EXPR|AHK_INPUT|AHK_SELECT|AHK_KEY|AHK_IMAGE):([^{}]*)\}")
+PLACEHOLDER_START_RE = re.compile(r"\{AHK_(?:EXPR|INPUT|SELECT|KEY|IMAGE):")
 VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SUPPORTED_KEYS = {"Tab"}
 
 
 def import_ahk(path: Path) -> ExpansionStore:
@@ -281,6 +283,7 @@ def render_ahk(store: ExpansionStore) -> str:
     ]
     rendered_sections: list[tuple[str, list[RenderedExpansion]]] = []
     needs_select_helper = False
+    needs_image_helper = False
 
     for section in store.sections:
         rendered_expansions = [
@@ -292,9 +295,15 @@ def render_ahk(store: ExpansionStore) -> str:
         needs_select_helper = needs_select_helper or any(
             item.needs_select_helper for item in rendered_expansions
         )
+        needs_image_helper = needs_image_helper or any(
+            item.needs_image_helper for item in rendered_expansions
+        )
 
     if needs_select_helper:
         lines.extend(_select_helper_lines())
+        lines.append("")
+    if needs_image_helper:
+        lines.extend(_image_helper_lines())
         lines.append("")
 
     for section, rendered_expansions in rendered_sections:
@@ -321,6 +330,13 @@ def render_expansion(expansion: Expansion) -> RenderedExpansion:
     lines = [f"::{expansion.trigger}::", "{"]
     lines.append("    __tem_result := \"\"")
     needs_select_helper = False
+    needs_image_helper = False
+
+    def flush_result() -> None:
+        lines.append("    if (__tem_result != \"\") {")
+        lines.append("        SendText(__tem_result)")
+        lines.append("        __tem_result := \"\"")
+        lines.append("    }")
 
     for segment in segments:
         if isinstance(segment, str):
@@ -346,11 +362,26 @@ def render_expansion(expansion: Expansion) -> RenderedExpansion:
             lines.append(f"    {variable} := __tem_select_{variable}.value")
             lines.append(f"    __tem_result .= {variable}")
             needs_select_helper = True
+        elif segment.kind == "AHK_KEY":
+            key_name = segment.value
+            flush_result()
+            lines.append(f"    Send(\"{{{key_name}}}\")")
+        elif segment.kind == "AHK_IMAGE":
+            image_path = segment.value
+            flush_result()
+            lines.append(f"    if (!TEM_PasteImage({_ahk_string(image_path)}))")
+            lines.append("        return")
+            needs_image_helper = True
 
-    lines.extend(["    SendText(__tem_result)", "}"])
+    flush_result()
+    lines.append("}")
     if expansion.notes:
         lines.append(f"; Notes: {expansion.notes}")
-    return RenderedExpansion(_maybe_disable_lines(lines, expansion.enabled), needs_select_helper)
+    return RenderedExpansion(
+        _maybe_disable_lines(lines, expansion.enabled),
+        needs_select_helper,
+        needs_image_helper,
+    )
 
 
 def validate_store_placeholders(store: ExpansionStore) -> None:
@@ -418,6 +449,22 @@ def _parse_placeholder(kind: str, body: str) -> TemplatePlaceholder:
             raise ValueError("AHK_SELECT requires at least one option.")
         return TemplatePlaceholder(kind, body, [variable, prompt, title, *options])
 
+    if kind == "AHK_KEY":
+        key_name = body.strip()
+        if not key_name:
+            raise ValueError("AHK_KEY requires a key name.")
+        if key_name not in SUPPORTED_KEYS:
+            raise ValueError("AHK_KEY currently supports only Tab.")
+        return TemplatePlaceholder(kind, key_name, [])
+
+    if kind == "AHK_IMAGE":
+        image_path = body.strip()
+        if not image_path:
+            raise ValueError("AHK_IMAGE requires an image file path.")
+        if any(char in image_path for char in "{}"):
+            raise ValueError("AHK_IMAGE path cannot contain braces.")
+        return TemplatePlaceholder(kind, image_path, [])
+
     raise ValueError(f"Unsupported placeholder type {kind}.")
 
 
@@ -469,6 +516,33 @@ def _select_helper_lines() -> list[str]:
         "    guiHwnd := selectGui.Hwnd",
         "    WinWaitClose(\"ahk_id \" guiHwnd)",
         "    return result",
+        "}",
+    ]
+
+
+def _image_helper_lines() -> list[str]:
+    return [
+        "TEM_PasteImage(imagePath) {",
+        "    if (!FileExist(imagePath)) {",
+        "        MsgBox(\"Image file not found:``n\" imagePath, \"Image placeholder\")",
+        "        return false",
+        "    }",
+        "    psPath := A_Temp \"\\tem_clip_image_\" A_TickCount \".ps1\"",
+        "    psScript := \"param([string]$Path)\" \"`n\"",
+        "        . \"Add-Type -AssemblyName System.Windows.Forms\" \"`n\"",
+        "        . \"Add-Type -AssemblyName System.Drawing\" \"`n\"",
+        "        . \"$img = [System.Drawing.Image]::FromFile($Path)\" \"`n\"",
+        "        . \"[System.Windows.Forms.Clipboard]::SetImage($img)\" \"`n\"",
+        "        . \"$img.Dispose()\" \"`n\"",
+        "    FileAppend(psScript, psPath, \"UTF-8\")",
+        "    exitCode := RunWait('powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File \"' psPath '\" \"' imagePath '\"', , \"Hide\")",
+        "    FileDelete(psPath)",
+        "    if (exitCode != 0) {",
+        "        MsgBox(\"Could not place image on clipboard:``n\" imagePath, \"Image placeholder\")",
+        "        return false",
+        "    }",
+        "    Send(\"^v\")",
+        "    return true",
         "}",
     ]
 

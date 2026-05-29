@@ -1,6 +1,6 @@
 import unittest
 
-from ahk_manager import Expansion, ExpansionStore, render_ahk
+from ahk_manager import Expansion, ExpansionStore, parse_replacement_template, render_ahk
 
 
 class PlaceholderGenerationTests(unittest.TestCase):
@@ -80,6 +80,63 @@ class PlaceholderGenerationTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "AHK_INPUT must use"):
+            render_ahk(store)
+
+    def test_tab_placeholder_parses(self) -> None:
+        segments = parse_replacement_template("A{AHK_KEY:Tab}B")
+
+        self.assertEqual(segments[1].kind, "AHK_KEY")
+        self.assertEqual(segments[1].value, "Tab")
+
+    def test_tab_placeholder_generates_dynamic_hotstring(self) -> None:
+        store = ExpansionStore(
+            sections=["Keys"],
+            expansions=[Expansion("Keys", "tabbed", "Left{AHK_KEY:Tab}Right")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn("::tabbed::\n{", output)
+        self.assertIn('Send("{Tab}")', output)
+        self.assertIn('__tem_result .= "Left"', output)
+        self.assertIn('__tem_result .= "Right"', output)
+        self.assertNotIn("::tabbed::Left", output)
+
+    def test_unsupported_key_raises_clear_error(self) -> None:
+        store = ExpansionStore(
+            sections=["Keys"],
+            expansions=[Expansion("Keys", "badkey", "{AHK_KEY:Enter}")],
+        )
+
+        with self.assertRaisesRegex(ValueError, "supports only Tab"):
+            render_ahk(store)
+
+    def test_image_placeholder_parses(self) -> None:
+        segments = parse_replacement_template(r"{AHK_IMAGE:C:\Users\Scott\Pictures\logo.png}")
+
+        self.assertEqual(segments[0].kind, "AHK_IMAGE")
+        self.assertEqual(segments[0].value, r"C:\Users\Scott\Pictures\logo.png")
+
+    def test_image_placeholder_generates_clipboard_paste_logic(self) -> None:
+        store = ExpansionStore(
+            sections=["Images"],
+            expansions=[Expansion("Images", "logo", r"Logo: {AHK_IMAGE:C:\Images\logo.png}")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn("TEM_PasteImage(imagePath)", output)
+        self.assertIn('if (!TEM_PasteImage("C:\\Images\\logo.png"))', output)
+        self.assertIn('MsgBox("Image file not found:', output)
+        self.assertIn('Send("^v")', output)
+
+    def test_empty_image_placeholder_raises_clear_error(self) -> None:
+        store = ExpansionStore(
+            sections=["Images"],
+            expansions=[Expansion("Images", "badimage", "{AHK_IMAGE:}")],
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires an image file path"):
             render_ahk(store)
 
 
