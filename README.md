@@ -106,6 +106,43 @@ The fields are:
 
 The generated AutoHotkey script includes a small selection GUI only when a list selection placeholder is used.
 
+### Tab
+
+Use **Insert Tab** to insert a Tab keystroke at that point in the expansion:
+
+```text
+First column{AHK_KEY:Tab}Second column
+```
+
+For now, `AHK_KEY` supports only:
+
+```text
+{AHK_KEY:Tab}
+```
+
+Any expansion containing `AHK_KEY` is generated as a dynamic multi-line hotstring.
+
+### Image
+
+Use **Insert Image** to choose an image file and insert an image placeholder:
+
+```text
+{AHK_IMAGE:C:\Users\Scott\Pictures\logo.png}
+```
+
+Supported file types in the chooser:
+
+- `.png`
+- `.jpg`
+- `.jpeg`
+- `.gif`
+- `.bmp`
+- `.webp`
+
+Image files are stored as file paths only. The image binary is not embedded in `expansions.json`. Moving, renaming, or deleting the image file will break that placeholder until the path is updated.
+
+Image insertion is implemented as a clipboard paste helper in the generated AutoHotkey v2 script. It checks that the file exists, uses PowerShell/.NET to place the image on the Windows clipboard, then sends `Ctrl+V`. This works best in rich-text targets that accept pasted images, such as Word, Outlook, Teams, or browser editors. Plain text editors such as Notepad cannot accept pasted images.
+
 ## Import an existing `.ahk` file
 
 Use **Import .ahk** to parse basic section comments and single-line hotstrings like:
