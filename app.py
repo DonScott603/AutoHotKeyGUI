@@ -14,11 +14,18 @@ from ahk_manager import (
     AppSettings,
     Expansion,
     ExpansionStore,
+    TemplateDef,
+    VariableDef,
+    VARIABLE_TYPES,
     count_import_conflicts,
     generate_ahk,
     import_ahk,
     merge_imported_store,
     parse_replacement_template,
+    resolve_template_segments,
+    resolve_variable_segments,
+    validate_template,
+    validate_variable,
 )
 
 
@@ -48,6 +55,8 @@ TEMPLATE_ACTION_BUTTON_WIDTHS = {
     "Insert List Selection": 19,
     "Insert Tab": 17,
     "Insert Image": 17,
+    "Insert Variable": 17,
+    "Insert Template": 17,
 }
 
 
@@ -291,6 +300,36 @@ class SelectPlaceholderDialog(simpledialog.Dialog):
         )
 
 
+class LibrarySelectionDialog(simpledialog.Dialog):
+    def __init__(self, parent: tk.Tk, title: str, items: list[str]) -> None:
+        self.items = items
+        self.result: str | None = None
+        self.listbox: tk.Listbox | None = None
+        super().__init__(parent, title)
+
+    def body(self, master: tk.Frame) -> tk.Widget:
+        master.columnconfigure(0, weight=1)
+        master.rowconfigure(0, weight=1)
+        self.listbox = tk.Listbox(master, height=10, width=42, exportselection=False)
+        self.listbox.grid(row=0, column=0, sticky="nsew")
+        for item in self.items:
+            self.listbox.insert(tk.END, item)
+        if self.items:
+            self.listbox.selection_set(0)
+        self.listbox.bind("<Double-1>", lambda _event: self.ok())
+        return self.listbox
+
+    def validate(self) -> bool:
+        if self.listbox is None or not self.listbox.curselection():
+            messagebox.showerror("Selection", "Select an item first.", parent=self)
+            return False
+        return True
+
+    def apply(self) -> None:
+        if self.listbox is not None and self.listbox.curselection():
+            self.result = self.listbox.get(self.listbox.curselection()[0])
+
+
 class ExpansionApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -310,6 +349,14 @@ class ExpansionApp(tk.Tk):
         self.enabled_var = tk.BooleanVar(value=True)
         self.ahk_path_var = tk.StringVar(value=self.settings.generated_ahk_path)
         self.status_var = tk.StringVar(value="Ready.")
+        self.current_variable: VariableDef | None = None
+        self.variable_name_var = tk.StringVar()
+        self.variable_type_var = tk.StringVar(value="text_input")
+        self.variable_prompt_var = tk.StringVar()
+        self.variable_default_var = tk.StringVar()
+        self.current_template: TemplateDef | None = None
+        self.template_name_var = tk.StringVar()
+        self.template_description_var = tk.StringVar()
 
         self._build_ui()
         self.refresh_sections()
@@ -333,7 +380,18 @@ class ExpansionApp(tk.Tk):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        notebook = ttk.Notebook(self)
+        notebook.grid(row=0, column=0, sticky="nsew")
+        expansions_tab = ttk.Frame(notebook)
+        variables_tab = ttk.Frame(notebook, padding=8)
+        templates_tab = ttk.Frame(notebook, padding=8)
+        notebook.add(expansions_tab, text="Expansions")
+        notebook.add(variables_tab, text="Variables")
+        notebook.add(templates_tab, text="Templates")
+        expansions_tab.columnconfigure(0, weight=1)
+        expansions_tab.rowconfigure(0, weight=1)
+
+        paned = ttk.PanedWindow(expansions_tab, orient=tk.HORIZONTAL)
         paned.grid(row=0, column=0, sticky="nsew")
 
         left = ttk.Frame(paned, padding=8)
@@ -355,6 +413,8 @@ class ExpansionApp(tk.Tk):
         self._build_sections(left)
         self._build_table(center)
         self._build_form(right)
+        self._build_variables_tab(variables_tab)
+        self._build_templates_tab(templates_tab)
 
         self._build_output_settings(self)
 
@@ -465,11 +525,7 @@ class ExpansionApp(tk.Tk):
         ttk.Label(parent, text="Replacement text").grid(row=5, column=0, sticky="sw", pady=(12, 2))
         template_actions = ttk.Frame(parent)
         template_actions.grid(row=6, column=0, sticky="ew", pady=(0, 4))
-        self._template_action_button(template_actions, "Insert Date/Time", self.insert_date_time).grid(row=0, column=0, padx=(0, 4), pady=(0, 4), sticky="w")
-        self._template_action_button(template_actions, "Insert Input Box", self.insert_input_box).grid(row=0, column=1, padx=4, pady=(0, 4), sticky="w")
-        self._template_action_button(template_actions, "Insert List Selection", self.insert_list_selection).grid(row=1, column=0, padx=(0, 4), pady=(0, 4), sticky="w")
-        self._template_action_button(template_actions, "Insert Tab", self.insert_tab).grid(row=1, column=1, padx=4, pady=(0, 4), sticky="w")
-        self._template_action_button(template_actions, "Insert Image", self.insert_image).grid(row=2, column=0, padx=(0, 4), sticky="w")
+        self._build_insertion_toolbar(template_actions, lambda: self.replacement_text)
 
         self.replacement_text = tk.Text(parent, height=10, wrap=tk.WORD, undo=True)
         self.replacement_text.grid(row=7, column=0, sticky="nsew")
@@ -492,6 +548,113 @@ class ExpansionApp(tk.Tk):
             width=TEMPLATE_ACTION_BUTTON_WIDTHS[text],
             command=command,
         )
+
+    def _build_insertion_toolbar(self, parent: ttk.Frame, target_getter: object) -> None:
+        actions = [
+            ("Insert Date/Time", self.insert_date_time),
+            ("Insert Input Box", self.insert_input_box),
+            ("Insert List Selection", self.insert_list_selection),
+            ("Insert Tab", self.insert_tab),
+            ("Insert Image", self.insert_image),
+            ("Insert Variable", self.insert_variable),
+            ("Insert Template", self.insert_template),
+        ]
+        for index, (text, command) in enumerate(actions):
+            row = index // 2
+            column = index % 2
+            self._template_action_button(
+                parent,
+                text,
+                lambda command=command, target_getter=target_getter: command(target_getter()),
+            ).grid(
+                row=row,
+                column=column,
+                padx=(0, 4) if column == 0 else 4,
+                pady=(0, 4) if row < 3 else (4, 0),
+                sticky="w",
+            )
+
+    def _build_variables_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=2)
+        parent.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(parent)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+        self.variable_tree = ttk.Treeview(left, columns=("type", "prompt"), show="headings", selectmode="browse")
+        self.variable_tree.heading("type", text="Type")
+        self.variable_tree.heading("prompt", text="Prompt")
+        self.variable_tree.column("type", width=110, stretch=False)
+        self.variable_tree.column("prompt", width=220)
+        self.variable_tree.grid(row=0, column=0, sticky="nsew")
+        self.variable_tree.bind("<<TreeviewSelect>>", self.on_variable_select)
+        var_actions = ttk.Frame(left)
+        var_actions.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(var_actions, text="New", width=8, command=self.new_variable).pack(side=tk.LEFT)
+        ttk.Button(var_actions, text="Delete", width=10, command=self.delete_variable).pack(side=tk.LEFT, padx=4)
+
+        form = ttk.Frame(parent)
+        form.grid(row=0, column=1, sticky="nsew")
+        form.columnconfigure(1, weight=1)
+        form.rowconfigure(5, weight=1)
+        ttk.Label(form, text="Name").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(form, textvariable=self.variable_name_var).grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Label(form, text="Type").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(form, textvariable=self.variable_type_var, values=sorted(VARIABLE_TYPES), state="readonly").grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Label(form, text="Prompt text").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(form, textvariable=self.variable_prompt_var).grid(row=2, column=1, sticky="ew", pady=4)
+        ttk.Label(form, text="Default/format").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(form, textvariable=self.variable_default_var).grid(row=3, column=1, sticky="ew", pady=4)
+        ttk.Label(form, text="List options").grid(row=4, column=0, sticky="nw", padx=(0, 8), pady=4)
+        self.variable_options_text = tk.Text(form, height=6, wrap=tk.WORD)
+        self.variable_options_text.grid(row=4, column=1, sticky="ew", pady=4)
+        ttk.Label(form, text="Notes").grid(row=5, column=0, sticky="nw", padx=(0, 8), pady=4)
+        self.variable_notes_text = tk.Text(form, height=6, wrap=tk.WORD)
+        self.variable_notes_text.grid(row=5, column=1, sticky="nsew", pady=4)
+        ttk.Button(form, text="Apply Variable", command=self.apply_variable).grid(row=6, column=1, sticky="w", pady=(8, 0))
+        self.refresh_variables()
+
+    def _build_templates_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=2)
+        parent.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(parent)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+        self.template_tree = ttk.Treeview(left, columns=("description",), show="headings", selectmode="browse")
+        self.template_tree.heading("description", text="Description")
+        self.template_tree.column("description", width=260)
+        self.template_tree.grid(row=0, column=0, sticky="nsew")
+        self.template_tree.bind("<<TreeviewSelect>>", self.on_template_select)
+        template_actions = ttk.Frame(left)
+        template_actions.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(template_actions, text="New", width=8, command=self.new_template).pack(side=tk.LEFT)
+        ttk.Button(template_actions, text="Duplicate", width=10, command=self.duplicate_template).pack(side=tk.LEFT, padx=4)
+        ttk.Button(template_actions, text="Delete", width=10, command=self.delete_template).pack(side=tk.LEFT, padx=4)
+
+        form = ttk.Frame(parent)
+        form.grid(row=0, column=1, sticky="nsew")
+        form.columnconfigure(1, weight=1)
+        form.rowconfigure(3, weight=1)
+        ttk.Label(form, text="Name").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(form, textvariable=self.template_name_var).grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Label(form, text="Description").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(form, textvariable=self.template_description_var).grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Label(form, text="Body").grid(row=2, column=0, sticky="nw", padx=(0, 8), pady=4)
+        body_actions = ttk.Frame(form)
+        body_actions.grid(row=2, column=1, sticky="nw", pady=(0, 4))
+        self._build_insertion_toolbar(body_actions, lambda: self.template_body_text)
+        self.template_body_text = tk.Text(form, height=12, wrap=tk.WORD)
+        self.template_body_text.grid(row=3, column=1, sticky="nsew", pady=4)
+        ttk.Label(form, text="Notes").grid(row=4, column=0, sticky="nw", padx=(0, 8), pady=4)
+        self.template_notes_text = tk.Text(form, height=5, wrap=tk.WORD)
+        self.template_notes_text.grid(row=4, column=1, sticky="ew", pady=4)
+        ttk.Button(form, text="Apply Template", command=self.apply_template).grid(row=5, column=1, sticky="w", pady=(8, 0))
+        self.refresh_templates()
 
     def refresh_sections(self) -> None:
         self.section_list.delete(0, tk.END)
@@ -533,6 +696,198 @@ class ExpansionApp(tk.Tk):
         self.duplicate_label.configure(
             text=f"Duplicate trigger groups: {duplicate_count}" if duplicate_count else ""
         )
+
+    def refresh_variables(self) -> None:
+        if not hasattr(self, "variable_tree"):
+            return
+        for item in self.variable_tree.get_children():
+            self.variable_tree.delete(item)
+        for index, variable in enumerate(self.store.variables):
+            self.variable_tree.insert("", tk.END, iid=str(index), values=(variable.type, variable.prompt_text))
+
+    def refresh_templates(self) -> None:
+        if not hasattr(self, "template_tree"):
+            return
+        for item in self.template_tree.get_children():
+            self.template_tree.delete(item)
+        for index, template in enumerate(self.store.templates):
+            self.template_tree.insert("", tk.END, iid=str(index), values=(template.description,))
+
+    def on_variable_select(self, _event: tk.Event) -> None:
+        selection = self.variable_tree.selection()
+        if not selection:
+            return
+        variable = self.store.variables[int(selection[0])]
+        self.current_variable = variable
+        self.variable_name_var.set(variable.name)
+        self.variable_type_var.set(variable.type)
+        self.variable_prompt_var.set(variable.prompt_text)
+        self.variable_default_var.set(variable.default_value)
+        self.variable_options_text.delete("1.0", tk.END)
+        self.variable_options_text.insert("1.0", "\n".join(variable.list_options))
+        self.variable_notes_text.delete("1.0", tk.END)
+        self.variable_notes_text.insert("1.0", variable.notes)
+
+    def on_template_select(self, _event: tk.Event) -> None:
+        selection = self.template_tree.selection()
+        if not selection:
+            return
+        template = self.store.templates[int(selection[0])]
+        self.current_template = template
+        self.template_name_var.set(template.name)
+        self.template_description_var.set(template.description)
+        self.template_body_text.delete("1.0", tk.END)
+        self.template_body_text.insert("1.0", template.body)
+        self.template_notes_text.delete("1.0", tk.END)
+        self.template_notes_text.insert("1.0", template.notes)
+
+    def new_variable(self) -> None:
+        self.current_variable = None
+        self.variable_name_var.set("")
+        self.variable_type_var.set("text_input")
+        self.variable_prompt_var.set("")
+        self.variable_default_var.set("")
+        self.variable_options_text.delete("1.0", tk.END)
+        self.variable_notes_text.delete("1.0", tk.END)
+
+    def new_template(self) -> None:
+        self.current_template = None
+        self.template_name_var.set("")
+        self.template_description_var.set("")
+        self.template_body_text.delete("1.0", tk.END)
+        self.template_notes_text.delete("1.0", tk.END)
+
+    def read_variable_form(self) -> VariableDef:
+        variable = VariableDef(
+            name=self.variable_name_var.get().strip(),
+            type=self.variable_type_var.get().strip(),
+            prompt_text=self.variable_prompt_var.get().strip(),
+            default_value=self.variable_default_var.get().strip(),
+            list_options=[
+                line.strip()
+                for line in self.variable_options_text.get("1.0", "end-1c").splitlines()
+                if line.strip()
+            ],
+            notes=self.variable_notes_text.get("1.0", "end-1c").strip(),
+        )
+        validate_variable(variable)
+        return variable
+
+    def read_template_form(self) -> TemplateDef:
+        template = TemplateDef(
+            name=self.template_name_var.get().strip(),
+            description=self.template_description_var.get().strip(),
+            body=self.template_body_text.get("1.0", "end-1c"),
+            notes=self.template_notes_text.get("1.0", "end-1c").strip(),
+        )
+        validate_template(template)
+        parse_replacement_template(template.body)
+        return template
+
+    def apply_variable(self) -> None:
+        try:
+            variable = self.read_variable_form()
+            self.ensure_unique_variable_name(variable.name, self.current_variable)
+        except ValueError as exc:
+            messagebox.showerror("Variable error", str(exc))
+            return
+        if self.current_variable is None:
+            self.store.variables.append(variable)
+            self.current_variable = variable
+        else:
+            self.current_variable.name = variable.name
+            self.current_variable.type = variable.type
+            self.current_variable.prompt_text = variable.prompt_text
+            self.current_variable.default_value = variable.default_value
+            self.current_variable.list_options = variable.list_options
+            self.current_variable.notes = variable.notes
+        self.refresh_variables()
+        self.set_status(f'Saved variable "{variable.name}".')
+
+    def apply_template(self) -> None:
+        try:
+            template = self.read_template_form()
+            self.ensure_unique_template_name(template.name, self.current_template)
+            candidate_templates = [
+                template if item is self.current_template else item
+                for item in self.store.templates
+            ]
+            if self.current_template is None:
+                candidate_templates.append(template)
+            segments = resolve_template_segments(
+                parse_replacement_template(template.body),
+                candidate_templates,
+                stack=(template.name,),
+            )
+            resolve_variable_segments(segments, self.store.variables)
+        except ValueError as exc:
+            messagebox.showerror("Template error", str(exc))
+            return
+        if self.current_template is None:
+            self.store.templates.append(template)
+            self.current_template = template
+        else:
+            self.current_template.name = template.name
+            self.current_template.description = template.description
+            self.current_template.body = template.body
+            self.current_template.notes = template.notes
+        self.refresh_templates()
+        self.set_status(f'Saved template "{template.name}".')
+
+    def ensure_unique_variable_name(self, name: str, current: VariableDef | None) -> None:
+        for variable in self.store.variables:
+            if variable is not current and variable.name == name:
+                raise ValueError(f'Duplicate variable name "{name}".')
+
+    def ensure_unique_template_name(self, name: str, current: TemplateDef | None) -> None:
+        for template in self.store.templates:
+            if template is not current and template.name == name:
+                raise ValueError(f'Duplicate template name "{name}".')
+
+    def delete_variable(self) -> None:
+        selection = self.variable_tree.selection()
+        if not selection:
+            messagebox.showinfo("Delete variable", "Select a variable first.")
+            return
+        variable = self.store.variables[int(selection[0])]
+        if not messagebox.askyesno("Delete variable", f'Delete variable "{variable.name}"?'):
+            return
+        self.store.variables.remove(variable)
+        self.current_variable = None
+        self.new_variable()
+        self.refresh_variables()
+
+    def delete_template(self) -> None:
+        selection = self.template_tree.selection()
+        if not selection:
+            messagebox.showinfo("Delete template", "Select a template first.")
+            return
+        template = self.store.templates[int(selection[0])]
+        if not messagebox.askyesno("Delete template", f'Delete template "{template.name}"?'):
+            return
+        self.store.templates.remove(template)
+        self.current_template = None
+        self.new_template()
+        self.refresh_templates()
+
+    def duplicate_template(self) -> None:
+        selection = self.template_tree.selection()
+        if not selection:
+            messagebox.showinfo("Duplicate template", "Select a template first.")
+            return
+        template = self.store.templates[int(selection[0])]
+        base_name = f"{template.name} Copy"
+        name = base_name
+        suffix = 2
+        while self.store.template_by_name(name):
+            name = f"{base_name} {suffix}"
+            suffix += 1
+        copy = TemplateDef(name, template.description, template.body, template.notes)
+        self.store.templates.append(copy)
+        self.current_template = copy
+        self.refresh_templates()
+        self.template_tree.selection_set(str(len(self.store.templates) - 1))
+        self.on_template_select(None)
 
     def _matches_filter(self, expansion: Expansion, section: str, query: str) -> bool:
         if expansion.section != section:
@@ -628,36 +983,58 @@ class ExpansionApp(tk.Tk):
         self.notes_text.delete("1.0", tk.END)
         self.notes_text.insert("1.0", expansion.notes)
 
-    def insert_date_time(self) -> None:
+    def insert_date_time(self, target: tk.Text | None = None) -> None:
         dialog = DateTimeDialog(self)
         if dialog.result:
-            self.insert_replacement_snippet(dialog.result)
+            self.insert_snippet(dialog.result, target)
 
-    def insert_input_box(self) -> None:
+    def insert_input_box(self, target: tk.Text | None = None) -> None:
         dialog = InputPlaceholderDialog(self)
         if dialog.result:
-            self.insert_replacement_snippet(dialog.result)
+            self.insert_snippet(dialog.result, target)
 
-    def insert_list_selection(self) -> None:
+    def insert_list_selection(self, target: tk.Text | None = None) -> None:
         dialog = SelectPlaceholderDialog(self)
         if dialog.result:
-            self.insert_replacement_snippet(dialog.result)
+            self.insert_snippet(dialog.result, target)
 
-    def insert_tab(self) -> None:
-        self.insert_replacement_snippet("{AHK_KEY:Tab}")
+    def insert_tab(self, target: tk.Text | None = None) -> None:
+        self.insert_snippet("{AHK_KEY:Tab}", target)
 
-    def insert_image(self) -> None:
+    def insert_image(self, target: tk.Text | None = None) -> None:
         file_path = filedialog.askopenfilename(
             title="Choose image to insert",
             filetypes=IMAGE_FILE_TYPES,
         )
         if not file_path:
             return
-        self.insert_replacement_snippet(f"{{AHK_IMAGE:{file_path}}}")
+        self.insert_snippet(f"{{AHK_IMAGE:{file_path}}}", target)
+
+    def insert_variable(self, target: tk.Text | None = None) -> None:
+        names = [variable.name for variable in self.store.variables]
+        if not names:
+            messagebox.showinfo("Insert Variable", "Create a variable first.")
+            return
+        dialog = LibrarySelectionDialog(self, "Insert Variable", names)
+        if dialog.result:
+            self.insert_snippet(f"{{VAR:{dialog.result}}}", target)
+
+    def insert_template(self, target: tk.Text | None = None) -> None:
+        names = [template.name for template in self.store.templates]
+        if not names:
+            messagebox.showinfo("Insert Template", "Create a template first.")
+            return
+        dialog = LibrarySelectionDialog(self, "Insert Template", names)
+        if dialog.result:
+            self.insert_snippet(f"{{TPL:{dialog.result}}}", target)
 
     def insert_replacement_snippet(self, snippet: str) -> None:
-        self.replacement_text.insert(tk.INSERT, snippet)
-        self.replacement_text.focus_set()
+        self.insert_snippet(snippet, self.replacement_text)
+
+    def insert_snippet(self, snippet: str, target: tk.Text | None = None) -> None:
+        target = target or self.replacement_text
+        target.insert(tk.INSERT, snippet)
+        target.focus_set()
 
     def apply_form(self) -> None:
         try:
@@ -698,7 +1075,8 @@ class ExpansionApp(tk.Tk):
         if not replacement:
             raise ValueError("Replacement text cannot be blank.")
         try:
-            parse_replacement_template(replacement)
+            segments = resolve_template_segments(parse_replacement_template(replacement), self.store.templates)
+            resolve_variable_segments(segments, self.store.variables)
         except ValueError as exc:
             raise ValueError(f"Replacement placeholder is invalid: {exc}") from exc
 

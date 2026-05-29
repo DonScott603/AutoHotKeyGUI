@@ -65,9 +65,72 @@ class Expansion:
 
 
 @dataclass
+class VariableDef:
+    name: str
+    type: str
+    prompt_text: str = ""
+    default_value: str = ""
+    list_options: list[str] = field(default_factory=list)
+    notes: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "VariableDef":
+        options = data.get("list_options", [])
+        if isinstance(options, str):
+            options = [line.strip() for line in options.splitlines() if line.strip()]
+        if not isinstance(options, list):
+            options = []
+        return cls(
+            name=str(data.get("name") or "").strip(),
+            type=str(data.get("type") or "text_input").strip(),
+            prompt_text=str(data.get("prompt_text") or ""),
+            default_value=str(data.get("default_value") or ""),
+            list_options=[str(option).strip() for option in options if str(option).strip()],
+            notes=str(data.get("notes") or ""),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "type": self.type,
+            "prompt_text": self.prompt_text,
+            "default_value": self.default_value,
+            "list_options": self.list_options,
+            "notes": self.notes,
+        }
+
+
+@dataclass
+class TemplateDef:
+    name: str
+    description: str = ""
+    body: str = ""
+    notes: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TemplateDef":
+        return cls(
+            name=str(data.get("name") or "").strip(),
+            description=str(data.get("description") or ""),
+            body=str(data.get("body") or ""),
+            notes=str(data.get("notes") or ""),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "body": self.body,
+            "notes": self.notes,
+        }
+
+
+@dataclass
 class ExpansionStore:
     sections: list[str] = field(default_factory=lambda: ["General"])
     expansions: list[Expansion] = field(default_factory=list)
+    variables: list[VariableDef] = field(default_factory=list)
+    templates: list[TemplateDef] = field(default_factory=list)
 
     @classmethod
     def load(cls, path: Path) -> "ExpansionStore":
@@ -86,17 +149,29 @@ class ExpansionStore:
             for item in data.get("expansions", [])
             if isinstance(item, dict)
         ]
+        variables = [
+            VariableDef.from_dict(item)
+            for item in data.get("variables", [])
+            if isinstance(item, dict)
+        ]
+        templates = [
+            TemplateDef.from_dict(item)
+            for item in data.get("templates", [])
+            if isinstance(item, dict)
+        ]
 
         for expansion in expansions:
             if expansion.section not in sections:
                 sections.append(expansion.section)
 
-        return cls(sections or ["General"], expansions)
+        return cls(sections or ["General"], expansions, variables, templates)
 
     def save(self, path: Path) -> None:
         data = {
             "sections": self.sections,
             "expansions": [expansion.to_dict() for expansion in self.expansions],
+            "variables": [variable.to_dict() for variable in self.variables],
+            "templates": [template.to_dict() for template in self.templates],
         }
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -141,6 +216,32 @@ class ExpansionStore:
             if len(matches) > 1
         }
 
+    def variable_by_name(self, name: str) -> VariableDef | None:
+        for variable in self.variables:
+            if variable.name == name:
+                return variable
+        return None
+
+    def template_by_name(self, name: str) -> TemplateDef | None:
+        for template in self.templates:
+            if template.name == name:
+                return template
+        return None
+
+    def duplicate_variable_names(self) -> dict[str, list[VariableDef]]:
+        grouped: dict[str, list[VariableDef]] = {}
+        for variable in self.variables:
+            if variable.name:
+                grouped.setdefault(variable.name, []).append(variable)
+        return {name: matches for name, matches in grouped.items() if len(matches) > 1}
+
+    def duplicate_template_names(self) -> dict[str, list[TemplateDef]]:
+        grouped: dict[str, list[TemplateDef]] = {}
+        for template in self.templates:
+            if template.name:
+                grouped.setdefault(template.name, []).append(template)
+        return {name: matches for name, matches in grouped.items() if len(matches) > 1}
+
 
 @dataclass
 class ImportMergeResult:
@@ -171,11 +272,12 @@ class RenderedExpansion:
 
 SECTION_RE = re.compile(r"^\s*;\s*=+\s*(?P<section>.*?)\s*=+\s*$")
 HOTSTRING_RE = re.compile(r"^\s*(?P<disabled>;\s*)?:(?P<options>[^:]*)?:(?P<trigger>[^:\s][^:]*)::(?P<replacement>.*)$")
-PLACEHOLDER_RE = re.compile(r"\{(AHK_EXPR|AHK_INPUT|AHK_SELECT|AHK_KEY|AHK_IMAGE):([^{}]*)\}")
-PLACEHOLDER_START_RE = re.compile(r"\{AHK_(?:EXPR|INPUT|SELECT|KEY|IMAGE):")
+PLACEHOLDER_RE = re.compile(r"\{(AHK_EXPR|AHK_INPUT|AHK_SELECT|AHK_KEY|AHK_IMAGE|VAR|TPL):([^{}]*)\}")
+PLACEHOLDER_START_RE = re.compile(r"\{(?:AHK_(?:EXPR|INPUT|SELECT|KEY|IMAGE)|VAR|TPL):")
 VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SUPPORTED_KEYS = {"Tab"}
 HOTSTRING_OPTIONS = "C"
+VARIABLE_TYPES = {"text_input", "list_selection", "date_time"}
 
 
 def import_ahk(path: Path) -> ExpansionStore:
@@ -290,7 +392,7 @@ def render_ahk(store: ExpansionStore) -> str:
 
     for section in store.sections:
         rendered_expansions = [
-            render_expansion(expansion)
+            render_expansion(expansion, store.variables, store.templates)
             for expansion in store.expansions
             if expansion.section == section
         ]
@@ -320,8 +422,16 @@ def render_ahk(store: ExpansionStore) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_expansion(expansion: Expansion) -> RenderedExpansion:
-    segments = parse_replacement_template(expansion.replacement)
+def render_expansion(
+    expansion: Expansion,
+    variables: list[VariableDef] | None = None,
+    templates: list[TemplateDef] | None = None,
+) -> RenderedExpansion:
+    segments = resolve_template_segments(
+        parse_replacement_template(expansion.replacement),
+        templates or [],
+    )
+    segments = resolve_variable_segments(segments, variables or [])
     dynamic = any(isinstance(segment, TemplatePlaceholder) for segment in segments)
     if not dynamic:
         line = f":{HOTSTRING_OPTIONS}:{expansion.trigger}::{_single_line_replacement(expansion.replacement)}"
@@ -389,11 +499,27 @@ def render_expansion(expansion: Expansion) -> RenderedExpansion:
 
 
 def validate_store_placeholders(store: ExpansionStore) -> None:
+    validate_variables(store.variables)
+    validate_templates(store.templates)
     for expansion in store.expansions:
         try:
-            parse_replacement_template(expansion.replacement)
+            segments = resolve_template_segments(
+                parse_replacement_template(expansion.replacement),
+                store.templates,
+            )
+            resolve_variable_segments(segments, store.variables)
         except ValueError as exc:
             raise ValueError(f'Invalid placeholder in trigger "{expansion.trigger}": {exc}') from exc
+    for template in store.templates:
+        try:
+            segments = resolve_template_segments(
+                parse_replacement_template(template.body),
+                store.templates,
+                stack=(template.name,),
+            )
+            resolve_variable_segments(segments, store.variables)
+        except ValueError as exc:
+            raise ValueError(f'Invalid placeholder in template "{template.name}": {exc}') from exc
 
 
 def parse_replacement_template(text: str) -> list[str | TemplatePlaceholder]:
@@ -469,7 +595,126 @@ def _parse_placeholder(kind: str, body: str) -> TemplatePlaceholder:
             raise ValueError("AHK_IMAGE path cannot contain braces.")
         return TemplatePlaceholder(kind, image_path, [])
 
+    if kind == "VAR":
+        variable_name = body.strip()
+        if not variable_name:
+            raise ValueError("VAR requires a variable name.")
+        _validate_variable_name(variable_name, "VAR")
+        return TemplatePlaceholder(kind, variable_name, [])
+
+    if kind == "TPL":
+        template_name = body.strip()
+        if not template_name:
+            raise ValueError("TPL requires a template name.")
+        return TemplatePlaceholder(kind, template_name, [])
+
     raise ValueError(f"Unsupported placeholder type {kind}.")
+
+
+def resolve_template_segments(
+    segments: list[str | TemplatePlaceholder],
+    templates: list[TemplateDef],
+    stack: tuple[str, ...] = (),
+) -> list[str | TemplatePlaceholder]:
+    template_map = {template.name: template for template in templates}
+    resolved: list[str | TemplatePlaceholder] = []
+    for segment in segments:
+        if not isinstance(segment, TemplatePlaceholder) or segment.kind != "TPL":
+            resolved.append(segment)
+            continue
+        template = template_map.get(segment.value)
+        if template is None:
+            raise ValueError(f'Undefined template "{segment.value}".')
+        if segment.value in stack:
+            cycle = " -> ".join([*stack, segment.value])
+            raise ValueError(f"Circular template reference detected: {cycle}.")
+        nested_segments = resolve_template_segments(
+            parse_replacement_template(template.body),
+            templates,
+            (*stack, segment.value),
+        )
+        resolved.extend(nested_segments)
+    return resolved
+
+
+def resolve_variable_segments(
+    segments: list[str | TemplatePlaceholder],
+    variables: list[VariableDef],
+) -> list[str | TemplatePlaceholder]:
+    variable_map = {variable.name: variable for variable in variables}
+    resolved: list[str | TemplatePlaceholder] = []
+    for segment in segments:
+        if not isinstance(segment, TemplatePlaceholder) or segment.kind != "VAR":
+            resolved.append(segment)
+            continue
+        variable = variable_map.get(segment.value)
+        if variable is None:
+            raise ValueError(f'Undefined variable "{segment.value}".')
+        resolved.append(variable_to_placeholder(variable))
+    return resolved
+
+
+def variable_to_placeholder(variable: VariableDef) -> TemplatePlaceholder:
+    validate_variable(variable)
+    if variable.type == "text_input":
+        prompt = variable.prompt_text or f"Enter {variable.name}"
+        title = variable.name.replace("_", " ").title()
+        return TemplatePlaceholder(
+            "AHK_INPUT",
+            "",
+            [variable.name, prompt, title, variable.default_value],
+        )
+    if variable.type == "list_selection":
+        prompt = variable.prompt_text or f"Choose {variable.name}"
+        title = variable.name.replace("_", " ").title()
+        return TemplatePlaceholder(
+            "AHK_SELECT",
+            "",
+            [variable.name, prompt, title, *variable.list_options],
+        )
+    if variable.type == "date_time":
+        date_format = variable.default_value or "yyyy-MM-dd"
+        return TemplatePlaceholder(
+            "AHK_EXPR",
+            f'FormatTime(A_Now, "{date_format}")',
+            [],
+        )
+    raise ValueError(f'Unsupported variable type "{variable.type}".')
+
+
+def validate_variables(variables: list[VariableDef]) -> None:
+    seen: set[str] = set()
+    for variable in variables:
+        validate_variable(variable)
+        if variable.name in seen:
+            raise ValueError(f'Duplicate variable name "{variable.name}".')
+        seen.add(variable.name)
+
+
+def validate_variable(variable: VariableDef) -> None:
+    if not variable.name:
+        raise ValueError("Variable name cannot be blank.")
+    _validate_variable_name(variable.name, "Variable")
+    if variable.type not in VARIABLE_TYPES:
+        raise ValueError(f'Unsupported variable type "{variable.type}".')
+    if variable.type == "list_selection" and not variable.list_options:
+        raise ValueError(f'Variable "{variable.name}" requires at least one list option.')
+    if variable.type == "date_time" and any(char in variable.default_value for char in '{}"'):
+        raise ValueError(f'Date/time variable "{variable.name}" format cannot contain braces or double quotes.')
+
+
+def validate_templates(templates: list[TemplateDef]) -> None:
+    seen: set[str] = set()
+    for template in templates:
+        validate_template(template)
+        if template.name in seen:
+            raise ValueError(f'Duplicate template name "{template.name}".')
+        seen.add(template.name)
+
+
+def validate_template(template: TemplateDef) -> None:
+    if not template.name:
+        raise ValueError("Template name cannot be blank.")
 
 
 def _validate_unmatched_placeholders(text: str, matched_starts: set[int]) -> None:

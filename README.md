@@ -57,6 +57,73 @@ Thank you for your business.
 
 Dynamic placeholders generate multi-line AutoHotkey v2 hotstrings at export time.
 
+## Variable Library
+
+The **Variables** tab stores reusable named placeholders that can be inserted into any expansion or template. Variables are saved in `expansions.json` as readable definitions, not generated AutoHotkey code.
+
+Supported variable types:
+
+- `text_input`: asks for free-form text at expansion time.
+- `list_selection`: asks the user to choose from saved options.
+- `date_time`: inserts a `FormatTime` value using the saved format.
+
+Examples:
+
+- `client_name`: `text_input`
+- `advisor_name`: `text_input`
+- `status`: `list_selection`
+- `today_iso`: `date_time` with default/format `yyyy-MM-dd`
+
+Use **Insert Variable** in the expansion editor to insert:
+
+```text
+{VAR:client_name}
+```
+
+At generation time, `{VAR:client_name}` is resolved by the generator into the same runtime behavior as the lower-level placeholders such as `AHK_INPUT`, `AHK_SELECT`, or `AHK_EXPR`.
+
+Variable names are case-sensitive and may contain only letters, numbers, and underscores. Undefined variable references stop generation with a clear validation error.
+
+## Template Library
+
+The **Templates** tab stores reusable expansion bodies. Templates are also saved in `expansions.json` as readable text.
+
+Templates have:
+
+- name
+- optional description
+- body text
+- optional notes
+
+Use **Insert Template** in the expansion or template editor to insert a readable template reference:
+
+```text
+{TPL:Client Follow-Up}
+```
+
+At generation time, the generator resolves the referenced template body.
+
+Example template:
+
+```text
+Dear {VAR:client_name},
+
+Thank you for taking the time to speak with me today.
+
+Best,
+{VAR:advisor_name}
+```
+
+Templates can include variables, other supported placeholders, and other templates:
+
+```text
+{TPL:Greeting}
+
+Status: {VAR:status}
+```
+
+Circular template references are not allowed. For example, Template A cannot include Template B if Template B includes Template A, and a template cannot include itself. Generation fails with a clear validation error if a circular reference is detected. Duplicate template names are not allowed.
+
 ### Date/Time
 
 Use **Insert Date/Time** to insert a FormatTime expression placeholder, for example:
