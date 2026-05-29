@@ -10,6 +10,7 @@ from typing import Any
 DEFAULT_JSON = "expansions.json"
 DEFAULT_AHK = "text_expansions.ahk"
 DEFAULT_SETTINGS = "settings.json"
+BACKUP_RETENTION_LIMIT = 5
 
 
 @dataclass
@@ -266,6 +267,7 @@ def generate_ahk(store: ExpansionStore, path: Path, backup: bool = True) -> Path
     if backup and path.exists():
         backup_path = _backup_path(path)
         shutil.copy2(path, backup_path)
+        _cleanup_old_backups(path)
     else:
         backup_path = None
 
@@ -554,7 +556,58 @@ def _single_line_replacement(text: str) -> str:
 
 def _backup_path(path: Path) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return path.with_name(f"{path.stem}.{timestamp}.bak{path.suffix}")
+    suffixes = _existing_backup_suffixes(path, timestamp)
+    if not suffixes:
+        return path.with_name(f"{path.stem}.{timestamp}.bak{path.suffix}")
+    next_suffix = max(suffixes) + 1
+    return path.with_name(f"{path.stem}.{timestamp}_{next_suffix}.bak{path.suffix}")
+
+
+def _cleanup_old_backups(path: Path, keep: int = BACKUP_RETENTION_LIMIT) -> None:
+    backups = _app_backup_paths(path)
+    if len(backups) <= keep:
+        return
+
+    backups.sort(key=_backup_sort_key, reverse=True)
+    for backup_path in backups[keep:]:
+        backup_path.unlink()
+
+
+def _app_backup_paths(path: Path) -> list[Path]:
+    escaped_stem = re.escape(path.stem)
+    escaped_suffix = re.escape(path.suffix)
+    backup_re = re.compile(
+        rf"^{escaped_stem}\.\d{{8}}_\d{{6}}(?:_\d+)?\.bak{escaped_suffix}$"
+    )
+    return [
+        candidate
+        for candidate in path.parent.iterdir()
+        if candidate.is_file() and backup_re.match(candidate.name)
+    ]
+
+
+def _backup_sort_key(path: Path) -> tuple[str, int, str]:
+    match = re.search(r"\.(\d{8}_\d{6})(?:_(\d+))?\.bak", path.name)
+    if not match:
+        return ("", 0, path.name)
+    suffix = int(match.group(2) or "1")
+    return (match.group(1), suffix, path.name)
+
+
+def _existing_backup_suffixes(path: Path, timestamp: str) -> list[int]:
+    escaped_stem = re.escape(path.stem)
+    escaped_suffix = re.escape(path.suffix)
+    backup_re = re.compile(
+        rf"^{escaped_stem}\.{re.escape(timestamp)}(?:_(\d+))?\.bak{escaped_suffix}$"
+    )
+    suffixes: list[int] = []
+    for candidate in path.parent.iterdir():
+        if not candidate.is_file():
+            continue
+        match = backup_re.match(candidate.name)
+        if match:
+            suffixes.append(int(match.group(1) or "1"))
+    return suffixes
 
 
 def _find_expansion(store: ExpansionStore, section: str, trigger: str) -> Expansion | None:

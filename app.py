@@ -32,6 +32,19 @@ IMAGE_FILE_TYPES = [
     ("WebP files", "*.webp"),
     ("All files", "*.*"),
 ]
+TABLE_ACTION_BUTTON_WIDTHS = {
+    "New": 8,
+    "Edit": 8,
+    "Delete": 10,
+    "Toggle Enabled": 15,
+}
+TEMPLATE_ACTION_BUTTON_WIDTHS = {
+    "Insert Date/Time": 17,
+    "Insert Input Box": 17,
+    "Insert List Selection": 19,
+    "Insert Tab": 17,
+    "Insert Image": 17,
+}
 
 
 def has_reserved_placeholder_chars(value: str) -> bool:
@@ -394,10 +407,19 @@ class ExpansionApp(tk.Tk):
 
         actions = ttk.Frame(parent)
         actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(actions, text="New", command=self.new_expansion).pack(side=tk.LEFT)
-        ttk.Button(actions, text="Edit", command=self.load_selected_expansion).pack(side=tk.LEFT, padx=4)
-        ttk.Button(actions, text="Delete", command=self.delete_expansion).pack(side=tk.LEFT, padx=4)
-        ttk.Button(actions, text="Toggle Enabled", command=self.toggle_enabled).pack(side=tk.LEFT, padx=4)
+        actions.columnconfigure((0, 1, 2), weight=0)
+        self._table_action_button(actions, "New", self.new_expansion).grid(row=0, column=0, padx=(0, 4), pady=(0, 4), sticky="w")
+        self._table_action_button(actions, "Edit", self.load_selected_expansion).grid(row=0, column=1, padx=4, pady=(0, 4), sticky="w")
+        self._table_action_button(actions, "Delete", self.delete_expansion).grid(row=0, column=2, padx=4, pady=(0, 4), sticky="w")
+        self._table_action_button(actions, "Toggle Enabled", self.toggle_enabled).grid(row=1, column=0, columnspan=2, padx=(0, 4), sticky="w")
+
+    def _table_action_button(self, parent: ttk.Frame, text: str, command: object) -> ttk.Button:
+        return ttk.Button(
+            parent,
+            text=text,
+            width=TABLE_ACTION_BUTTON_WIDTHS[text],
+            command=command,
+        )
 
     def _build_form(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -415,11 +437,11 @@ class ExpansionApp(tk.Tk):
         ttk.Label(parent, text="Replacement text").grid(row=5, column=0, sticky="sw", pady=(12, 2))
         template_actions = ttk.Frame(parent)
         template_actions.grid(row=6, column=0, sticky="ew", pady=(0, 4))
-        ttk.Button(template_actions, text="Insert Date/Time", command=self.insert_date_time).grid(row=0, column=0, padx=(0, 4), pady=(0, 4), sticky="w")
-        ttk.Button(template_actions, text="Insert Input Box", command=self.insert_input_box).grid(row=0, column=1, padx=4, pady=(0, 4), sticky="w")
-        ttk.Button(template_actions, text="Insert List Selection", command=self.insert_list_selection).grid(row=0, column=2, padx=4, pady=(0, 4), sticky="w")
-        ttk.Button(template_actions, text="Insert Tab", command=self.insert_tab).grid(row=1, column=0, padx=(0, 4), sticky="w")
-        ttk.Button(template_actions, text="Insert Image", command=self.insert_image).grid(row=1, column=1, padx=4, sticky="w")
+        self._template_action_button(template_actions, "Insert Date/Time", self.insert_date_time).grid(row=0, column=0, padx=(0, 4), pady=(0, 4), sticky="w")
+        self._template_action_button(template_actions, "Insert Input Box", self.insert_input_box).grid(row=0, column=1, padx=4, pady=(0, 4), sticky="w")
+        self._template_action_button(template_actions, "Insert List Selection", self.insert_list_selection).grid(row=1, column=0, padx=(0, 4), pady=(0, 4), sticky="w")
+        self._template_action_button(template_actions, "Insert Tab", self.insert_tab).grid(row=1, column=1, padx=4, pady=(0, 4), sticky="w")
+        self._template_action_button(template_actions, "Insert Image", self.insert_image).grid(row=2, column=0, padx=(0, 4), sticky="w")
 
         self.replacement_text = tk.Text(parent, height=10, wrap=tk.WORD, undo=True)
         self.replacement_text.grid(row=7, column=0, sticky="nsew")
@@ -434,6 +456,14 @@ class ExpansionApp(tk.Tk):
         form_actions.grid(row=11, column=0, sticky="ew", pady=(12, 0))
         ttk.Button(form_actions, text="Apply", command=self.apply_form).pack(side=tk.LEFT)
         ttk.Button(form_actions, text="Reset", command=self.new_expansion).pack(side=tk.LEFT, padx=4)
+
+    def _template_action_button(self, parent: ttk.Frame, text: str, command: object) -> ttk.Button:
+        return ttk.Button(
+            parent,
+            text=text,
+            width=TEMPLATE_ACTION_BUTTON_WIDTHS[text],
+            command=command,
+        )
 
     def refresh_sections(self) -> None:
         self.section_list.delete(0, tk.END)

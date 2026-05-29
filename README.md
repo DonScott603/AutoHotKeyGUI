@@ -36,6 +36,8 @@ If that file already exists, the app creates a timestamped backup before overwri
 text_expansions.20260529_143000.bak.ahk
 ```
 
+Only the five most recent generated `.ahk` backups for that configured output file are retained. Older app-created backups are deleted automatically; unrelated files are left alone.
+
 Run the generated `.ahk` file with AutoHotkey v2, or use the app controls:
 
 - **Run AHK** launches the configured generated script.
