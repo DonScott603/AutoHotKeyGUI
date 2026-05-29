@@ -97,7 +97,8 @@ class PlaceholderGenerationTests(unittest.TestCase):
         output = render_ahk(store)
 
         self.assertIn("::tabbed::\n{", output)
-        self.assertIn('Send("{Tab}")', output)
+        self.assertIn('SendEvent("{Tab}")', output)
+        self.assertIn("Sleep(100)", output)
         self.assertIn('__tem_result .= "Left"', output)
         self.assertIn('__tem_result .= "Right"', output)
         self.assertNotIn("::tabbed::Left", output)

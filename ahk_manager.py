@@ -365,7 +365,8 @@ def render_expansion(expansion: Expansion) -> RenderedExpansion:
         elif segment.kind == "AHK_KEY":
             key_name = segment.value
             flush_result()
-            lines.append(f"    Send(\"{{{key_name}}}\")")
+            lines.append(f"    SendEvent(\"{{{key_name}}}\")")
+            lines.append("    Sleep(100)")
         elif segment.kind == "AHK_IMAGE":
             image_path = segment.value
             flush_result()
