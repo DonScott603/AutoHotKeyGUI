@@ -1,6 +1,9 @@
 import shutil
 import subprocess
 import tkinter as tk
+import json
+import os
+import re
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -32,6 +35,7 @@ IMAGE_FILE_TYPES = [
     ("WebP files", "*.webp"),
     ("All files", "*.*"),
 ]
+AHK_PROCESS_NAMES = {"autohotkey.exe", "autohotkey64.exe", "autohotkey32.exe"}
 TABLE_ACTION_BUTTON_WIDTHS = {
     "New": 8,
     "Edit": 8,
@@ -49,6 +53,30 @@ TEMPLATE_ACTION_BUTTON_WIDTHS = {
 
 def has_reserved_placeholder_chars(value: str) -> bool:
     return any(char in value for char in "{}|")
+
+
+def normalized_path_for_compare(path: Path | str) -> str:
+    return os.path.normcase(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def command_line_references_script(command_line: str, target_path: Path | str) -> bool:
+    target = normalized_path_for_compare(target_path)
+    for candidate in extract_ahk_script_paths(command_line):
+        if normalized_path_for_compare(candidate) == target:
+            return True
+    return False
+
+
+def extract_ahk_script_paths(command_line: str) -> list[str]:
+    paths: list[str] = []
+    quoted_re = re.compile(r'"([^"]+?\.ahk)"', re.IGNORECASE)
+    for match in quoted_re.finditer(command_line):
+        paths.append(match.group(1))
+
+    stripped = quoted_re.sub(" ", command_line)
+    for token in re.findall(r"[^\s]+?\.ahk", stripped, re.IGNORECASE):
+        paths.append(token.strip('"'))
+    return paths
 
 
 class ImportConflictDialog(simpledialog.Dialog):
@@ -767,35 +795,31 @@ class ExpansionApp(tk.Tk):
         self.set_status(f"Running {self.current_ahk_path()}.")
 
     def reload_ahk(self) -> None:
-        if self.ahk_process is None:
-            messagebox.showinfo(
-                "Reload AHK",
-                "This app has not started the generated AHK script in this session. "
-                "Only app-started processes can be cleanly reloaded.",
-            )
-            return
-
-        if self.ahk_process.poll() is None:
-            self.ahk_process.terminate()
-            try:
-                self.ahk_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.ahk_process.kill()
-                self.ahk_process.wait(timeout=5)
-        else:
-            messagebox.showinfo(
-                "Reload AHK",
-                "The AHK process started by this app is no longer running. Use Run AHK to start it again.",
-            )
-            self.ahk_process = None
-            return
-
+        terminated = 0
+        inspect_warning = ""
         try:
+            terminated = self._terminate_matching_ahk_processes(self.current_ahk_path())
             self.ahk_process = self._launch_ahk()
+        except ProcessLookupError as exc:
+            inspect_warning = str(exc)
+            try:
+                self.ahk_process = self._launch_ahk()
+            except ValueError as launch_exc:
+                messagebox.showerror("Reload AHK", f"{inspect_warning}\n\nAlso failed to launch: {launch_exc}")
+                return
         except ValueError as exc:
             messagebox.showerror("Reload AHK", str(exc))
             return
-        self.set_status(f"Reloaded {self.current_ahk_path()}.")
+
+        message = f"Reloaded {self.current_ahk_path()}."
+        if terminated:
+            message += f" Stopped {terminated} matching running script process(es)."
+        elif inspect_warning:
+            message += f" Warning: {inspect_warning}"
+        else:
+            message += " No existing matching process was found."
+        self.set_status(message)
+        messagebox.showinfo("Reload AHK", message)
 
     def _launch_ahk(self) -> subprocess.Popen:
         ahk_path = self.current_ahk_path()
@@ -830,6 +854,66 @@ class ExpansionApp(tk.Tk):
             if candidate.exists():
                 return candidate
         return None
+
+    def _terminate_matching_ahk_processes(self, ahk_path: Path) -> int:
+        processes = self._running_autohotkey_processes()
+        target_path = ahk_path.resolve(strict=False)
+        current_pid = os.getpid()
+        terminated = 0
+
+        for process in processes:
+            pid = process.get("ProcessId")
+            command_line = process.get("CommandLine") or ""
+            name = str(process.get("Name") or "").lower()
+            if name not in AHK_PROCESS_NAMES or not isinstance(pid, int) or pid == current_pid:
+                continue
+            if not command_line_references_script(command_line, target_path):
+                continue
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                terminated += 1
+            except (OSError, subprocess.CalledProcessError) as exc:
+                raise ValueError(f"Could not stop matching AutoHotkey process {pid}: {exc}") from exc
+        return terminated
+
+    def _running_autohotkey_processes(self) -> list[dict[str, object]]:
+        command = [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            (
+                "Get-CimInstance Win32_Process "
+                "| Where-Object { $_.Name -match '^AutoHotkey(32|64)?\\.exe$' } "
+                "| Select-Object ProcessId,Name,CommandLine "
+                "| ConvertTo-Json -Compress"
+            ),
+        ]
+        try:
+            result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise ProcessLookupError(
+                "Could not inspect running AutoHotkey processes; launching without stopping any existing script."
+            ) from exc
+
+        output = result.stdout.strip()
+        if not output:
+            return []
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise ProcessLookupError(
+                "Could not parse running AutoHotkey process list; launching without stopping any existing script."
+            ) from exc
+        if isinstance(data, dict):
+            return [data]
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        return []
 
     def import_ahk(self) -> None:
         file_path = filedialog.askopenfilename(
@@ -880,8 +964,8 @@ class ExpansionApp(tk.Tk):
 
     def warn_if_duplicate(self, trigger: str) -> None:
         duplicates = self.store.duplicate_triggers()
-        if trigger.lower() in duplicates:
-            sections = ", ".join(expansion.section for expansion in duplicates[trigger.lower()])
+        if trigger in duplicates:
+            sections = ", ".join(expansion.section for expansion in duplicates[trigger])
             messagebox.showwarning(
                 "Duplicate trigger",
                 f'Trigger "{trigger}" appears in multiple expansions: {sections}.',

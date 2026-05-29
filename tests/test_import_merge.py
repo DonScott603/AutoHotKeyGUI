@@ -96,6 +96,22 @@ class ImportMergeTests(unittest.TestCase):
         self.assertEqual(target.expansions[0].trigger, "sig")
         self.assertEqual(target.expansions[1].trigger, "brb")
 
+    def test_case_variants_import_without_conflict(self) -> None:
+        target = ExpansionStore(
+            sections=["Common"],
+            expansions=[Expansion("Common", "Hsa", "Has")],
+        )
+        imported = ExpansionStore(
+            sections=["Common"],
+            expansions=[Expansion("Common", "hsa", "has")],
+        )
+
+        result = merge_imported_store(target, imported)
+
+        self.assertEqual(result.conflicts, 0)
+        self.assertEqual(result.added, 1)
+        self.assertEqual([item.trigger for item in target.expansions], ["Hsa", "hsa"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -134,7 +134,7 @@ class ExpansionStore:
         for expansion in self.expansions:
             if not expansion.trigger:
                 continue
-            grouped.setdefault(expansion.trigger.lower(), []).append(expansion)
+            grouped.setdefault(expansion.trigger, []).append(expansion)
         return {
             trigger: matches
             for trigger, matches in grouped.items()
@@ -175,6 +175,7 @@ PLACEHOLDER_RE = re.compile(r"\{(AHK_EXPR|AHK_INPUT|AHK_SELECT|AHK_KEY|AHK_IMAGE
 PLACEHOLDER_START_RE = re.compile(r"\{AHK_(?:EXPR|INPUT|SELECT|KEY|IMAGE):")
 VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SUPPORTED_KEYS = {"Tab"}
+HOTSTRING_OPTIONS = "C"
 
 
 def import_ahk(path: Path) -> ExpansionStore:
@@ -323,13 +324,13 @@ def render_expansion(expansion: Expansion) -> RenderedExpansion:
     segments = parse_replacement_template(expansion.replacement)
     dynamic = any(isinstance(segment, TemplatePlaceholder) for segment in segments)
     if not dynamic:
-        line = f"::{expansion.trigger}::{_single_line_replacement(expansion.replacement)}"
+        line = f":{HOTSTRING_OPTIONS}:{expansion.trigger}::{_single_line_replacement(expansion.replacement)}"
         lines = [line]
         if expansion.notes:
             lines.append(f"; Notes: {expansion.notes}")
         return RenderedExpansion(_maybe_disable_lines(lines, expansion.enabled))
 
-    lines = [f"::{expansion.trigger}::", "{"]
+    lines = [f":{HOTSTRING_OPTIONS}:{expansion.trigger}::", "{"]
     lines.append("    __tem_result := \"\"")
     needs_select_helper = False
     needs_image_helper = False
@@ -612,7 +613,7 @@ def _existing_backup_suffixes(path: Path, timestamp: str) -> list[int]:
 
 def _find_expansion(store: ExpansionStore, section: str, trigger: str) -> Expansion | None:
     for expansion in store.expansions:
-        if expansion.section == section and expansion.trigger.lower() == trigger.lower():
+        if expansion.section == section and expansion.trigger == trigger:
             return expansion
     return None
 

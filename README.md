@@ -41,9 +41,9 @@ Only the five most recent generated `.ahk` backups for that configured output fi
 Run the generated `.ahk` file with AutoHotkey v2, or use the app controls:
 
 - **Run AHK** launches the configured generated script.
-- **Reload AHK** stops and relaunches the script only if this app started that process during the current GUI session.
+- **Reload AHK** stops and relaunches only running AutoHotkey processes whose command line references the configured generated script path.
 
-The app does not kill all AutoHotkey processes globally. If the script was started outside this app, reload will show a message explaining that only app-started processes can be cleanly reloaded.
+The app does not kill all AutoHotkey processes globally. Reload targets only the configured generated `.ahk` file, so unrelated AutoHotkey scripts are left alone. If process inspection is unavailable, the app warns and launches the configured script without stopping anything.
 
 ## Template insertion helpers
 
@@ -169,6 +169,8 @@ Each expansion has:
 - `replacement`
 - `enabled`
 - `notes`
+
+Generated hotstrings are case-sensitive by default. Triggers such as `Hsa` and `hsa` are treated as distinct triggers and can have different replacements.
 
 Sections are rendered as comments in the generated `.ahk` file:
 

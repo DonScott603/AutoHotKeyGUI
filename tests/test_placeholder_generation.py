@@ -12,7 +12,7 @@ class PlaceholderGenerationTests(unittest.TestCase):
 
         output = render_ahk(store)
 
-        self.assertIn("::brb::Be right back", output)
+        self.assertIn(":C:brb::Be right back", output)
         self.assertNotIn("SendText(__tem_result)", output)
 
     def test_date_time_expression_placeholder_generates_dynamic_hotstring(self) -> None:
@@ -29,7 +29,7 @@ class PlaceholderGenerationTests(unittest.TestCase):
 
         output = render_ahk(store)
 
-        self.assertIn("::today::\n{", output)
+        self.assertIn(":C:today::\n{", output)
         self.assertIn('__tem_result .= "Today is "', output)
         self.assertIn('__tem_result .= FormatTime(A_Now, "yyyy-MM-dd")', output)
         self.assertIn("SendText(__tem_result)", output)
@@ -96,12 +96,28 @@ class PlaceholderGenerationTests(unittest.TestCase):
 
         output = render_ahk(store)
 
-        self.assertIn("::tabbed::\n{", output)
+        self.assertIn(":C:tabbed::\n{", output)
         self.assertIn('SendEvent("{Tab}")', output)
         self.assertIn("Sleep(100)", output)
         self.assertIn('__tem_result .= "Left"', output)
         self.assertIn('__tem_result .= "Right"', output)
         self.assertNotIn("::tabbed::Left", output)
+
+    def test_case_sensitive_hotstrings_preserve_trigger_case(self) -> None:
+        store = ExpansionStore(
+            sections=["Case"],
+            expansions=[
+                Expansion("Case", "Hsa", "Has"),
+                Expansion("Case", "hsa", "has"),
+                Expansion("Case", "Dyn", 'Today {AHK_EXPR:FormatTime(A_Now, "yyyy-MM-dd")}'),
+            ],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn(":C:Hsa::Has", output)
+        self.assertIn(":C:hsa::has", output)
+        self.assertIn(":C:Dyn::\n{", output)
 
     def test_unsupported_key_raises_clear_error(self) -> None:
         store = ExpansionStore(
