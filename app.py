@@ -23,6 +23,15 @@ APP_DIR = Path(__file__).resolve().parent
 JSON_PATH = APP_DIR / DEFAULT_JSON
 AHK_PATH = APP_DIR / DEFAULT_AHK
 SETTINGS_PATH = APP_DIR / DEFAULT_SETTINGS
+IMAGE_FILE_TYPES = [
+    ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+    ("PNG files", "*.png"),
+    ("JPEG files", "*.jpg *.jpeg"),
+    ("GIF files", "*.gif"),
+    ("Bitmap files", "*.bmp"),
+    ("WebP files", "*.webp"),
+    ("All files", "*.*"),
+]
 
 
 def has_reserved_placeholder_chars(value: str) -> bool:
@@ -406,9 +415,11 @@ class ExpansionApp(tk.Tk):
         ttk.Label(parent, text="Replacement text").grid(row=5, column=0, sticky="sw", pady=(12, 2))
         template_actions = ttk.Frame(parent)
         template_actions.grid(row=6, column=0, sticky="ew", pady=(0, 4))
-        ttk.Button(template_actions, text="Insert Date/Time", command=self.insert_date_time).pack(side=tk.LEFT)
-        ttk.Button(template_actions, text="Insert Input Box", command=self.insert_input_box).pack(side=tk.LEFT, padx=4)
-        ttk.Button(template_actions, text="Insert List Selection", command=self.insert_list_selection).pack(side=tk.LEFT, padx=4)
+        ttk.Button(template_actions, text="Insert Date/Time", command=self.insert_date_time).grid(row=0, column=0, padx=(0, 4), pady=(0, 4), sticky="w")
+        ttk.Button(template_actions, text="Insert Input Box", command=self.insert_input_box).grid(row=0, column=1, padx=4, pady=(0, 4), sticky="w")
+        ttk.Button(template_actions, text="Insert List Selection", command=self.insert_list_selection).grid(row=0, column=2, padx=4, pady=(0, 4), sticky="w")
+        ttk.Button(template_actions, text="Insert Tab", command=self.insert_tab).grid(row=1, column=0, padx=(0, 4), sticky="w")
+        ttk.Button(template_actions, text="Insert Image", command=self.insert_image).grid(row=1, column=1, padx=4, sticky="w")
 
         self.replacement_text = tk.Text(parent, height=10, wrap=tk.WORD, undo=True)
         self.replacement_text.grid(row=7, column=0, sticky="nsew")
@@ -573,6 +584,18 @@ class ExpansionApp(tk.Tk):
         dialog = SelectPlaceholderDialog(self)
         if dialog.result:
             self.insert_replacement_snippet(dialog.result)
+
+    def insert_tab(self) -> None:
+        self.insert_replacement_snippet("{AHK_KEY:Tab}")
+
+    def insert_image(self) -> None:
+        file_path = filedialog.askopenfilename(
+            title="Choose image to insert",
+            filetypes=IMAGE_FILE_TYPES,
+        )
+        if not file_path:
+            return
+        self.insert_replacement_snippet(f"{{AHK_IMAGE:{file_path}}}")
 
     def insert_replacement_snippet(self, snippet: str) -> None:
         self.replacement_text.insert(tk.INSERT, snippet)
