@@ -364,7 +364,9 @@ def validate_store_placeholders(store: ExpansionStore) -> None:
 def parse_replacement_template(text: str) -> list[str | TemplatePlaceholder]:
     segments: list[str | TemplatePlaceholder] = []
     position = 0
+    matched_starts: set[int] = set()
     for match in PLACEHOLDER_RE.finditer(text):
+        matched_starts.add(match.start())
         if match.start() > position:
             segments.append(text[position:match.start()])
         segments.append(_parse_placeholder(match.group(1), match.group(2)))
@@ -373,7 +375,7 @@ def parse_replacement_template(text: str) -> list[str | TemplatePlaceholder]:
     if position < len(text):
         segments.append(text[position:])
 
-    _validate_unmatched_placeholders(text, segments)
+    _validate_unmatched_placeholders(text, matched_starts)
     return segments
 
 
@@ -386,8 +388,10 @@ def _parse_placeholder(kind: str, body: str) -> TemplatePlaceholder:
 
     if kind == "AHK_INPUT":
         parts = body.split("|")
-        if len(parts) != 4:
+        if len(parts) not in {3, 4}:
             raise ValueError("AHK_INPUT must use {AHK_INPUT:variable|prompt|title|default}.")
+        if len(parts) == 3:
+            parts.append("")
         variable, prompt, title, default = [part.strip() for part in parts]
         _validate_variable_name(variable, "AHK_INPUT")
         if not prompt:
@@ -417,20 +421,14 @@ def _parse_placeholder(kind: str, body: str) -> TemplatePlaceholder:
     raise ValueError(f"Unsupported placeholder type {kind}.")
 
 
-def _validate_unmatched_placeholders(text: str, segments: list[str | TemplatePlaceholder]) -> None:
-    reconstructed_length = 0
-    for segment in segments:
-        if isinstance(segment, str):
-            reconstructed_length += len(segment)
-        else:
-            reconstructed_length += len(f"{{{segment.kind}:{segment.value}}}")
-    if reconstructed_length != len(text) and PLACEHOLDER_START_RE.search(text):
-        raise ValueError("Placeholder syntax is malformed or contains unsupported braces.")
-
+def _validate_unmatched_placeholders(text: str, matched_starts: set[int]) -> None:
     for match in PLACEHOLDER_START_RE.finditer(text):
+        if match.start() in matched_starts:
+            continue
         closing = text.find("}", match.start())
         if closing == -1:
             raise ValueError("Placeholder is missing a closing brace.")
+        raise ValueError("Placeholder syntax is malformed or contains unsupported braces.")
 
 
 def _validate_variable_name(value: str, placeholder_name: str) -> None:

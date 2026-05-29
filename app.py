@@ -1,13 +1,244 @@
+import shutil
+import subprocess
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from ahk_manager import DEFAULT_AHK, DEFAULT_JSON, Expansion, ExpansionStore, generate_ahk, import_ahk
+from ahk_manager import (
+    DEFAULT_AHK,
+    DEFAULT_JSON,
+    DEFAULT_SETTINGS,
+    AppSettings,
+    Expansion,
+    ExpansionStore,
+    count_import_conflicts,
+    generate_ahk,
+    import_ahk,
+    merge_imported_store,
+    parse_replacement_template,
+)
 
 
 APP_DIR = Path(__file__).resolve().parent
 JSON_PATH = APP_DIR / DEFAULT_JSON
 AHK_PATH = APP_DIR / DEFAULT_AHK
+SETTINGS_PATH = APP_DIR / DEFAULT_SETTINGS
+
+
+def has_reserved_placeholder_chars(value: str) -> bool:
+    return any(char in value for char in "{}|")
+
+
+class ImportConflictDialog(simpledialog.Dialog):
+    def __init__(self, parent: tk.Tk, conflict_count: int) -> None:
+        self.conflict_count = conflict_count
+        self.choice = tk.StringVar(value="skip")
+        self.result: str | None = None
+        super().__init__(parent, "Import conflicts")
+
+    def body(self, master: tk.Frame) -> tk.Widget:
+        ttk.Label(
+            master,
+            text=(
+                f"{self.conflict_count} imported trigger(s) already exist in the same section. "
+                "Choose how to handle all conflicts."
+            ),
+            wraplength=420,
+        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        ttk.Radiobutton(master, text="Skip duplicate triggers", variable=self.choice, value="skip").grid(
+            row=1, column=0, sticky="w"
+        )
+        ttk.Radiobutton(master, text="Overwrite existing expansions", variable=self.choice, value="overwrite").grid(
+            row=2, column=0, sticky="w"
+        )
+        ttk.Radiobutton(master, text="Keep both with renamed trigger", variable=self.choice, value="rename").grid(
+            row=3, column=0, sticky="w"
+        )
+        return master
+
+    def apply(self) -> None:
+        self.result = self.choice.get()
+
+
+class DateTimeDialog(simpledialog.Dialog):
+    FORMAT_OPTIONS = {
+        "Short date": "MM/dd/yyyy",
+        "ISO date": "yyyy-MM-dd",
+        "Long date": "dddd, MMMM d, yyyy",
+        "Time": "h:mm tt",
+        "Date + time": "yyyy-MM-dd h:mm tt",
+        "Custom format": "",
+    }
+
+    def __init__(self, parent: tk.Tk) -> None:
+        self.choice = tk.StringVar(value="ISO date")
+        self.custom_format = tk.StringVar()
+        self.result: str | None = None
+        super().__init__(parent, "Insert Date/Time")
+
+    def body(self, master: tk.Frame) -> tk.Widget:
+        master.columnconfigure(1, weight=1)
+        ttk.Label(master, text="Format").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        combo = ttk.Combobox(
+            master,
+            textvariable=self.choice,
+            state="readonly",
+            values=list(self.FORMAT_OPTIONS.keys()),
+            width=28,
+        )
+        combo.grid(row=0, column=1, sticky="ew", pady=(0, 8))
+        ttk.Label(master, text="Custom").grid(row=1, column=0, sticky="w", padx=(0, 8))
+        entry = ttk.Entry(master, textvariable=self.custom_format)
+        entry.grid(row=1, column=1, sticky="ew")
+        return combo
+
+    def validate(self) -> bool:
+        selected = self.choice.get()
+        date_format = self.custom_format.get().strip() if selected == "Custom format" else self.FORMAT_OPTIONS[selected]
+        if not date_format:
+            messagebox.showerror("Date/Time format", "Enter a custom date/time format.", parent=self)
+            return False
+        if any(char in date_format for char in '{}"'):
+            messagebox.showerror("Date/Time format", 'Format cannot contain braces or double quotes.', parent=self)
+            return False
+        return True
+
+    def apply(self) -> None:
+        selected = self.choice.get()
+        date_format = self.custom_format.get().strip() if selected == "Custom format" else self.FORMAT_OPTIONS[selected]
+        self.result = f'{{AHK_EXPR:FormatTime(A_Now, "{date_format}")}}'
+
+
+class InputPlaceholderDialog(simpledialog.Dialog):
+    def __init__(self, parent: tk.Tk) -> None:
+        self.variable = tk.StringVar(value="name")
+        self.prompt = tk.StringVar(value="Enter value")
+        self.title_text = tk.StringVar(value="Input")
+        self.default = tk.StringVar()
+        self.result: str | None = None
+        super().__init__(parent, "Insert Input Box")
+
+    def body(self, master: tk.Frame) -> tk.Widget:
+        master.columnconfigure(1, weight=1)
+        first: tk.Widget | None = None
+        fields = [
+            ("Variable name", self.variable),
+            ("Prompt text", self.prompt),
+            ("Window title", self.title_text),
+            ("Default value", self.default),
+        ]
+        for row, (label, variable) in enumerate(fields):
+            ttk.Label(master, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+            entry = ttk.Entry(master, textvariable=variable, width=34)
+            entry.grid(row=row, column=1, sticky="ew", pady=4)
+            if first is None:
+                first = entry
+        return first
+
+    def validate(self) -> bool:
+        fields = [self.prompt.get(), self.title_text.get(), self.default.get()]
+        if any(has_reserved_placeholder_chars(value) for value in fields):
+            messagebox.showerror(
+                "Input Box placeholder",
+                "Prompt, title, and default value cannot contain braces or pipe characters.",
+                parent=self,
+            )
+            return False
+        try:
+            parse_replacement_template(self._placeholder())
+        except ValueError as exc:
+            messagebox.showerror("Input Box placeholder", str(exc), parent=self)
+            return False
+        return True
+
+    def apply(self) -> None:
+        self.result = self._placeholder()
+
+    def _placeholder(self) -> str:
+        return (
+            "{AHK_INPUT:"
+            f"{self.variable.get().strip()}|"
+            f"{self.prompt.get().strip()}|"
+            f"{self.title_text.get().strip()}|"
+            f"{self.default.get().strip()}"
+            "}"
+        )
+
+
+class SelectPlaceholderDialog(simpledialog.Dialog):
+    def __init__(self, parent: tk.Tk) -> None:
+        self.variable = tk.StringVar(value="choice")
+        self.prompt = tk.StringVar(value="Choose an option")
+        self.title_text = tk.StringVar(value="Selection")
+        self.result: str | None = None
+        self.options_text: tk.Text | None = None
+        super().__init__(parent, "Insert List Selection")
+
+    def body(self, master: tk.Frame) -> tk.Widget:
+        master.columnconfigure(1, weight=1)
+        fields = [
+            ("Variable name", self.variable),
+            ("Prompt text", self.prompt),
+            ("Window title", self.title_text),
+        ]
+        first: tk.Widget | None = None
+        for row, (label, variable) in enumerate(fields):
+            ttk.Label(master, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+            entry = ttk.Entry(master, textvariable=variable, width=34)
+            entry.grid(row=row, column=1, sticky="ew", pady=4)
+            if first is None:
+                first = entry
+
+        ttk.Label(master, text="Options").grid(row=3, column=0, sticky="nw", padx=(0, 8), pady=4)
+        self.options_text = tk.Text(master, width=34, height=6, wrap=tk.WORD)
+        self.options_text.grid(row=3, column=1, sticky="nsew", pady=4)
+        self.options_text.insert("1.0", "Option A\nOption B\nOption C")
+        return first
+
+    def validate(self) -> bool:
+        fields = [self.prompt.get(), self.title_text.get()]
+        if any(has_reserved_placeholder_chars(value) for value in fields):
+            messagebox.showerror(
+                "List Selection placeholder",
+                "Prompt and title cannot contain braces or pipe characters.",
+                parent=self,
+            )
+            return False
+        if self.options_text is not None:
+            options_text = self.options_text.get("1.0", "end-1c")
+            if any(char in options_text for char in "{}|"):
+                messagebox.showerror(
+                    "List Selection placeholder",
+                    "Options cannot contain braces or pipe characters.",
+                    parent=self,
+                )
+                return False
+        try:
+            parse_replacement_template(self._placeholder())
+        except ValueError as exc:
+            messagebox.showerror("List Selection placeholder", str(exc), parent=self)
+            return False
+        return True
+
+    def apply(self) -> None:
+        self.result = self._placeholder()
+
+    def _placeholder(self) -> str:
+        options = []
+        if self.options_text is not None:
+            options = [
+                line.strip()
+                for line in self.options_text.get("1.0", "end-1c").splitlines()
+                if line.strip()
+            ]
+        return (
+            "{AHK_SELECT:"
+            f"{self.variable.get().strip()}|"
+            f"{self.prompt.get().strip()}|"
+            f"{self.title_text.get().strip()}|"
+            f"{'||'.join(options)}"
+            "}"
+        )
 
 
 class ExpansionApp(tk.Tk):
@@ -18,6 +249,8 @@ class ExpansionApp(tk.Tk):
         self.minsize(900, 560)
 
         self.store = self._load_store()
+        self.settings = self._load_settings()
+        self.ahk_process: subprocess.Popen | None = None
         self.selected_section = tk.StringVar(value=self.store.sections[0])
         self.search_var = tk.StringVar()
         self.current_expansion: Expansion | None = None
@@ -25,6 +258,7 @@ class ExpansionApp(tk.Tk):
         self.section_var = tk.StringVar()
         self.trigger_var = tk.StringVar()
         self.enabled_var = tk.BooleanVar(value=True)
+        self.ahk_path_var = tk.StringVar(value=self.settings.generated_ahk_path)
         self.status_var = tk.StringVar(value="Ready.")
 
         self._build_ui()
@@ -38,6 +272,13 @@ class ExpansionApp(tk.Tk):
             messagebox.showerror("Load error", str(exc))
             return ExpansionStore()
 
+    def _load_settings(self) -> AppSettings:
+        try:
+            return AppSettings.load(SETTINGS_PATH, AHK_PATH)
+        except ValueError as exc:
+            messagebox.showerror("Settings error", str(exc))
+            return AppSettings(str(AHK_PATH))
+
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -48,35 +289,65 @@ class ExpansionApp(tk.Tk):
         left = ttk.Frame(paned, padding=8)
         center = ttk.Frame(paned, padding=(8, 8, 4, 8))
         right = ttk.Frame(paned, padding=(4, 8, 8, 8))
-        paned.add(left, weight=1)
-        paned.add(center, weight=4)
-        paned.add(right, weight=3)
+        paned.add(left, weight=0)
+        paned.add(center, weight=5)
+        paned.add(right, weight=2)
+        paned.pane(left, weight=0)
+        paned.pane(center, weight=5)
+        paned.pane(right, weight=2)
+        try:
+            paned.pane(left, minsize=190)
+            paned.pane(center, minsize=420)
+            paned.pane(right, minsize=280)
+        except tk.TclError:
+            pass
 
         self._build_sections(left)
         self._build_table(center)
         self._build_form(right)
 
+        self._build_output_settings(self)
+
         footer = ttk.Frame(self, padding=(8, 0, 8, 8))
-        footer.grid(row=1, column=0, sticky="ew")
+        footer.grid(row=2, column=0, sticky="ew")
         footer.columnconfigure(0, weight=1)
 
         ttk.Label(footer, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
         ttk.Button(footer, text="Save JSON", command=self.save_json).grid(row=0, column=1, padx=4)
         ttk.Button(footer, text="Generate .ahk", command=self.generate_ahk).grid(row=0, column=2, padx=4)
-        ttk.Button(footer, text="Import .ahk", command=self.import_ahk).grid(row=0, column=3, padx=4)
+        ttk.Button(footer, text="Run AHK", command=self.run_ahk).grid(row=0, column=3, padx=4)
+        ttk.Button(footer, text="Reload AHK", command=self.reload_ahk).grid(row=0, column=4, padx=4)
+        ttk.Button(footer, text="Import .ahk", command=self.import_ahk).grid(row=0, column=5, padx=4)
+
+    def _build_output_settings(self, parent: tk.Widget) -> None:
+        output_frame = ttk.Frame(parent, padding=(8, 4, 8, 8))
+        output_frame.grid(row=1, column=0, sticky="ew")
+        output_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(output_frame, text="Generated AHK path").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        path_entry = ttk.Entry(output_frame, textvariable=self.ahk_path_var)
+        path_entry.grid(row=0, column=1, sticky="ew")
+        path_entry.bind("<FocusOut>", lambda _event: self.save_settings())
+        path_entry.bind("<Return>", lambda _event: self.save_settings())
+        ttk.Button(output_frame, text="Browse", width=10, command=self.browse_ahk_path).grid(row=0, column=2, padx=(8, 0))
 
     def _build_sections(self, parent: ttk.Frame) -> None:
+        parent.configure(width=210)
         parent.rowconfigure(1, weight=1)
-        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1, minsize=190)
+        parent.grid_propagate(False)
 
-        ttk.Label(parent, text="Sections").grid(row=0, column=0, sticky="w")
+        ttk.Label(parent, text="Sections").grid(row=0, column=0, sticky="ew")
         self.section_list = tk.Listbox(parent, exportselection=False)
-        self.section_list.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(6, 8))
+        self.section_list.grid(row=1, column=0, sticky="nsew", pady=(6, 8))
         self.section_list.bind("<<ListboxSelect>>", self.on_section_select)
 
-        ttk.Button(parent, text="Add", command=self.add_section).grid(row=2, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(parent, text="Rename", command=self.rename_section).grid(row=2, column=1, sticky="ew", padx=4)
-        ttk.Button(parent, text="Delete", command=self.delete_section).grid(row=2, column=2, sticky="ew", padx=(4, 0))
+        button_frame = ttk.Frame(parent)
+        button_frame.grid(row=2, column=0, sticky="ew")
+        button_frame.columnconfigure((0, 1, 2), weight=0)
+        ttk.Button(button_frame, text="Add", width=8, command=self.add_section).grid(row=0, column=0, padx=(0, 4))
+        ttk.Button(button_frame, text="Rename", width=9, command=self.rename_section).grid(row=0, column=1, padx=4)
+        ttk.Button(button_frame, text="Delete", width=8, command=self.delete_section).grid(row=0, column=2, padx=(4, 0))
 
     def _build_table(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(2, weight=1)
@@ -121,7 +392,7 @@ class ExpansionApp(tk.Tk):
 
     def _build_form(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(6, weight=1)
+        parent.rowconfigure(7, weight=1)
 
         ttk.Label(parent, text="Edit Expansion").grid(row=0, column=0, sticky="w")
 
@@ -133,17 +404,23 @@ class ExpansionApp(tk.Tk):
         ttk.Entry(parent, textvariable=self.trigger_var).grid(row=4, column=0, sticky="ew")
 
         ttk.Label(parent, text="Replacement text").grid(row=5, column=0, sticky="sw", pady=(12, 2))
+        template_actions = ttk.Frame(parent)
+        template_actions.grid(row=6, column=0, sticky="ew", pady=(0, 4))
+        ttk.Button(template_actions, text="Insert Date/Time", command=self.insert_date_time).pack(side=tk.LEFT)
+        ttk.Button(template_actions, text="Insert Input Box", command=self.insert_input_box).pack(side=tk.LEFT, padx=4)
+        ttk.Button(template_actions, text="Insert List Selection", command=self.insert_list_selection).pack(side=tk.LEFT, padx=4)
+
         self.replacement_text = tk.Text(parent, height=10, wrap=tk.WORD, undo=True)
-        self.replacement_text.grid(row=6, column=0, sticky="nsew")
+        self.replacement_text.grid(row=7, column=0, sticky="nsew")
 
-        ttk.Label(parent, text="Notes").grid(row=7, column=0, sticky="w", pady=(12, 2))
+        ttk.Label(parent, text="Notes").grid(row=8, column=0, sticky="w", pady=(12, 2))
         self.notes_text = tk.Text(parent, height=5, wrap=tk.WORD, undo=True)
-        self.notes_text.grid(row=8, column=0, sticky="ew")
+        self.notes_text.grid(row=9, column=0, sticky="ew")
 
-        ttk.Checkbutton(parent, text="Enabled", variable=self.enabled_var).grid(row=9, column=0, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(parent, text="Enabled", variable=self.enabled_var).grid(row=10, column=0, sticky="w", pady=(10, 0))
 
         form_actions = ttk.Frame(parent)
-        form_actions.grid(row=10, column=0, sticky="ew", pady=(12, 0))
+        form_actions.grid(row=11, column=0, sticky="ew", pady=(12, 0))
         ttk.Button(form_actions, text="Apply", command=self.apply_form).pack(side=tk.LEFT)
         ttk.Button(form_actions, text="Reset", command=self.new_expansion).pack(side=tk.LEFT, padx=4)
 
@@ -282,6 +559,25 @@ class ExpansionApp(tk.Tk):
         self.notes_text.delete("1.0", tk.END)
         self.notes_text.insert("1.0", expansion.notes)
 
+    def insert_date_time(self) -> None:
+        dialog = DateTimeDialog(self)
+        if dialog.result:
+            self.insert_replacement_snippet(dialog.result)
+
+    def insert_input_box(self) -> None:
+        dialog = InputPlaceholderDialog(self)
+        if dialog.result:
+            self.insert_replacement_snippet(dialog.result)
+
+    def insert_list_selection(self) -> None:
+        dialog = SelectPlaceholderDialog(self)
+        if dialog.result:
+            self.insert_replacement_snippet(dialog.result)
+
+    def insert_replacement_snippet(self, snippet: str) -> None:
+        self.replacement_text.insert(tk.INSERT, snippet)
+        self.replacement_text.focus_set()
+
     def apply_form(self) -> None:
         try:
             expansion = self.read_form()
@@ -320,6 +616,10 @@ class ExpansionApp(tk.Tk):
             raise ValueError('Trigger cannot contain whitespace or "::".')
         if not replacement:
             raise ValueError("Replacement text cannot be blank.")
+        try:
+            parse_replacement_template(replacement)
+        except ValueError as exc:
+            raise ValueError(f"Replacement placeholder is invalid: {exc}") from exc
 
         return Expansion(section, trigger, replacement, self.enabled_var.get(), notes)
 
@@ -347,6 +647,36 @@ class ExpansionApp(tk.Tk):
         self.refresh_expansions()
         self.set_status(f'{"Enabled" if expansion.enabled else "Disabled"} "{expansion.trigger}".')
 
+    def current_ahk_path(self) -> Path:
+        configured_path = self.ahk_path_var.get().strip()
+        if not configured_path:
+            return AHK_PATH
+        return Path(configured_path).expanduser()
+
+    def browse_ahk_path(self) -> None:
+        current_path = self.current_ahk_path()
+        file_path = filedialog.asksaveasfilename(
+            title="Choose generated AutoHotkey script path",
+            initialdir=str(current_path.parent if current_path.parent.exists() else APP_DIR),
+            initialfile=current_path.name or DEFAULT_AHK,
+            defaultextension=".ahk",
+            filetypes=[("AutoHotkey files", "*.ahk"), ("All files", "*.*")],
+        )
+        if not file_path:
+            return
+        self.ahk_path_var.set(file_path)
+        self.save_settings()
+
+    def save_settings(self) -> None:
+        self.settings.generated_ahk_path = str(self.current_ahk_path())
+        self.ahk_path_var.set(self.settings.generated_ahk_path)
+        try:
+            self.settings.save(SETTINGS_PATH)
+        except OSError as exc:
+            messagebox.showerror("Settings error", f"Could not save {SETTINGS_PATH.name}: {exc}")
+            return
+        self.set_status(f"Saved {SETTINGS_PATH.name}.")
+
     def save_json(self) -> None:
         try:
             self.store.save(JSON_PATH)
@@ -356,18 +686,97 @@ class ExpansionApp(tk.Tk):
         self.set_status(f"Saved {JSON_PATH.name}.")
 
     def generate_ahk(self) -> None:
+        ahk_path = self.current_ahk_path()
         try:
+            self.save_settings()
             self.store.save(JSON_PATH)
-            backup_path = generate_ahk(self.store, AHK_PATH, backup=True)
+            backup_path = generate_ahk(self.store, ahk_path, backup=True)
         except (OSError, ValueError) as exc:
             messagebox.showerror("Generate error", str(exc))
             return
 
-        message = f"Generated {AHK_PATH.name}."
+        message = f"Generated {ahk_path}."
         if backup_path:
             message += f" Backup: {backup_path.name}."
         self.set_status(message)
         messagebox.showinfo("Generate .ahk", message)
+
+    def run_ahk(self) -> None:
+        if self.ahk_process is not None and self.ahk_process.poll() is None:
+            messagebox.showinfo("Run AHK", "The generated AHK script is already running from this app.")
+            return
+
+        try:
+            self.ahk_process = self._launch_ahk()
+        except ValueError as exc:
+            messagebox.showerror("Run AHK", str(exc))
+            return
+        self.set_status(f"Running {self.current_ahk_path()}.")
+
+    def reload_ahk(self) -> None:
+        if self.ahk_process is None:
+            messagebox.showinfo(
+                "Reload AHK",
+                "This app has not started the generated AHK script in this session. "
+                "Only app-started processes can be cleanly reloaded.",
+            )
+            return
+
+        if self.ahk_process.poll() is None:
+            self.ahk_process.terminate()
+            try:
+                self.ahk_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.ahk_process.kill()
+                self.ahk_process.wait(timeout=5)
+        else:
+            messagebox.showinfo(
+                "Reload AHK",
+                "The AHK process started by this app is no longer running. Use Run AHK to start it again.",
+            )
+            self.ahk_process = None
+            return
+
+        try:
+            self.ahk_process = self._launch_ahk()
+        except ValueError as exc:
+            messagebox.showerror("Reload AHK", str(exc))
+            return
+        self.set_status(f"Reloaded {self.current_ahk_path()}.")
+
+    def _launch_ahk(self) -> subprocess.Popen:
+        ahk_path = self.current_ahk_path()
+        if not ahk_path.exists():
+            raise ValueError(f"{ahk_path} does not exist. Generate the .ahk file first.")
+
+        executable = self._find_autohotkey()
+        if executable is None:
+            raise ValueError(
+                "AutoHotkey was not found. Install AutoHotkey v2 or add AutoHotkey.exe to PATH."
+            )
+
+        try:
+            return subprocess.Popen([str(executable), str(ahk_path)])
+        except OSError as exc:
+            raise ValueError(f"Could not launch AutoHotkey: {exc}") from exc
+
+    def _find_autohotkey(self) -> Path | None:
+        for name in ("AutoHotkey64.exe", "AutoHotkey.exe"):
+            found = shutil.which(name)
+            if found:
+                return Path(found)
+
+        candidates = [
+            Path("C:/Program Files/AutoHotkey/v2/AutoHotkey64.exe"),
+            Path("C:/Program Files/AutoHotkey/v2/AutoHotkey.exe"),
+            Path("C:/Program Files/AutoHotkey/AutoHotkey64.exe"),
+            Path("C:/Program Files/AutoHotkey/AutoHotkey.exe"),
+            Path("C:/Program Files (x86)/AutoHotkey/AutoHotkey.exe"),
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
 
     def import_ahk(self) -> None:
         file_path = filedialog.askopenfilename(
@@ -383,21 +792,26 @@ class ExpansionApp(tk.Tk):
             messagebox.showerror("Import error", str(exc))
             return
 
-        if self.store.expansions:
-            replace = messagebox.askyesno(
-                "Import .ahk",
-                "Replace current sections and expansions with the imported file?",
-            )
-            if not replace:
+        conflict_count = count_import_conflicts(self.store, imported)
+        conflict_action = "skip"
+        if conflict_count:
+            dialog = ImportConflictDialog(self, conflict_count)
+            conflict_action = dialog.result
+            if conflict_action is None:
                 return
 
-        self.store = imported
-        self.selected_section.set(self.store.sections[0])
+        result = merge_imported_store(self.store, imported, conflict_action)
+        self.selected_section.set(imported.sections[0] if imported.sections else self.store.sections[0])
         self.current_expansion = None
         self.refresh_sections()
         self.refresh_expansions()
         self.clear_form()
-        self.set_status(f"Imported {len(imported.expansions)} expansion(s).")
+        self.set_status(
+            "Imported "
+            f"{result.total_changed} expansion(s): "
+            f"{result.added} added, {result.overwritten} overwritten, "
+            f"{result.renamed} renamed, {result.skipped} skipped."
+        )
 
     def clear_search(self) -> None:
         self.search_var.set("")
