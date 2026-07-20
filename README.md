@@ -20,7 +20,13 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
-The app reads and writes `expansions.json` in the project folder. It also stores the generated-script path in `settings.json` and the light/dark theme choice in `ui_prefs.json`.
+The app reads and writes `expansions.json` in the project folder. This file holds your personal expansions and is not tracked in git. To start from a sample, copy the bundled example:
+
+```powershell
+Copy-Item expansions.json.example expansions.json
+```
+
+If `expansions.json` is absent, the app simply starts with an empty store. It also stores the generated-script path in `settings.json` and the light/dark theme choice in `ui_prefs.json` (both untracked).
 
 The window uses a left sidebar to switch between the **Expansions**, **Variables**, and **Templates** views, and a theme toggle at the bottom of the sidebar switches between light and dark mode (defaulting to your OS setting).
 

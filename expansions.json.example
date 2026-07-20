@@ -1,0 +1,95 @@
+{
+  "sections": [
+    "General",
+    "Email",
+    "Dates"
+  ],
+  "expansions": [
+    {
+      "section": "General",
+      "trigger": "brb",
+      "replacement": "Be right back!",
+      "enabled": true,
+      "notes": "Simple literal expansion. Punctuation such as ! is sent as-is."
+    },
+    {
+      "section": "General",
+      "trigger": ";hello",
+      "replacement": "Hello {AHK_INPUT:person|Enter a name|Name|}, nice to meet you!",
+      "enabled": true,
+      "notes": "Prompts for a value at expansion time via an inline input box."
+    },
+    {
+      "section": "Email",
+      "trigger": ";dear",
+      "replacement": "{TPL:Greeting}\n\n",
+      "enabled": true,
+      "notes": "Inserts the reusable Greeting template."
+    },
+    {
+      "section": "Email",
+      "trigger": ";sig",
+      "replacement": "{TPL:Signature}",
+      "enabled": true,
+      "notes": "Inserts the reusable Signature template."
+    },
+    {
+      "section": "Email",
+      "trigger": ";status",
+      "replacement": "Current status: {VAR:status}",
+      "enabled": true,
+      "notes": "Uses a list-selection variable."
+    },
+    {
+      "section": "Dates",
+      "trigger": ";today",
+      "replacement": "Today is {VAR:today_iso}.",
+      "enabled": true,
+      "notes": "Uses a date/time variable."
+    }
+  ],
+  "variables": [
+    {
+      "name": "client_name",
+      "type": "text_input",
+      "prompt_text": "Enter client name",
+      "default_value": "",
+      "list_options": [],
+      "notes": "Free-text value prompted at expansion time."
+    },
+    {
+      "name": "status",
+      "type": "list_selection",
+      "prompt_text": "Choose a status",
+      "default_value": "",
+      "list_options": [
+        "Pending",
+        "Approved",
+        "Rejected"
+      ],
+      "notes": "Presents a drop-down of options."
+    },
+    {
+      "name": "today_iso",
+      "type": "date_time",
+      "prompt_text": "",
+      "default_value": "yyyy-MM-dd",
+      "list_options": [],
+      "notes": "AutoHotkey FormatTime pattern."
+    }
+  ],
+  "templates": [
+    {
+      "name": "Greeting",
+      "description": "Opening line for a letter or email",
+      "body": "Dear {VAR:client_name},",
+      "notes": ""
+    },
+    {
+      "name": "Signature",
+      "description": "Standard closing signature",
+      "body": "Best regards,\nYour Name",
+      "notes": ""
+    }
+  ]
+}
