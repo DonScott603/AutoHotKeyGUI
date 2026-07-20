@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -67,7 +67,17 @@ def _app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _resource_path(name: str) -> Path:
+    # Bundled read-only resources (e.g. the icon) live in the PyInstaller
+    # extraction dir when frozen, separate from the writable data dir.
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        return Path(base) / name
+    return Path(__file__).resolve().parent / name
+
+
 APP_DIR = _app_dir()
+ICON_PATH = _resource_path("app.ico")
 JSON_PATH = APP_DIR / DEFAULT_JSON
 AHK_PATH = APP_DIR / DEFAULT_AHK
 SETTINGS_PATH = APP_DIR / DEFAULT_SETTINGS
@@ -549,6 +559,8 @@ class ExpansionApp(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("AutoHotkey Text Expansion Manager")
+        if ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICON_PATH)))
         # Open wide enough that the Snippets table shows all columns without a
         # horizontal scrollbar (even when a vertical scrollbar is present).
         self.resize(1448, 720)
@@ -1751,6 +1763,8 @@ class ExpansionApp(QMainWindow):
 
 def main() -> None:
     app = QApplication.instance() or QApplication(sys.argv)
+    if ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(ICON_PATH)))
     window = ExpansionApp()
     window.show()
     app.exec()

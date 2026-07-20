@@ -45,12 +45,17 @@ portable: it reads and writes `expansions.json`, `settings.json`, and
 `ui_prefs.json` **in the same folder as the `.exe`**, so run it from a
 user-writable location (e.g. its own folder, not `C:\Program Files`).
 
-The bundled `.spec` produces a one-file, windowed (no console) build. Delete it
-to regenerate defaults, or rebuild from scratch with:
+The bundled `.spec` produces a one-file, windowed (no console) build with the
+app icon. Rebuild from scratch with:
 
 ```powershell
-python -m PyInstaller --onefile --windowed --name AutoHotkeyExpansionManager app.py
+python -m PyInstaller --onefile --windowed --name AutoHotkeyExpansionManager `
+  --icon app.ico --add-data "app.ico;." app.py
 ```
+
+Releases are also built automatically: publishing a GitHub Release runs
+`.github/workflows/build.yml`, which builds the exe and attaches it to the
+release. The icon (`app.ico`) can be regenerated with `python tools/make_icon.py`.
 
 ## Generate the AutoHotkey script
 
