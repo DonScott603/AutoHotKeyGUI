@@ -103,6 +103,44 @@ class PlaceholderGenerationTests(unittest.TestCase):
         self.assertIn('__tem_result .= "Right"', output)
         self.assertNotIn("::tabbed::Left", output)
 
+    def test_output_declares_single_instance_force(self) -> None:
+        store = ExpansionStore(
+            sections=["Common"],
+            expansions=[Expansion("Common", "brb", "Be right back")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn("#SingleInstance Force", output)
+
+    def test_dynamic_hotstring_reproduces_ending_character(self) -> None:
+        store = ExpansionStore(
+            sections=["Dates"],
+            expansions=[
+                Expansion(
+                    "Dates",
+                    "today",
+                    'Today is {AHK_EXPR:FormatTime(A_Now, "yyyy-MM-dd")}',
+                )
+            ],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn('if (A_EndChar = "`r" || A_EndChar = "`n") {', output)
+        self.assertIn('Send("{Enter}")', output)
+        self.assertIn("SendText(A_EndChar)", output)
+
+    def test_static_hotstring_omits_ending_character_logic(self) -> None:
+        store = ExpansionStore(
+            sections=["Common"],
+            expansions=[Expansion("Common", "brb", "Be right back")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertNotIn("A_EndChar", output)
+
     def test_case_sensitive_hotstrings_preserve_trigger_case(self) -> None:
         store = ExpansionStore(
             sections=["Case"],
