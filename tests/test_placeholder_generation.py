@@ -15,6 +15,21 @@ class PlaceholderGenerationTests(unittest.TestCase):
         self.assertIn(":CT:brb::Be right back", output)
         self.assertNotIn("SendText(__tem_result)", output)
 
+    def test_empty_replacement_is_skipped_not_broken(self) -> None:
+        # A ":opts:trigger::" line with nothing after "::" makes AutoHotkey expect
+        # a code block and error. An empty replacement must instead be skipped.
+        store = ExpansionStore(
+            sections=["S"],
+            expansions=[Expansion("S", ";x", ""), Expansion("S", "ok", "fine")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn('Skipped ";x": empty replacement.', output)
+        self.assertIn(":CT:ok::fine", output)
+        for line in output.splitlines():
+            self.assertFalse(line.rstrip().endswith("::"), f"bare hotstring: {line!r}")
+
     def test_static_replacement_with_send_special_chars_uses_text_mode(self) -> None:
         # "!", "^", "+", "#", "{", "}" are Send modifiers/keys in AutoHotkey's
         # default hotstring mode; the "T" (Text) option sends them literally so a

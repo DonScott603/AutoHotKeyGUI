@@ -340,11 +340,23 @@ def import_ahk(path: Path) -> ExpansionStore:
                         notes=str(pending_source.get("notes", "")),
                     )
                 )
-            elif hotstring_match.group("replacement") == "" and _hotstring_has_code_block(lines, index):
-                # A dynamic hotstring from an unmarked file: its logic lives in a
-                # code block that cannot be reversed into template syntax. Skip it
-                # rather than import a corrupt empty expansion.
-                pass
+            elif hotstring_match.group("replacement") == "" and (
+                (block_open := _find_block_open(lines, index)) is not None
+            ):
+                # A dynamic hotstring from an unmarked (pre-marker) generated file.
+                # Reconstruct the template from the generated code block; if the
+                # block is not in a recognised form, skip it rather than import a
+                # corrupt empty expansion.
+                reconstructed = _reconstruct_replacement(lines, block_open)
+                if reconstructed is not None:
+                    expansions.append(
+                        Expansion(
+                            section=current_section,
+                            trigger=trigger,
+                            replacement=reconstructed,
+                            enabled=enabled,
+                        )
+                    )
             else:
                 expansions.append(
                     Expansion(
@@ -361,14 +373,142 @@ def import_ahk(path: Path) -> ExpansionStore:
     return ExpansionStore(sections=sections, expansions=expansions)
 
 
-def _hotstring_has_code_block(lines: list[str], index: int) -> bool:
-    """Return True if the hotstring at ``index`` is followed by a ``{`` block."""
-    for follow in lines[index + 1:]:
-        stripped = follow.strip()
-        if not stripped:
+_BLOCK_OPEN_RE = re.compile(r"^;?\s?\{\s*$")
+_BLOCK_CLOSE_RE = re.compile(r"^;?\s?\}\s*$")
+_AHK_QUOTED_RE = re.compile(r'"((?:`.|[^"`])*)"')
+
+
+def _find_block_open(lines: list[str], index: int) -> int | None:
+    """Return the index of a top-level ``{`` immediately following a hotstring."""
+    for j in range(index + 1, len(lines)):
+        if not lines[j].strip():
             continue
-        return stripped.lstrip(";").strip() == "{"
-    return False
+        return j if _BLOCK_OPEN_RE.match(lines[j]) else None
+    return None
+
+
+def _strip_disabled(line: str) -> str:
+    return re.sub(r"^;\s?", "", line)
+
+
+def _unescape_ahk(value: str) -> str:
+    escapes = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "`": "`", '"': '"'}
+    out: list[str] = []
+    i = 0
+    while i < len(value):
+        char = value[i]
+        if char == "`" and i + 1 < len(value):
+            out.append(escapes.get(value[i + 1], value[i + 1]))
+            i += 2
+        else:
+            out.append(char)
+            i += 1
+    return "".join(out)
+
+
+def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
+    """Rebuild a replacement template from a generated code block.
+
+    Reverses the fixed patterns emitted by ``render_expansion`` for dynamic
+    expansions (literals, AHK_EXPR, AHK_INPUT, AHK_SELECT, AHK_KEY, AHK_IMAGE).
+    Returns None if the block is not in the expected generated form.
+    """
+    close_index = None
+    for j in range(open_index + 1, len(lines)):
+        if _BLOCK_CLOSE_RE.match(lines[j]):
+            close_index = j
+            break
+    if close_index is None:
+        return None
+
+    body = [_strip_disabled(lines[k]).strip() for k in range(open_index + 1, close_index)]
+    parts: list[str] = []
+    i = 0
+    while i < len(body):
+        line = body[i]
+        if line in ("", '__tem_result := ""'):
+            i += 1
+            continue
+        # Flush block: if (__tem_result != "") { ... }
+        if line == 'if (__tem_result != "") {':
+            i += 1
+            while i < len(body) and body[i] != "}":
+                i += 1
+            i += 1
+            continue
+        # End-char handling (always a fixed 5-line trailer).
+        if line.startswith("if (A_EndChar"):
+            i += 5
+            continue
+        # Literal text: __tem_result .= "..."
+        literal = re.fullmatch(r'__tem_result \.= "(.*)"', line)
+        if literal:
+            parts.append(_unescape_ahk(literal.group(1)))
+            i += 1
+            continue
+        # Input box: 5 lines.
+        if re.match(r"__tem_input_\w+ := InputBox\(", line):
+            quoted = _AHK_QUOTED_RE.findall(line)
+            if len(quoted) < 2:
+                return None
+            var = re.match(r"__tem_input_(\w+) :=", line).group(1)
+            prompt = _unescape_ahk(quoted[0])
+            title = _unescape_ahk(quoted[1])
+            default = _unescape_ahk(quoted[2]) if len(quoted) > 2 else ""
+            parts.append(f"{{AHK_INPUT:{var}|{prompt}|{title}|{default}}}")
+            i += 5
+            continue
+        # List selection: 5 lines.
+        if re.match(r"__tem_select_\w+ := TEM_Select\(", line):
+            quoted = _AHK_QUOTED_RE.findall(line)
+            if len(quoted) < 2:
+                return None
+            var = re.match(r"__tem_select_(\w+) :=", line).group(1)
+            prompt = _unescape_ahk(quoted[0])
+            title = _unescape_ahk(quoted[1])
+            options = [_unescape_ahk(option) for option in quoted[2:]]
+            parts.append(f"{{AHK_SELECT:{var}|{prompt}|{title}|{'||'.join(options)}}}")
+            i += 5
+            continue
+        # Key press: SendEvent("{Tab}") followed by Sleep(...).
+        key = re.fullmatch(r'SendEvent\("\{(\w+)\}"\)', line)
+        if key:
+            parts.append(f"{{AHK_KEY:{key.group(1)}}}")
+            i += 1
+            if i < len(body) and body[i].startswith("Sleep("):
+                i += 1
+            continue
+        # Image paste: if (!TEM_PasteImage("...")) / return
+        image = re.fullmatch(r'if \(!TEM_PasteImage\("(.*)"\)\)', line)
+        if image:
+            parts.append(f"{{AHK_IMAGE:{_unescape_ahk(image.group(1))}}}")
+            i += 1
+            if i < len(body) and body[i] == "return":
+                i += 1
+            continue
+        # AHK expression: __tem_result .= <expr>
+        expr = re.fullmatch(r"__tem_result \.= (.+)", line)
+        if expr:
+            value = expr.group(1).strip()
+            if re.fullmatch(r"\w+", value):
+                # A bare variable reference already emitted by an input/select block.
+                i += 1
+                continue
+            parts.append(f"{{AHK_EXPR:{value}}}")
+            i += 1
+            continue
+        # Leftover lines that belong to an input/select block we already emitted.
+        if (
+            line == "return"
+            or re.fullmatch(r"if \(.*\)", line)
+            or re.fullmatch(r"\w+ := __tem_(input|select)_\w+\.\w+", line)
+        ):
+            i += 1
+            continue
+        # Unrecognised content: refuse rather than guess.
+        return None
+
+    return "".join(parts) if parts else None
 
 
 def count_import_conflicts(target: ExpansionStore, imported: ExpansionStore) -> int:
@@ -480,6 +620,13 @@ def render_expansion(
     variables: list[VariableDef] | None = None,
     templates: list[TemplateDef] | None = None,
 ) -> RenderedExpansion:
+    if expansion.replacement == "":
+        # An empty replacement would emit ":opts:trigger::" with nothing after
+        # "::", which AutoHotkey reads as the start of an execute hotstring and
+        # then errors ("hotstring is missing its opening brace"). Emit an inert
+        # comment instead so the generated script always runs.
+        return RenderedExpansion([f'; Skipped "{expansion.trigger}": empty replacement.'])
+
     segments = resolve_template_segments(
         parse_replacement_template(expansion.replacement),
         templates or [],

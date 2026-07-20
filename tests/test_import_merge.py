@@ -155,14 +155,39 @@ class ImportMergeTests(unittest.TestCase):
         self.assertEqual(imported.expansions[0].replacement, "Be right back!")
         self.assertEqual(imported.expansions[0].notes, "quick")
 
-    def test_unmarked_code_block_hotstring_is_skipped(self) -> None:
-        # An old generated file (no source marker) whose dynamic logic lives in a
-        # code block must be skipped, not imported as a corrupt empty expansion.
+    def test_unmarked_dynamic_block_is_reconstructed(self) -> None:
+        # An old generated file (no source markers) must have its dynamic
+        # expansions reconstructed from the generated code blocks.
+        store = ExpansionStore(
+            sections=["Dates", "Work"],
+            expansions=[
+                Expansion("Dates", ";ld", '{AHK_EXPR:FormatTime(A_Now, "yyyy-MM-dd")}'),
+                Expansion("Work", ";ask", "Hi {AHK_INPUT:name|Enter name|Name|}, ok"),
+            ],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "old.ahk"
+            generate_ahk(store, ahk_path, backup=False)
+            text = ahk_path.read_text(encoding="utf-8")
+            without_markers = "\n".join(
+                line for line in text.splitlines() if not line.strip().startswith("; @tem:")
+            )
+            ahk_path.write_text(without_markers, encoding="utf-8")
+            imported = import_ahk(ahk_path)
+
+        by_trigger = {item.trigger: item.replacement for item in imported.expansions}
+        self.assertEqual(by_trigger[";ld"], '{AHK_EXPR:FormatTime(A_Now, "yyyy-MM-dd")}')
+        self.assertEqual(by_trigger[";ask"], "Hi {AHK_INPUT:name|Enter name|Name|}, ok")
+
+    def test_unrecognised_code_block_hotstring_is_skipped(self) -> None:
+        # A code block that is not in the generated form cannot be reversed and
+        # must be skipped rather than imported as a corrupt empty expansion.
         content = (
-            "; === Dates ===\n"
-            ":C:;ld::\n"
+            "; === Misc ===\n"
+            ":C:;weird::\n"
             "{\n"
-            '    __tem_result := ""\n'
+            "    SomethingUnexpected()\n"
             "}\n"
         )
         with TemporaryDirectory() as temp_dir:
