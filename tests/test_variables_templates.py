@@ -1,6 +1,12 @@
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+# Run Qt without a real display so the GUI tests work headlessly (e.g. in CI).
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication, QPushButton
 
 from ahk_manager import (
     Expansion,
@@ -12,6 +18,10 @@ from ahk_manager import (
     validate_variables,
 )
 from app import ExpansionApp
+
+
+# A single QApplication must exist for the lifetime of the process.
+_qt_app = QApplication.instance() or QApplication([])
 
 
 class VariableTemplateTests(unittest.TestCase):
@@ -89,78 +99,78 @@ class VariableTemplateTests(unittest.TestCase):
             app.store.templates = [
                 TemplateDef("Client Follow-Up", "", "Dear {VAR:client_name},", ""),
             ]
-            app.replacement_text.delete("1.0", "end")
+            app.replacement_text.setPlainText("")
             app.insert_snippet("{TPL:Client Follow-Up}", app.replacement_text)
-            self.assertEqual(app.replacement_text.get("1.0", "end-1c"), "{TPL:Client Follow-Up}")
+            self.assertEqual(app.replacement_text.toPlainText(), "{TPL:Client Follow-Up}")
         finally:
-            app.destroy()
+            app.close()
 
     def test_variable_placeholder_syntax(self) -> None:
         app = ExpansionApp()
         try:
-            app.replacement_text.delete("1.0", "end")
+            app.replacement_text.setPlainText("")
             app.insert_replacement_snippet("{VAR:client_name}")
-            self.assertEqual(app.replacement_text.get("1.0", "end-1c"), "{VAR:client_name}")
+            self.assertEqual(app.replacement_text.toPlainText(), "{VAR:client_name}")
         finally:
-            app.destroy()
+            app.close()
 
     def test_template_body_accepts_variable_insertion_syntax(self) -> None:
         app = ExpansionApp()
         try:
-            app.template_body_text.delete("1.0", "end")
+            app.template_body_text.setPlainText("")
             app.insert_snippet("{VAR:client_name}", app.template_body_text)
-            self.assertEqual(app.template_body_text.get("1.0", "end-1c"), "{VAR:client_name}")
+            self.assertEqual(app.template_body_text.toPlainText(), "{VAR:client_name}")
         finally:
-            app.destroy()
+            app.close()
 
     def test_template_body_accepts_date_time_placeholder(self) -> None:
         app = ExpansionApp()
         try:
             snippet = '{AHK_EXPR:FormatTime(A_Now, "yyyy-MM-dd")}'
-            app.template_body_text.delete("1.0", "end")
+            app.template_body_text.setPlainText("")
             app.insert_snippet(snippet, app.template_body_text)
-            self.assertEqual(app.template_body_text.get("1.0", "end-1c"), snippet)
+            self.assertEqual(app.template_body_text.toPlainText(), snippet)
         finally:
-            app.destroy()
+            app.close()
 
     def test_template_body_accepts_input_placeholder(self) -> None:
         app = ExpansionApp()
         try:
             snippet = "{AHK_INPUT:client_name|Enter client name|Client Name|}"
-            app.template_body_text.delete("1.0", "end")
+            app.template_body_text.setPlainText("")
             app.insert_snippet(snippet, app.template_body_text)
-            self.assertEqual(app.template_body_text.get("1.0", "end-1c"), snippet)
+            self.assertEqual(app.template_body_text.toPlainText(), snippet)
         finally:
-            app.destroy()
+            app.close()
 
     def test_template_body_accepts_list_selection_placeholder(self) -> None:
         app = ExpansionApp()
         try:
             snippet = "{AHK_SELECT:status|Choose status|Status|Pending||Approved}"
-            app.template_body_text.delete("1.0", "end")
+            app.template_body_text.setPlainText("")
             app.insert_snippet(snippet, app.template_body_text)
-            self.assertEqual(app.template_body_text.get("1.0", "end-1c"), snippet)
+            self.assertEqual(app.template_body_text.toPlainText(), snippet)
         finally:
-            app.destroy()
+            app.close()
 
     def test_template_body_accepts_image_placeholder(self) -> None:
         app = ExpansionApp()
         try:
             snippet = r"{AHK_IMAGE:C:\Images\logo.png}"
-            app.template_body_text.delete("1.0", "end")
+            app.template_body_text.setPlainText("")
             app.insert_snippet(snippet, app.template_body_text)
-            self.assertEqual(app.template_body_text.get("1.0", "end-1c"), snippet)
+            self.assertEqual(app.template_body_text.toPlainText(), snippet)
         finally:
-            app.destroy()
+            app.close()
 
     def test_template_body_accepts_tab_placeholder(self) -> None:
         app = ExpansionApp()
         try:
-            app.template_body_text.delete("1.0", "end")
+            app.template_body_text.setPlainText("")
             app.insert_snippet("{AHK_KEY:Tab}", app.template_body_text)
-            self.assertEqual(app.template_body_text.get("1.0", "end-1c"), "{AHK_KEY:Tab}")
+            self.assertEqual(app.template_body_text.toPlainText(), "{AHK_KEY:Tab}")
         finally:
-            app.destroy()
+            app.close()
 
     def test_template_nesting_resolves_when_used_by_expansion(self) -> None:
         store = ExpansionStore(
@@ -204,27 +214,19 @@ class VariableTemplateTests(unittest.TestCase):
     def test_template_editor_has_same_insertion_buttons(self) -> None:
         app = ExpansionApp()
         try:
-            labels = set()
-
-            def walk(widget):
-                for child in widget.winfo_children():
-                    if child.winfo_class() == "TButton":
-                        labels.add(child.cget("text"))
-                    walk(child)
-
-            walk(app.template_body_text.master)
+            labels = {button.text() for button in app.findChildren(QPushButton)}
             for label in {
-                "Insert Variable",
-                "Insert Template",
-                "Insert Date/Time",
-                "Insert Input Box",
-                "Insert List Selection",
-                "Insert Tab",
-                "Insert Image",
+                "Variable",
+                "Template",
+                "Date/Time",
+                "Input Box",
+                "List Selection",
+                "Tab",
+                "Image",
             }:
                 self.assertIn(label, labels)
         finally:
-            app.destroy()
+            app.close()
 
     def test_duplicate_variable_names_are_invalid(self) -> None:
         with self.assertRaisesRegex(ValueError, "Duplicate variable name"):
@@ -246,7 +248,7 @@ class VariableTemplateTests(unittest.TestCase):
             expansions=[Expansion("Common", "brb", "Be right back")],
         )
 
-        self.assertIn(":C:brb::Be right back", render_ahk(store))
+        self.assertIn(":CT:brb::Be right back", render_ahk(store))
 
 
 if __name__ == "__main__":

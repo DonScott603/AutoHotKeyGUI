@@ -2,3 +2,4 @@ __pycache__/
 *.py[cod]
 *.bak.ahk
 settings.json
+ui_prefs.json

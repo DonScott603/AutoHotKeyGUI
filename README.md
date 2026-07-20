@@ -4,11 +4,15 @@ A small Windows desktop app for managing AutoHotkey text expansion hotstrings wi
 
 ## Requirements
 
-- Python 3
-- Tkinter, which is included with the standard Windows Python installer
+- Python 3.11+
+- [PySide6](https://pypi.org/project/PySide6/) (Qt for Python) for the GUI
 - AutoHotkey v2 to run the generated script
 
-No third-party Python packages are required.
+Install the Python dependencies with:
+
+```powershell
+python -m pip install -r requirements.txt
+```
 
 ## Run the app
 
@@ -16,7 +20,9 @@ No third-party Python packages are required.
 python app.py
 ```
 
-The app reads and writes `expansions.json` in the project folder. It also stores app preferences in `settings.json`.
+The app reads and writes `expansions.json` in the project folder. It also stores the generated-script path in `settings.json` and the light/dark theme choice in `ui_prefs.json`.
+
+The window uses a left sidebar to switch between the **Expansions**, **Variables**, and **Templates** views, and a theme toggle at the bottom of the sidebar switches between light and dark mode (defaulting to your OS setting).
 
 ## Generate the AutoHotkey script
 

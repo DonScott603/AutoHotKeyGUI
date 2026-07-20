@@ -277,6 +277,10 @@ PLACEHOLDER_START_RE = re.compile(r"\{(?:AHK_(?:EXPR|INPUT|SELECT|KEY|IMAGE)|VAR
 VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SUPPORTED_KEYS = {"Tab"}
 HOTSTRING_OPTIONS = "C"
+# Static auto-replace hotstrings add "T" (Text mode) so the replacement is sent
+# literally. Without it AutoHotkey interprets ^ + ! # { } as Send modifiers/keys
+# (e.g. a leading/trailing "!" becomes Alt), corrupting the expansion.
+STATIC_HOTSTRING_OPTIONS = "CT"
 VARIABLE_TYPES = {"text_input", "list_selection", "date_time"}
 
 
@@ -435,7 +439,7 @@ def render_expansion(
     segments = resolve_variable_segments(segments, variables or [])
     dynamic = any(isinstance(segment, TemplatePlaceholder) for segment in segments)
     if not dynamic:
-        line = f":{HOTSTRING_OPTIONS}:{expansion.trigger}::{_single_line_replacement(expansion.replacement)}"
+        line = f":{STATIC_HOTSTRING_OPTIONS}:{expansion.trigger}::{_single_line_replacement(expansion.replacement)}"
         lines = [line]
         if expansion.notes:
             lines.append(f"; Notes: {expansion.notes}")

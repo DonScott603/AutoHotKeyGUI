@@ -1,11 +1,40 @@
-import shutil
-import subprocess
-import tkinter as tk
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QRadioButton,
+    QSplitter,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
 
 from ahk_manager import (
     DEFAULT_AHK,
@@ -33,31 +62,20 @@ APP_DIR = Path(__file__).resolve().parent
 JSON_PATH = APP_DIR / DEFAULT_JSON
 AHK_PATH = APP_DIR / DEFAULT_AHK
 SETTINGS_PATH = APP_DIR / DEFAULT_SETTINGS
-IMAGE_FILE_TYPES = [
-    ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
-    ("PNG files", "*.png"),
-    ("JPEG files", "*.jpg *.jpeg"),
-    ("GIF files", "*.gif"),
-    ("Bitmap files", "*.bmp"),
-    ("WebP files", "*.webp"),
-    ("All files", "*.*"),
-]
+UI_PREFS_PATH = APP_DIR / "ui_prefs.json"
+
+# Qt file-dialog filter strings (";;"-separated) rather than tkinter tuples.
+IMAGE_FILE_FILTER = (
+    "Image files (*.png *.jpg *.jpeg *.gif *.bmp *.webp);;"
+    "PNG files (*.png);;"
+    "JPEG files (*.jpg *.jpeg);;"
+    "GIF files (*.gif);;"
+    "Bitmap files (*.bmp);;"
+    "WebP files (*.webp);;"
+    "All files (*.*)"
+)
+AHK_FILE_FILTER = "AutoHotkey files (*.ahk);;All files (*.*)"
 AHK_PROCESS_NAMES = {"autohotkey.exe", "autohotkey64.exe", "autohotkey32.exe"}
-TABLE_ACTION_BUTTON_WIDTHS = {
-    "New": 8,
-    "Edit": 8,
-    "Delete": 10,
-    "Toggle Enabled": 15,
-}
-TEMPLATE_ACTION_BUTTON_WIDTHS = {
-    "Insert Date/Time": 17,
-    "Insert Input Box": 17,
-    "Insert List Selection": 19,
-    "Insert Tab": 17,
-    "Insert Image": 17,
-    "Insert Variable": 17,
-    "Insert Template": 17,
-}
 
 
 def has_reserved_placeholder_chars(value: str) -> bool:
@@ -88,38 +106,209 @@ def extract_ahk_script_paths(command_line: str) -> list[str]:
     return paths
 
 
-class ImportConflictDialog(simpledialog.Dialog):
-    def __init__(self, parent: tk.Tk, conflict_count: int) -> None:
-        self.conflict_count = conflict_count
-        self.choice = tk.StringVar(value="skip")
+# ---------------------------------------------------------------------------
+# Theming
+# ---------------------------------------------------------------------------
+
+_THEME_COLORS = {
+    "light": {
+        "bg": "#f4f5f7",
+        "panel": "#ffffff",
+        "panel_alt": "#eceef1",
+        "text": "#1f2937",
+        "muted": "#6b7280",
+        "border": "#d1d5db",
+        "accent": "#2563eb",
+        "accent_text": "#ffffff",
+        "sidebar": "#e9ebef",
+        "sidebar_sel": "#2563eb",
+        "sidebar_sel_text": "#ffffff",
+        "warn": "#9a3412",
+        "selection": "#dbeafe",
+    },
+    "dark": {
+        "bg": "#1e1f22",
+        "panel": "#2b2d31",
+        "panel_alt": "#232428",
+        "text": "#e5e7eb",
+        "muted": "#9ca3af",
+        "border": "#3f4147",
+        "accent": "#3b82f6",
+        "accent_text": "#ffffff",
+        "sidebar": "#191a1d",
+        "sidebar_sel": "#3b82f6",
+        "sidebar_sel_text": "#ffffff",
+        "warn": "#fca5a5",
+        "selection": "#1e3a5f",
+    },
+}
+
+
+def build_stylesheet(theme: str) -> str:
+    c = _THEME_COLORS[theme]
+    return f"""
+    QWidget {{
+        background-color: {c['bg']};
+        color: {c['text']};
+        font-size: 10pt;
+    }}
+    QLabel {{ background: transparent; }}
+    QLabel#Heading {{ font-size: 12pt; font-weight: 600; }}
+    QLabel#Warn {{ color: {c['warn']}; }}
+    QLabel#Muted {{ color: {c['muted']}; }}
+    QListWidget, QTableWidget, QPlainTextEdit, QLineEdit, QComboBox {{
+        background-color: {c['panel']};
+        border: 1px solid {c['border']};
+        border-radius: 6px;
+        selection-background-color: {c['selection']};
+        selection-color: {c['text']};
+    }}
+    QPlainTextEdit, QLineEdit {{ padding: 4px 6px; }}
+    QComboBox {{ padding: 4px 6px; }}
+    QTableWidget {{ gridline-color: {c['border']}; }}
+    QHeaderView::section {{
+        background-color: {c['panel_alt']};
+        color: {c['muted']};
+        border: none;
+        border-bottom: 1px solid {c['border']};
+        padding: 5px 6px;
+        font-weight: 600;
+    }}
+    QListWidget#Sidebar {{
+        background-color: {c['sidebar']};
+        border: none;
+        border-right: 1px solid {c['border']};
+        border-radius: 0px;
+        outline: 0;
+        padding-top: 8px;
+    }}
+    QListWidget#Sidebar::item {{
+        padding: 10px 14px;
+        margin: 2px 6px;
+        border-radius: 6px;
+    }}
+    QListWidget#Sidebar::item:selected {{
+        background-color: {c['sidebar_sel']};
+        color: {c['sidebar_sel_text']};
+    }}
+    QPushButton {{
+        background-color: {c['panel']};
+        border: 1px solid {c['border']};
+        border-radius: 6px;
+        padding: 6px 12px;
+    }}
+    QPushButton:hover {{ background-color: {c['panel_alt']}; }}
+    QPushButton:pressed {{ background-color: {c['accent']}; color: {c['accent_text']}; }}
+    QPushButton#Primary {{
+        background-color: {c['accent']};
+        color: {c['accent_text']};
+        border: 1px solid {c['accent']};
+        font-weight: 600;
+    }}
+    QPushButton#Primary:hover {{ background-color: {c['accent']}; }}
+    QSplitter::handle {{ background-color: {c['border']}; }}
+    QStatusBar {{ background: transparent; }}
+    """
+
+
+def detect_system_theme() -> str:
+    try:
+        scheme = QGuiApplication.styleHints().colorScheme()
+        if scheme == Qt.ColorScheme.Dark:
+            return "dark"
+    except Exception:
+        pass
+    return "light"
+
+
+def load_theme_pref() -> str | None:
+    try:
+        data = json.loads(UI_PREFS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    theme = data.get("theme")
+    return theme if theme in ("light", "dark") else None
+
+
+def save_theme_pref(theme: str) -> None:
+    try:
+        UI_PREFS_PATH.write_text(
+            json.dumps({"theme": theme}, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Small message-box helpers
+# ---------------------------------------------------------------------------
+
+def show_error(parent, title: str, message: str) -> None:
+    QMessageBox.critical(parent, title, message)
+
+
+def show_info(parent, title: str, message: str) -> None:
+    QMessageBox.information(parent, title, message)
+
+
+def show_warning(parent, title: str, message: str) -> None:
+    QMessageBox.warning(parent, title, message)
+
+
+def confirm(parent, title: str, message: str) -> bool:
+    reply = QMessageBox.question(
+        parent,
+        title,
+        message,
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No,
+    )
+    return reply == QMessageBox.StandardButton.Yes
+
+
+# ---------------------------------------------------------------------------
+# Dialogs
+# ---------------------------------------------------------------------------
+
+class ImportConflictDialog(QDialog):
+    def __init__(self, parent, conflict_count: int) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Import conflicts")
         self.result: str | None = None
-        super().__init__(parent, "Import conflicts")
 
-    def body(self, master: tk.Frame) -> tk.Widget:
-        ttk.Label(
-            master,
-            text=(
-                f"{self.conflict_count} imported trigger(s) already exist in the same section. "
-                "Choose how to handle all conflicts."
-            ),
-            wraplength=420,
-        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
-        ttk.Radiobutton(master, text="Skip duplicate triggers", variable=self.choice, value="skip").grid(
-            row=1, column=0, sticky="w"
+        layout = QVBoxLayout(self)
+        label = QLabel(
+            f"{conflict_count} imported trigger(s) already exist in the same section. "
+            "Choose how to handle all conflicts."
         )
-        ttk.Radiobutton(master, text="Overwrite existing expansions", variable=self.choice, value="overwrite").grid(
-            row=2, column=0, sticky="w"
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        self._skip = QRadioButton("Skip duplicate triggers")
+        self._overwrite = QRadioButton("Overwrite existing expansions")
+        self._rename = QRadioButton("Keep both with renamed trigger")
+        self._skip.setChecked(True)
+        for widget in (self._skip, self._overwrite, self._rename):
+            layout.addWidget(widget)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        ttk.Radiobutton(master, text="Keep both with renamed trigger", variable=self.choice, value="rename").grid(
-            row=3, column=0, sticky="w"
-        )
-        return master
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
-    def apply(self) -> None:
-        self.result = self.choice.get()
+    def accept(self) -> None:
+        if self._overwrite.isChecked():
+            self.result = "overwrite"
+        elif self._rename.isChecked():
+            self.result = "rename"
+        else:
+            self.result = "skip"
+        super().accept()
 
 
-class DateTimeDialog(simpledialog.Dialog):
+class DateTimeDialog(QDialog):
     FORMAT_OPTIONS = {
         "Short date": "MM/dd/yyyy",
         "ISO date": "yyyy-MM-dd",
@@ -129,656 +318,846 @@ class DateTimeDialog(simpledialog.Dialog):
         "Custom format": "",
     }
 
-    def __init__(self, parent: tk.Tk) -> None:
-        self.choice = tk.StringVar(value="ISO date")
-        self.custom_format = tk.StringVar()
+    def __init__(self, parent) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Insert Date/Time")
         self.result: str | None = None
-        super().__init__(parent, "Insert Date/Time")
 
-    def body(self, master: tk.Frame) -> tk.Widget:
-        master.columnconfigure(1, weight=1)
-        ttk.Label(master, text="Format").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
-        combo = ttk.Combobox(
-            master,
-            textvariable=self.choice,
-            state="readonly",
-            values=list(self.FORMAT_OPTIONS.keys()),
-            width=28,
+        layout = QGridLayout(self)
+        layout.addWidget(QLabel("Format"), 0, 0)
+        self._combo = QComboBox()
+        self._combo.addItems(list(self.FORMAT_OPTIONS.keys()))
+        self._combo.setCurrentText("ISO date")
+        layout.addWidget(self._combo, 0, 1)
+        layout.addWidget(QLabel("Custom"), 1, 0)
+        self._custom = QLineEdit()
+        layout.addWidget(self._custom, 1, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        combo.grid(row=0, column=1, sticky="ew", pady=(0, 8))
-        ttk.Label(master, text="Custom").grid(row=1, column=0, sticky="w", padx=(0, 8))
-        entry = ttk.Entry(master, textvariable=self.custom_format)
-        entry.grid(row=1, column=1, sticky="ew")
-        return combo
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons, 2, 0, 1, 2)
 
-    def validate(self) -> bool:
-        selected = self.choice.get()
-        date_format = self.custom_format.get().strip() if selected == "Custom format" else self.FORMAT_OPTIONS[selected]
+    def _date_format(self) -> str:
+        selected = self._combo.currentText()
+        if selected == "Custom format":
+            return self._custom.text().strip()
+        return self.FORMAT_OPTIONS[selected]
+
+    def accept(self) -> None:
+        date_format = self._date_format()
         if not date_format:
-            messagebox.showerror("Date/Time format", "Enter a custom date/time format.", parent=self)
-            return False
+            show_error(self, "Date/Time format", "Enter a custom date/time format.")
+            return
         if any(char in date_format for char in '{}"'):
-            messagebox.showerror("Date/Time format", 'Format cannot contain braces or double quotes.', parent=self)
-            return False
-        return True
-
-    def apply(self) -> None:
-        selected = self.choice.get()
-        date_format = self.custom_format.get().strip() if selected == "Custom format" else self.FORMAT_OPTIONS[selected]
+            show_error(self, "Date/Time format", "Format cannot contain braces or double quotes.")
+            return
         self.result = f'{{AHK_EXPR:FormatTime(A_Now, "{date_format}")}}'
+        super().accept()
 
 
-class InputPlaceholderDialog(simpledialog.Dialog):
-    def __init__(self, parent: tk.Tk) -> None:
-        self.variable = tk.StringVar(value="name")
-        self.prompt = tk.StringVar(value="Enter value")
-        self.title_text = tk.StringVar(value="Input")
-        self.default = tk.StringVar()
+class InputPlaceholderDialog(QDialog):
+    def __init__(self, parent) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Insert Input Box")
         self.result: str | None = None
-        super().__init__(parent, "Insert Input Box")
 
-    def body(self, master: tk.Frame) -> tk.Widget:
-        master.columnconfigure(1, weight=1)
-        first: tk.Widget | None = None
+        layout = QGridLayout(self)
+        self._variable = QLineEdit("name")
+        self._prompt = QLineEdit("Enter value")
+        self._title = QLineEdit("Input")
+        self._default = QLineEdit()
         fields = [
-            ("Variable name", self.variable),
-            ("Prompt text", self.prompt),
-            ("Window title", self.title_text),
-            ("Default value", self.default),
+            ("Variable name", self._variable),
+            ("Prompt text", self._prompt),
+            ("Window title", self._title),
+            ("Default value", self._default),
         ]
-        for row, (label, variable) in enumerate(fields):
-            ttk.Label(master, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
-            entry = ttk.Entry(master, textvariable=variable, width=34)
-            entry.grid(row=row, column=1, sticky="ew", pady=4)
-            if first is None:
-                first = entry
-        return first
+        for row, (label, widget) in enumerate(fields):
+            layout.addWidget(QLabel(label), row, 0)
+            widget.setMinimumWidth(240)
+            layout.addWidget(widget, row, 1)
 
-    def validate(self) -> bool:
-        fields = [self.prompt.get(), self.title_text.get(), self.default.get()]
-        if any(has_reserved_placeholder_chars(value) for value in fields):
-            messagebox.showerror(
-                "Input Box placeholder",
-                "Prompt, title, and default value cannot contain braces or pipe characters.",
-                parent=self,
-            )
-            return False
-        try:
-            parse_replacement_template(self._placeholder())
-        except ValueError as exc:
-            messagebox.showerror("Input Box placeholder", str(exc), parent=self)
-            return False
-        return True
-
-    def apply(self) -> None:
-        self.result = self._placeholder()
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons, len(fields), 0, 1, 2)
 
     def _placeholder(self) -> str:
         return (
             "{AHK_INPUT:"
-            f"{self.variable.get().strip()}|"
-            f"{self.prompt.get().strip()}|"
-            f"{self.title_text.get().strip()}|"
-            f"{self.default.get().strip()}"
+            f"{self._variable.text().strip()}|"
+            f"{self._prompt.text().strip()}|"
+            f"{self._title.text().strip()}|"
+            f"{self._default.text().strip()}"
             "}"
         )
 
-
-class SelectPlaceholderDialog(simpledialog.Dialog):
-    def __init__(self, parent: tk.Tk) -> None:
-        self.variable = tk.StringVar(value="choice")
-        self.prompt = tk.StringVar(value="Choose an option")
-        self.title_text = tk.StringVar(value="Selection")
-        self.result: str | None = None
-        self.options_text: tk.Text | None = None
-        super().__init__(parent, "Insert List Selection")
-
-    def body(self, master: tk.Frame) -> tk.Widget:
-        master.columnconfigure(1, weight=1)
-        fields = [
-            ("Variable name", self.variable),
-            ("Prompt text", self.prompt),
-            ("Window title", self.title_text),
-        ]
-        first: tk.Widget | None = None
-        for row, (label, variable) in enumerate(fields):
-            ttk.Label(master, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
-            entry = ttk.Entry(master, textvariable=variable, width=34)
-            entry.grid(row=row, column=1, sticky="ew", pady=4)
-            if first is None:
-                first = entry
-
-        ttk.Label(master, text="Options").grid(row=3, column=0, sticky="nw", padx=(0, 8), pady=4)
-        self.options_text = tk.Text(master, width=34, height=6, wrap=tk.WORD)
-        self.options_text.grid(row=3, column=1, sticky="nsew", pady=4)
-        self.options_text.insert("1.0", "Option A\nOption B\nOption C")
-        return first
-
-    def validate(self) -> bool:
-        fields = [self.prompt.get(), self.title_text.get()]
+    def accept(self) -> None:
+        fields = [self._prompt.text(), self._title.text(), self._default.text()]
         if any(has_reserved_placeholder_chars(value) for value in fields):
-            messagebox.showerror(
-                "List Selection placeholder",
-                "Prompt and title cannot contain braces or pipe characters.",
-                parent=self,
+            show_error(
+                self,
+                "Input Box placeholder",
+                "Prompt, title, and default value cannot contain braces or pipe characters.",
             )
-            return False
-        if self.options_text is not None:
-            options_text = self.options_text.get("1.0", "end-1c")
-            if any(char in options_text for char in "{}|"):
-                messagebox.showerror(
-                    "List Selection placeholder",
-                    "Options cannot contain braces or pipe characters.",
-                    parent=self,
-                )
-                return False
+            return
         try:
             parse_replacement_template(self._placeholder())
         except ValueError as exc:
-            messagebox.showerror("List Selection placeholder", str(exc), parent=self)
-            return False
-        return True
-
-    def apply(self) -> None:
+            show_error(self, "Input Box placeholder", str(exc))
+            return
         self.result = self._placeholder()
+        super().accept()
+
+
+class SelectPlaceholderDialog(QDialog):
+    def __init__(self, parent) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Insert List Selection")
+        self.result: str | None = None
+
+        layout = QGridLayout(self)
+        self._variable = QLineEdit("choice")
+        self._prompt = QLineEdit("Choose an option")
+        self._title = QLineEdit("Selection")
+        fields = [
+            ("Variable name", self._variable),
+            ("Prompt text", self._prompt),
+            ("Window title", self._title),
+        ]
+        for row, (label, widget) in enumerate(fields):
+            layout.addWidget(QLabel(label), row, 0)
+            widget.setMinimumWidth(240)
+            layout.addWidget(widget, row, 1)
+
+        layout.addWidget(QLabel("Options"), 3, 0, Qt.AlignmentFlag.AlignTop)
+        self._options = QPlainTextEdit("Option A\nOption B\nOption C")
+        self._options.setMinimumHeight(120)
+        layout.addWidget(self._options, 3, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons, 4, 0, 1, 2)
 
     def _placeholder(self) -> str:
-        options = []
-        if self.options_text is not None:
-            options = [
-                line.strip()
-                for line in self.options_text.get("1.0", "end-1c").splitlines()
-                if line.strip()
-            ]
+        options = [
+            line.strip()
+            for line in self._options.toPlainText().splitlines()
+            if line.strip()
+        ]
         return (
             "{AHK_SELECT:"
-            f"{self.variable.get().strip()}|"
-            f"{self.prompt.get().strip()}|"
-            f"{self.title_text.get().strip()}|"
+            f"{self._variable.text().strip()}|"
+            f"{self._prompt.text().strip()}|"
+            f"{self._title.text().strip()}|"
             f"{'||'.join(options)}"
             "}"
         )
 
+    def accept(self) -> None:
+        fields = [self._prompt.text(), self._title.text()]
+        if any(has_reserved_placeholder_chars(value) for value in fields):
+            show_error(
+                self,
+                "List Selection placeholder",
+                "Prompt and title cannot contain braces or pipe characters.",
+            )
+            return
+        if any(char in self._options.toPlainText() for char in "{}|"):
+            show_error(
+                self,
+                "List Selection placeholder",
+                "Options cannot contain braces or pipe characters.",
+            )
+            return
+        try:
+            parse_replacement_template(self._placeholder())
+        except ValueError as exc:
+            show_error(self, "List Selection placeholder", str(exc))
+            return
+        self.result = self._placeholder()
+        super().accept()
 
-class LibrarySelectionDialog(simpledialog.Dialog):
-    def __init__(self, parent: tk.Tk, title: str, items: list[str]) -> None:
-        self.items = items
+
+class LibrarySelectionDialog(QDialog):
+    def __init__(self, parent, title: str, items: list[str]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
         self.result: str | None = None
-        self.listbox: tk.Listbox | None = None
-        super().__init__(parent, title)
 
-    def body(self, master: tk.Frame) -> tk.Widget:
-        master.columnconfigure(0, weight=1)
-        master.rowconfigure(0, weight=1)
-        self.listbox = tk.Listbox(master, height=10, width=42, exportselection=False)
-        self.listbox.grid(row=0, column=0, sticky="nsew")
-        for item in self.items:
-            self.listbox.insert(tk.END, item)
-        if self.items:
-            self.listbox.selection_set(0)
-        self.listbox.bind("<Double-1>", lambda _event: self.ok())
-        return self.listbox
+        layout = QVBoxLayout(self)
+        self._list = QListWidget()
+        self._list.addItems(items)
+        if items:
+            self._list.setCurrentRow(0)
+        self._list.itemDoubleClicked.connect(lambda _item: self.accept())
+        self._list.setMinimumSize(300, 220)
+        layout.addWidget(self._list)
 
-    def validate(self) -> bool:
-        if self.listbox is None or not self.listbox.curselection():
-            messagebox.showerror("Selection", "Select an item first.", parent=self)
-            return False
-        return True
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
-    def apply(self) -> None:
-        if self.listbox is not None and self.listbox.curselection():
-            self.result = self.listbox.get(self.listbox.curselection()[0])
+    def accept(self) -> None:
+        item = self._list.currentItem()
+        if item is None:
+            show_error(self, "Selection", "Select an item first.")
+            return
+        self.result = item.text()
+        super().accept()
 
 
-class ExpansionApp(tk.Tk):
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
+# Insertion toolbar entries: (button label, handler attribute name). The label
+# drops the repetitive "Insert " prefix (kept as a tooltip) so the toolbar stays
+# compact and the form panels fit in a reasonably sized window.
+INSERTION_ACTIONS = (
+    ("Date/Time", "insert_date_time"),
+    ("Input Box", "insert_input_box"),
+    ("List Selection", "insert_list_selection"),
+    ("Tab", "insert_tab"),
+    ("Image", "insert_image"),
+    ("Variable", "insert_variable"),
+    ("Template", "insert_template"),
+)
+
+
+class ExpansionApp(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.title("AutoHotkey Text Expansion Manager")
-        self.geometry("1120x680")
-        self.minsize(900, 560)
+        self.setWindowTitle("AutoHotkey Text Expansion Manager")
+        # Open wide enough that the Snippets table shows all columns without a
+        # horizontal scrollbar (even when a vertical scrollbar is present).
+        self.resize(1448, 720)
 
         self.store = self._load_store()
         self.settings = self._load_settings()
         self.ahk_process: subprocess.Popen | None = None
-        self.selected_section = tk.StringVar(value=self.store.sections[0])
-        self.search_var = tk.StringVar()
-        self.current_expansion: Expansion | None = None
+        self.theme = load_theme_pref() or detect_system_theme()
 
-        self.section_var = tk.StringVar()
-        self.trigger_var = tk.StringVar()
-        self.enabled_var = tk.BooleanVar(value=True)
-        self.ahk_path_var = tk.StringVar(value=self.settings.generated_ahk_path)
-        self.status_var = tk.StringVar(value="Ready.")
+        self.selected_section = self.store.sections[0]
+        self.current_expansion: Expansion | None = None
         self.current_variable: VariableDef | None = None
-        self.variable_name_var = tk.StringVar()
-        self.variable_type_var = tk.StringVar(value="text_input")
-        self.variable_prompt_var = tk.StringVar()
-        self.variable_default_var = tk.StringVar()
         self.current_template: TemplateDef | None = None
-        self.template_name_var = tk.StringVar()
-        self.template_description_var = tk.StringVar()
 
         self._build_ui()
+        self.apply_theme()
         self.refresh_sections()
         self.refresh_expansions()
+        self.refresh_variables()
+        self.refresh_templates()
 
+        # Derive the window's minimum size from what the widest page actually
+        # needs so panels can never be shrunk into overlapping each other.
+        # (A hardcoded minimum that is smaller than the content disables Qt's
+        # layout-driven minimum and lets the panes clip.)
+        content_min = self.centralWidget().minimumSizeHint()
+        self.setMinimumSize(content_min.width(), max(content_min.height(), 600))
+
+    # -- loading -----------------------------------------------------------
     def _load_store(self) -> ExpansionStore:
         try:
             return ExpansionStore.load(JSON_PATH)
         except ValueError as exc:
-            messagebox.showerror("Load error", str(exc))
+            show_error(None, "Load error", str(exc))
             return ExpansionStore()
 
     def _load_settings(self) -> AppSettings:
         try:
             return AppSettings.load(SETTINGS_PATH, AHK_PATH)
         except ValueError as exc:
-            messagebox.showerror("Settings error", str(exc))
+            show_error(None, "Settings error", str(exc))
             return AppSettings(str(AHK_PATH))
 
+    # -- UI construction ---------------------------------------------------
     def _build_ui(self) -> None:
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        notebook = ttk.Notebook(self)
-        notebook.grid(row=0, column=0, sticky="nsew")
-        expansions_tab = ttk.Frame(notebook)
-        variables_tab = ttk.Frame(notebook, padding=8)
-        templates_tab = ttk.Frame(notebook, padding=8)
-        notebook.add(expansions_tab, text="Expansions")
-        notebook.add(variables_tab, text="Variables")
-        notebook.add(templates_tab, text="Templates")
-        expansions_tab.columnconfigure(0, weight=1)
-        expansions_tab.rowconfigure(0, weight=1)
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
 
-        paned = ttk.PanedWindow(expansions_tab, orient=tk.HORIZONTAL)
-        paned.grid(row=0, column=0, sticky="nsew")
+        body.addWidget(self._build_sidebar())
 
-        left = ttk.Frame(paned, padding=8)
-        center = ttk.Frame(paned, padding=(8, 8, 4, 8))
-        right = ttk.Frame(paned, padding=(4, 8, 8, 8))
-        paned.add(left, weight=0)
-        paned.add(center, weight=5)
-        paned.add(right, weight=2)
-        paned.pane(left, weight=0)
-        paned.pane(center, weight=5)
-        paned.pane(right, weight=2)
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._build_expansions_page())
+        self.stack.addWidget(self._build_variables_page())
+        self.stack.addWidget(self._build_templates_page())
+        body.addWidget(self.stack, 1)
+
+        root.addLayout(body, 1)
+        root.addWidget(self._build_footer())
+
+        self.nav.setCurrentRow(0)
+
+    def _build_sidebar(self) -> QWidget:
+        container = QWidget()
+        container.setFixedWidth(168)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.nav = QListWidget()
+        self.nav.setObjectName("Sidebar")
+        for label in ("⌨  Expansions", "ƒ  Variables", "▤  Templates"):
+            QListWidgetItem(label, self.nav)
+        self.nav.currentRowChanged.connect(self.stack_set_index)
+        layout.addWidget(self.nav, 1)
+
+        self.theme_button = QPushButton()
+        self.theme_button.clicked.connect(self.toggle_theme)
+        theme_wrap = QWidget()
+        theme_wrap.setObjectName("Sidebar")
+        wrap_layout = QVBoxLayout(theme_wrap)
+        wrap_layout.setContentsMargins(10, 6, 10, 10)
+        wrap_layout.addWidget(self.theme_button)
+        layout.addWidget(theme_wrap)
+        return container
+
+    def stack_set_index(self, index: int) -> None:
+        if index >= 0:
+            self.stack.setCurrentIndex(index)
+
+    def _build_expansions_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self._build_sections_panel())
+        splitter.addWidget(self._build_table_panel())
+        splitter.addWidget(self._build_form_panel())
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 5)
+        splitter.setStretchFactor(2, 3)
+        splitter.setSizes([232, 540, 360])
+        layout.addWidget(splitter)
+        return page
+
+    def _build_sections_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setMinimumWidth(232)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 10, 0)
+
+        heading = QLabel("Sections")
+        heading.setObjectName("Heading")
+        layout.addWidget(heading)
+
+        self.section_list = QListWidget()
+        self.section_list.currentRowChanged.connect(self.on_section_select)
+        layout.addWidget(self.section_list, 1)
+
+        # One compact row: tighter padding and a trailing stretch keep the three
+        # buttons at their natural size (not stretched) while staying legible.
+        buttons = QHBoxLayout()
+        buttons.setSpacing(6)
+        for text, slot in (
+            ("Add", self.add_section),
+            ("Rename", self.rename_section),
+            ("Delete", self.delete_section),
+        ):
+            button = QPushButton(text)
+            button.setStyleSheet("padding: 6px 4px;")
+            button.clicked.connect(slot)
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+        return panel
+
+    def _build_table_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setMinimumWidth(340)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 0, 10, 0)
+
+        heading = QLabel("Snippets")
+        heading.setObjectName("Heading")
+        layout.addWidget(heading)
+
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Search"))
+        self.search_edit = QLineEdit()
+        self.search_edit.textChanged.connect(lambda _text: self.refresh_expansions())
+        search_row.addWidget(self.search_edit, 1)
+        clear_button = QPushButton("Clear")
+        clear_button.clicked.connect(self.clear_search)
+        search_row.addWidget(clear_button)
+        layout.addLayout(search_row)
+
+        self.duplicate_label = QLabel("")
+        self.duplicate_label.setObjectName("Warn")
+        layout.addWidget(self.duplicate_label)
+
+        self.tree = QTableWidget(0, 4)
+        self.tree.setHorizontalHeaderLabels(["On", "Trigger", "Replacement", "Notes"])
+        self._configure_table(self.tree)
+        header = self.tree.horizontalHeader()
+        self.tree.setColumnWidth(0, 44)
+        self.tree.setColumnWidth(1, 130)
+        self.tree.setColumnWidth(2, 300)
+        header.setStretchLastSection(True)
+        self.tree.itemSelectionChanged.connect(self.on_expansion_select)
+        self.tree.cellDoubleClicked.connect(lambda _r, _c: self.load_selected_expansion())
+        layout.addWidget(self.tree, 1)
+
+        actions = QHBoxLayout()
+        for text, slot in (
+            ("New", self.new_expansion),
+            ("Edit", self.load_selected_expansion),
+            ("Delete", self.delete_expansion),
+            ("Toggle Enabled", self.toggle_enabled),
+        ):
+            button = QPushButton(text)
+            button.clicked.connect(slot)
+            actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        return panel
+
+    def _build_form_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setMinimumWidth(272)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 0, 0, 0)
+
+        heading = QLabel("Edit Expansion")
+        heading.setObjectName("Heading")
+        layout.addWidget(heading)
+
+        layout.addWidget(QLabel("Section"))
+        self.section_combo = QComboBox()
+        layout.addWidget(self.section_combo)
+
+        layout.addWidget(QLabel("Trigger"))
+        self.trigger_edit = QLineEdit()
+        layout.addWidget(self.trigger_edit)
+
+        layout.addWidget(QLabel("Replacement text"))
+        toolbar = self._build_insertion_toolbar(lambda: self.replacement_text)
+        layout.addWidget(toolbar)
+        self.replacement_text = QPlainTextEdit()
+        layout.addWidget(self.replacement_text, 1)
+
+        layout.addWidget(QLabel("Notes"))
+        self.notes_text = QPlainTextEdit()
+        self.notes_text.setMaximumHeight(90)
+        layout.addWidget(self.notes_text)
+
+        self.enabled_check = QCheckBox("Enabled")
+        self.enabled_check.setChecked(True)
+        layout.addWidget(self.enabled_check)
+
+        form_actions = QHBoxLayout()
+        apply_button = QPushButton("Apply")
+        apply_button.setObjectName("Primary")
+        apply_button.clicked.connect(self.apply_form)
+        reset_button = QPushButton("Reset")
+        reset_button.clicked.connect(self.new_expansion)
+        form_actions.addWidget(apply_button)
+        form_actions.addWidget(reset_button)
+        form_actions.addStretch(1)
+        layout.addLayout(form_actions)
+        return panel
+
+    def _build_insertion_toolbar(self, target_getter) -> QWidget:
+        toolbar = QWidget()
+        grid = QGridLayout(toolbar)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(4)
+        for index, (label, handler_name) in enumerate(INSERTION_ACTIONS):
+            command = getattr(self, handler_name)
+            button = QPushButton(label)
+            button.setToolTip(f"Insert {label}")
+            button.setStyleSheet("padding: 6px 8px;")
+            button.clicked.connect(
+                lambda _checked=False, command=command, getter=target_getter: command(getter())
+            )
+            grid.addWidget(button, index // 2, index % 2)
+        return toolbar
+
+    def _build_variables_page(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(12, 12, 12, 12)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 10, 0)
+        heading = QLabel("Variables")
+        heading.setObjectName("Heading")
+        left_layout.addWidget(heading)
+        self.variable_tree = QTableWidget(0, 2)
+        self.variable_tree.setHorizontalHeaderLabels(["Type", "Prompt"])
+        self._configure_table(self.variable_tree)
+        self.variable_tree.setColumnWidth(0, 110)
+        self.variable_tree.horizontalHeader().setStretchLastSection(True)
+        self.variable_tree.itemSelectionChanged.connect(self.on_variable_select)
+        left_layout.addWidget(self.variable_tree, 1)
+        var_actions = QHBoxLayout()
+        for text, slot in (("New", self.new_variable), ("Delete", self.delete_variable)):
+            button = QPushButton(text)
+            button.clicked.connect(slot)
+            var_actions.addWidget(button)
+        var_actions.addStretch(1)
+        left_layout.addLayout(var_actions)
+
+        form = QWidget()
+        form_layout = QGridLayout(form)
+        form_layout.setContentsMargins(10, 0, 0, 0)
+        self.variable_name_edit = QLineEdit()
+        self.variable_type_combo = QComboBox()
+        self.variable_type_combo.addItems(sorted(VARIABLE_TYPES))
+        self.variable_prompt_edit = QLineEdit()
+        self.variable_default_edit = QLineEdit()
+        form_layout.addWidget(QLabel("Name"), 0, 0)
+        form_layout.addWidget(self.variable_name_edit, 0, 1)
+        form_layout.addWidget(QLabel("Type"), 1, 0)
+        form_layout.addWidget(self.variable_type_combo, 1, 1)
+        form_layout.addWidget(QLabel("Prompt text"), 2, 0)
+        form_layout.addWidget(self.variable_prompt_edit, 2, 1)
+        form_layout.addWidget(QLabel("Default/format"), 3, 0)
+        form_layout.addWidget(self.variable_default_edit, 3, 1)
+        form_layout.addWidget(QLabel("List options"), 4, 0, Qt.AlignmentFlag.AlignTop)
+        self.variable_options_text = QPlainTextEdit()
+        self.variable_options_text.setMaximumHeight(120)
+        form_layout.addWidget(self.variable_options_text, 4, 1)
+        form_layout.addWidget(QLabel("Notes"), 5, 0, Qt.AlignmentFlag.AlignTop)
+        self.variable_notes_text = QPlainTextEdit()
+        form_layout.addWidget(self.variable_notes_text, 5, 1)
+        apply_button = QPushButton("Apply Variable")
+        apply_button.setObjectName("Primary")
+        apply_button.clicked.connect(self.apply_variable)
+        form_layout.addWidget(apply_button, 6, 1, Qt.AlignmentFlag.AlignLeft)
+        form_layout.setRowStretch(5, 1)
+        form_layout.setColumnStretch(1, 1)
+
+        splitter.addWidget(left)
+        splitter.addWidget(form)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([360, 620])
+        outer.addWidget(splitter)
+        return page
+
+    def _build_templates_page(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(12, 12, 12, 12)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 10, 0)
+        heading = QLabel("Templates")
+        heading.setObjectName("Heading")
+        left_layout.addWidget(heading)
+        self.template_tree = QTableWidget(0, 1)
+        self.template_tree.setHorizontalHeaderLabels(["Description"])
+        self._configure_table(self.template_tree)
+        self.template_tree.horizontalHeader().setStretchLastSection(True)
+        self.template_tree.itemSelectionChanged.connect(self.on_template_select)
+        left_layout.addWidget(self.template_tree, 1)
+        tpl_actions = QHBoxLayout()
+        for text, slot in (
+            ("New", self.new_template),
+            ("Duplicate", self.duplicate_template),
+            ("Delete", self.delete_template),
+        ):
+            button = QPushButton(text)
+            button.clicked.connect(slot)
+            tpl_actions.addWidget(button)
+        tpl_actions.addStretch(1)
+        left_layout.addLayout(tpl_actions)
+
+        form = QWidget()
+        form_layout = QGridLayout(form)
+        form_layout.setContentsMargins(10, 0, 0, 0)
+        self.template_name_edit = QLineEdit()
+        self.template_description_edit = QLineEdit()
+        form_layout.addWidget(QLabel("Name"), 0, 0)
+        form_layout.addWidget(self.template_name_edit, 0, 1)
+        form_layout.addWidget(QLabel("Description"), 1, 0)
+        form_layout.addWidget(self.template_description_edit, 1, 1)
+        form_layout.addWidget(QLabel("Body"), 2, 0, Qt.AlignmentFlag.AlignTop)
+        toolbar = self._build_insertion_toolbar(lambda: self.template_body_text)
+        form_layout.addWidget(toolbar, 2, 1)
+        self.template_body_text = QPlainTextEdit()
+        form_layout.addWidget(self.template_body_text, 3, 1)
+        form_layout.addWidget(QLabel("Notes"), 4, 0, Qt.AlignmentFlag.AlignTop)
+        self.template_notes_text = QPlainTextEdit()
+        self.template_notes_text.setMaximumHeight(90)
+        form_layout.addWidget(self.template_notes_text, 4, 1)
+        apply_button = QPushButton("Apply Template")
+        apply_button.setObjectName("Primary")
+        apply_button.clicked.connect(self.apply_template)
+        form_layout.addWidget(apply_button, 5, 1, Qt.AlignmentFlag.AlignLeft)
+        form_layout.setRowStretch(3, 1)
+        form_layout.setColumnStretch(1, 1)
+
+        splitter.addWidget(left)
+        splitter.addWidget(form)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([360, 620])
+        outer.addWidget(splitter)
+        return page
+
+    def _build_footer(self) -> QWidget:
+        footer = QFrame()
+        footer.setObjectName("Footer")
+        outer = QVBoxLayout(footer)
+        outer.setContentsMargins(12, 8, 12, 10)
+        outer.setSpacing(8)
+
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("Generated AHK path"))
+        self.ahk_path_edit = QLineEdit(self.settings.generated_ahk_path)
+        self.ahk_path_edit.editingFinished.connect(self.save_settings)
+        path_row.addWidget(self.ahk_path_edit, 1)
+        browse_button = QPushButton("Browse")
+        browse_button.clicked.connect(self.browse_ahk_path)
+        path_row.addWidget(browse_button)
+        outer.addLayout(path_row)
+
+        action_row = QHBoxLayout()
+        self.status_label = QLabel("Ready.")
+        self.status_label.setObjectName("Muted")
+        action_row.addWidget(self.status_label, 1)
+        for text, slot, primary in (
+            ("Save JSON", self.save_json, False),
+            ("Generate .ahk", self.generate_ahk, True),
+            ("Run AHK", self.run_ahk, False),
+            ("Reload AHK", self.reload_ahk, False),
+            ("Import .ahk", self.import_ahk, False),
+        ):
+            button = QPushButton(text)
+            if primary:
+                button.setObjectName("Primary")
+            button.clicked.connect(slot)
+            action_row.addWidget(button)
+        outer.addLayout(action_row)
+        return footer
+
+    @staticmethod
+    def _configure_table(table: QTableWidget) -> None:
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setWordWrap(False)
+
+    # -- theming -----------------------------------------------------------
+    def apply_theme(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(build_stylesheet(self.theme))
+        self.theme_button.setText(
+            "☀  Light mode" if self.theme == "dark" else "☾  Dark mode"
+        )
+        self._apply_titlebar_theme()
+
+    def _apply_titlebar_theme(self) -> None:
+        """Match the native Windows title bar to the current theme (Win 10/11)."""
+        if sys.platform != "win32":
+            return
         try:
-            paned.pane(left, minsize=190)
-            paned.pane(center, minsize=420)
-            paned.pane(right, minsize=280)
-        except tk.TclError:
+            import ctypes
+
+            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+            hwnd = int(self.winId())
+            value = ctypes.c_int(1 if self.theme == "dark" else 0)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                ctypes.byref(value),
+                ctypes.sizeof(value),
+            )
+            # Nudge the non-client area to repaint so the change shows immediately
+            # while the window is already visible.
+            if self.isVisible():
+                SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_FRAMECHANGED = 0x2, 0x1, 0x4, 0x20
+                ctypes.windll.user32.SetWindowPos(
+                    hwnd, 0, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+                )
+        except Exception:
             pass
 
-        self._build_sections(left)
-        self._build_table(center)
-        self._build_form(right)
-        self._build_variables_tab(variables_tab)
-        self._build_templates_tab(templates_tab)
+    def toggle_theme(self) -> None:
+        self.theme = "light" if self.theme == "dark" else "dark"
+        save_theme_pref(self.theme)
+        self.apply_theme()
 
-        self._build_output_settings(self)
+    # -- table helpers -----------------------------------------------------
+    @staticmethod
+    def _table_selected_store_index(table: QTableWidget) -> int | None:
+        rows = table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        item = table.item(rows[0].row(), 0)
+        if item is None:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
 
-        footer = ttk.Frame(self, padding=(8, 0, 8, 8))
-        footer.grid(row=2, column=0, sticky="ew")
-        footer.columnconfigure(0, weight=1)
-
-        ttk.Label(footer, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
-        ttk.Button(footer, text="Save JSON", command=self.save_json).grid(row=0, column=1, padx=4)
-        ttk.Button(footer, text="Generate .ahk", command=self.generate_ahk).grid(row=0, column=2, padx=4)
-        ttk.Button(footer, text="Run AHK", command=self.run_ahk).grid(row=0, column=3, padx=4)
-        ttk.Button(footer, text="Reload AHK", command=self.reload_ahk).grid(row=0, column=4, padx=4)
-        ttk.Button(footer, text="Import .ahk", command=self.import_ahk).grid(row=0, column=5, padx=4)
-
-    def _build_output_settings(self, parent: tk.Widget) -> None:
-        output_frame = ttk.Frame(parent, padding=(8, 4, 8, 8))
-        output_frame.grid(row=1, column=0, sticky="ew")
-        output_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(output_frame, text="Generated AHK path").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        path_entry = ttk.Entry(output_frame, textvariable=self.ahk_path_var)
-        path_entry.grid(row=0, column=1, sticky="ew")
-        path_entry.bind("<FocusOut>", lambda _event: self.save_settings())
-        path_entry.bind("<Return>", lambda _event: self.save_settings())
-        ttk.Button(output_frame, text="Browse", width=10, command=self.browse_ahk_path).grid(row=0, column=2, padx=(8, 0))
-
-    def _build_sections(self, parent: ttk.Frame) -> None:
-        parent.configure(width=210)
-        parent.rowconfigure(1, weight=1)
-        parent.columnconfigure(0, weight=1, minsize=190)
-        parent.grid_propagate(False)
-
-        ttk.Label(parent, text="Sections").grid(row=0, column=0, sticky="ew")
-        self.section_list = tk.Listbox(parent, exportselection=False)
-        self.section_list.grid(row=1, column=0, sticky="nsew", pady=(6, 8))
-        self.section_list.bind("<<ListboxSelect>>", self.on_section_select)
-
-        button_frame = ttk.Frame(parent)
-        button_frame.grid(row=2, column=0, sticky="ew")
-        button_frame.columnconfigure((0, 1, 2), weight=0)
-        ttk.Button(button_frame, text="Add", width=8, command=self.add_section).grid(row=0, column=0, padx=(0, 4))
-        ttk.Button(button_frame, text="Rename", width=9, command=self.rename_section).grid(row=0, column=1, padx=4)
-        ttk.Button(button_frame, text="Delete", width=8, command=self.delete_section).grid(row=0, column=2, padx=(4, 0))
-
-    def _build_table(self, parent: ttk.Frame) -> None:
-        parent.rowconfigure(2, weight=1)
-        parent.columnconfigure(0, weight=1)
-
-        search_frame = ttk.Frame(parent)
-        search_frame.grid(row=0, column=0, sticky="ew")
-        search_frame.columnconfigure(1, weight=1)
-        ttk.Label(search_frame, text="Search").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
-        search_entry.grid(row=0, column=1, sticky="ew")
-        search_entry.bind("<KeyRelease>", lambda _event: self.refresh_expansions())
-        ttk.Button(search_frame, text="Clear", command=self.clear_search).grid(row=0, column=2, padx=(8, 0))
-
-        self.duplicate_label = ttk.Label(parent, foreground="#9a3412")
-        self.duplicate_label.grid(row=1, column=0, sticky="w", pady=(8, 4))
-
-        columns = ("enabled", "trigger", "replacement", "notes")
-        self.tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="browse")
-        self.tree.heading("enabled", text="On")
-        self.tree.heading("trigger", text="Trigger")
-        self.tree.heading("replacement", text="Replacement")
-        self.tree.heading("notes", text="Notes")
-        self.tree.column("enabled", width=48, stretch=False, anchor="center")
-        self.tree.column("trigger", width=130, stretch=False)
-        self.tree.column("replacement", width=360)
-        self.tree.column("notes", width=220)
-        self.tree.grid(row=2, column=0, sticky="nsew")
-        self.tree.bind("<<TreeviewSelect>>", self.on_expansion_select)
-        self.tree.bind("<Double-1>", lambda _event: self.load_selected_expansion())
-
-        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.tree.yview)
-        scrollbar.grid(row=2, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=scrollbar.set)
-
-        actions = ttk.Frame(parent)
-        actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        actions.columnconfigure((0, 1, 2), weight=0)
-        self._table_action_button(actions, "New", self.new_expansion).grid(row=0, column=0, padx=(0, 4), pady=(0, 4), sticky="w")
-        self._table_action_button(actions, "Edit", self.load_selected_expansion).grid(row=0, column=1, padx=4, pady=(0, 4), sticky="w")
-        self._table_action_button(actions, "Delete", self.delete_expansion).grid(row=0, column=2, padx=4, pady=(0, 4), sticky="w")
-        self._table_action_button(actions, "Toggle Enabled", self.toggle_enabled).grid(row=1, column=0, columnspan=2, padx=(0, 4), sticky="w")
-
-    def _table_action_button(self, parent: ttk.Frame, text: str, command: object) -> ttk.Button:
-        return ttk.Button(
-            parent,
-            text=text,
-            width=TABLE_ACTION_BUTTON_WIDTHS[text],
-            command=command,
-        )
-
-    def _build_form(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(7, weight=1)
-
-        ttk.Label(parent, text="Edit Expansion").grid(row=0, column=0, sticky="w")
-
-        ttk.Label(parent, text="Section").grid(row=1, column=0, sticky="w", pady=(12, 2))
-        self.section_combo = ttk.Combobox(parent, textvariable=self.section_var, state="readonly")
-        self.section_combo.grid(row=2, column=0, sticky="ew")
-
-        ttk.Label(parent, text="Trigger").grid(row=3, column=0, sticky="w", pady=(12, 2))
-        ttk.Entry(parent, textvariable=self.trigger_var).grid(row=4, column=0, sticky="ew")
-
-        ttk.Label(parent, text="Replacement text").grid(row=5, column=0, sticky="sw", pady=(12, 2))
-        template_actions = ttk.Frame(parent)
-        template_actions.grid(row=6, column=0, sticky="ew", pady=(0, 4))
-        self._build_insertion_toolbar(template_actions, lambda: self.replacement_text)
-
-        self.replacement_text = tk.Text(parent, height=10, wrap=tk.WORD, undo=True)
-        self.replacement_text.grid(row=7, column=0, sticky="nsew")
-
-        ttk.Label(parent, text="Notes").grid(row=8, column=0, sticky="w", pady=(12, 2))
-        self.notes_text = tk.Text(parent, height=5, wrap=tk.WORD, undo=True)
-        self.notes_text.grid(row=9, column=0, sticky="ew")
-
-        ttk.Checkbutton(parent, text="Enabled", variable=self.enabled_var).grid(row=10, column=0, sticky="w", pady=(10, 0))
-
-        form_actions = ttk.Frame(parent)
-        form_actions.grid(row=11, column=0, sticky="ew", pady=(12, 0))
-        ttk.Button(form_actions, text="Apply", command=self.apply_form).pack(side=tk.LEFT)
-        ttk.Button(form_actions, text="Reset", command=self.new_expansion).pack(side=tk.LEFT, padx=4)
-
-    def _template_action_button(self, parent: ttk.Frame, text: str, command: object) -> ttk.Button:
-        return ttk.Button(
-            parent,
-            text=text,
-            width=TEMPLATE_ACTION_BUTTON_WIDTHS[text],
-            command=command,
-        )
-
-    def _build_insertion_toolbar(self, parent: ttk.Frame, target_getter: object) -> None:
-        actions = [
-            ("Insert Date/Time", self.insert_date_time),
-            ("Insert Input Box", self.insert_input_box),
-            ("Insert List Selection", self.insert_list_selection),
-            ("Insert Tab", self.insert_tab),
-            ("Insert Image", self.insert_image),
-            ("Insert Variable", self.insert_variable),
-            ("Insert Template", self.insert_template),
-        ]
-        for index, (text, command) in enumerate(actions):
-            row = index // 2
-            column = index % 2
-            self._template_action_button(
-                parent,
-                text,
-                lambda command=command, target_getter=target_getter: command(target_getter()),
-            ).grid(
-                row=row,
-                column=column,
-                padx=(0, 4) if column == 0 else 4,
-                pady=(0, 4) if row < 3 else (4, 0),
-                sticky="w",
-            )
-
-    def _build_variables_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.columnconfigure(1, weight=2)
-        parent.rowconfigure(0, weight=1)
-
-        left = ttk.Frame(parent)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        left.rowconfigure(0, weight=1)
-        left.columnconfigure(0, weight=1)
-        self.variable_tree = ttk.Treeview(left, columns=("type", "prompt"), show="headings", selectmode="browse")
-        self.variable_tree.heading("type", text="Type")
-        self.variable_tree.heading("prompt", text="Prompt")
-        self.variable_tree.column("type", width=110, stretch=False)
-        self.variable_tree.column("prompt", width=220)
-        self.variable_tree.grid(row=0, column=0, sticky="nsew")
-        self.variable_tree.bind("<<TreeviewSelect>>", self.on_variable_select)
-        var_actions = ttk.Frame(left)
-        var_actions.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(var_actions, text="New", width=8, command=self.new_variable).pack(side=tk.LEFT)
-        ttk.Button(var_actions, text="Delete", width=10, command=self.delete_variable).pack(side=tk.LEFT, padx=4)
-
-        form = ttk.Frame(parent)
-        form.grid(row=0, column=1, sticky="nsew")
-        form.columnconfigure(1, weight=1)
-        form.rowconfigure(5, weight=1)
-        ttk.Label(form, text="Name").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(form, textvariable=self.variable_name_var).grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Label(form, text="Type").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Combobox(form, textvariable=self.variable_type_var, values=sorted(VARIABLE_TYPES), state="readonly").grid(row=1, column=1, sticky="ew", pady=4)
-        ttk.Label(form, text="Prompt text").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(form, textvariable=self.variable_prompt_var).grid(row=2, column=1, sticky="ew", pady=4)
-        ttk.Label(form, text="Default/format").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(form, textvariable=self.variable_default_var).grid(row=3, column=1, sticky="ew", pady=4)
-        ttk.Label(form, text="List options").grid(row=4, column=0, sticky="nw", padx=(0, 8), pady=4)
-        self.variable_options_text = tk.Text(form, height=6, wrap=tk.WORD)
-        self.variable_options_text.grid(row=4, column=1, sticky="ew", pady=4)
-        ttk.Label(form, text="Notes").grid(row=5, column=0, sticky="nw", padx=(0, 8), pady=4)
-        self.variable_notes_text = tk.Text(form, height=6, wrap=tk.WORD)
-        self.variable_notes_text.grid(row=5, column=1, sticky="nsew", pady=4)
-        ttk.Button(form, text="Apply Variable", command=self.apply_variable).grid(row=6, column=1, sticky="w", pady=(8, 0))
-        self.refresh_variables()
-
-    def _build_templates_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.columnconfigure(1, weight=2)
-        parent.rowconfigure(0, weight=1)
-
-        left = ttk.Frame(parent)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        left.rowconfigure(0, weight=1)
-        left.columnconfigure(0, weight=1)
-        self.template_tree = ttk.Treeview(left, columns=("description",), show="headings", selectmode="browse")
-        self.template_tree.heading("description", text="Description")
-        self.template_tree.column("description", width=260)
-        self.template_tree.grid(row=0, column=0, sticky="nsew")
-        self.template_tree.bind("<<TreeviewSelect>>", self.on_template_select)
-        template_actions = ttk.Frame(left)
-        template_actions.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(template_actions, text="New", width=8, command=self.new_template).pack(side=tk.LEFT)
-        ttk.Button(template_actions, text="Duplicate", width=10, command=self.duplicate_template).pack(side=tk.LEFT, padx=4)
-        ttk.Button(template_actions, text="Delete", width=10, command=self.delete_template).pack(side=tk.LEFT, padx=4)
-
-        form = ttk.Frame(parent)
-        form.grid(row=0, column=1, sticky="nsew")
-        form.columnconfigure(1, weight=1)
-        form.rowconfigure(3, weight=1)
-        ttk.Label(form, text="Name").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(form, textvariable=self.template_name_var).grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Label(form, text="Description").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(form, textvariable=self.template_description_var).grid(row=1, column=1, sticky="ew", pady=4)
-        ttk.Label(form, text="Body").grid(row=2, column=0, sticky="nw", padx=(0, 8), pady=4)
-        body_actions = ttk.Frame(form)
-        body_actions.grid(row=2, column=1, sticky="nw", pady=(0, 4))
-        self._build_insertion_toolbar(body_actions, lambda: self.template_body_text)
-        self.template_body_text = tk.Text(form, height=12, wrap=tk.WORD)
-        self.template_body_text.grid(row=3, column=1, sticky="nsew", pady=4)
-        ttk.Label(form, text="Notes").grid(row=4, column=0, sticky="nw", padx=(0, 8), pady=4)
-        self.template_notes_text = tk.Text(form, height=5, wrap=tk.WORD)
-        self.template_notes_text.grid(row=4, column=1, sticky="ew", pady=4)
-        ttk.Button(form, text="Apply Template", command=self.apply_template).grid(row=5, column=1, sticky="w", pady=(8, 0))
-        self.refresh_templates()
-
+    # -- refresh -----------------------------------------------------------
     def refresh_sections(self) -> None:
-        self.section_list.delete(0, tk.END)
-        for section in self.store.sections:
-            self.section_list.insert(tk.END, section)
+        self.section_list.blockSignals(True)
+        self.section_list.clear()
+        self.section_list.addItems(self.store.sections)
+        self.section_list.blockSignals(False)
 
-        selected = self.selected_section.get()
+        selected = self.selected_section
         if selected not in self.store.sections:
             selected = self.store.sections[0]
-            self.selected_section.set(selected)
-        self.section_list.selection_clear(0, tk.END)
-        self.section_list.selection_set(self.store.sections.index(selected))
-        self.section_list.see(self.store.sections.index(selected))
-        self.section_combo.configure(values=self.store.sections)
-        self.section_var.set(selected)
+            self.selected_section = selected
+        index = self.store.sections.index(selected)
+        self.section_list.blockSignals(True)
+        self.section_list.setCurrentRow(index)
+        self.section_list.blockSignals(False)
+
+        self.section_combo.blockSignals(True)
+        self.section_combo.clear()
+        self.section_combo.addItems(self.store.sections)
+        self.section_combo.setCurrentText(selected)
+        self.section_combo.blockSignals(False)
 
     def refresh_expansions(self) -> None:
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-
-        query = self.search_var.get().strip().lower()
-        section = self.selected_section.get()
+        query = self.search_edit.text().strip().lower()
+        section = self.selected_section
+        self.tree.blockSignals(True)
+        self.tree.setRowCount(0)
         for index, expansion in enumerate(self.store.expansions):
             if not self._matches_filter(expansion, section, query):
                 continue
-            self.tree.insert(
-                "",
-                tk.END,
-                iid=str(index),
-                values=(
-                    "Yes" if expansion.enabled else "No",
-                    expansion.trigger,
-                    self._preview(expansion.replacement),
-                    self._preview(expansion.notes),
-                ),
+            row = self.tree.rowCount()
+            self.tree.insertRow(row)
+            values = (
+                "Yes" if expansion.enabled else "No",
+                expansion.trigger,
+                self._preview(expansion.replacement),
+                self._preview(expansion.notes),
             )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, index)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.tree.setItem(row, column, item)
+        self.tree.blockSignals(False)
 
         duplicate_count = len(self.store.duplicate_triggers())
-        self.duplicate_label.configure(
-            text=f"Duplicate trigger groups: {duplicate_count}" if duplicate_count else ""
+        self.duplicate_label.setText(
+            f"Duplicate trigger groups: {duplicate_count}" if duplicate_count else ""
         )
 
     def refresh_variables(self) -> None:
         if not hasattr(self, "variable_tree"):
             return
-        for item in self.variable_tree.get_children():
-            self.variable_tree.delete(item)
+        self.variable_tree.blockSignals(True)
+        self.variable_tree.setRowCount(0)
         for index, variable in enumerate(self.store.variables):
-            self.variable_tree.insert("", tk.END, iid=str(index), values=(variable.type, variable.prompt_text))
+            self.variable_tree.insertRow(index)
+            type_item = QTableWidgetItem(variable.type)
+            type_item.setData(Qt.ItemDataRole.UserRole, index)
+            self.variable_tree.setItem(index, 0, type_item)
+            self.variable_tree.setItem(index, 1, QTableWidgetItem(variable.prompt_text))
+        self.variable_tree.blockSignals(False)
 
     def refresh_templates(self) -> None:
         if not hasattr(self, "template_tree"):
             return
-        for item in self.template_tree.get_children():
-            self.template_tree.delete(item)
+        self.template_tree.blockSignals(True)
+        self.template_tree.setRowCount(0)
         for index, template in enumerate(self.store.templates):
-            self.template_tree.insert("", tk.END, iid=str(index), values=(template.description,))
+            self.template_tree.insertRow(index)
+            item = QTableWidgetItem(template.description)
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            self.template_tree.setItem(index, 0, item)
+        self.template_tree.blockSignals(False)
 
-    def on_variable_select(self, _event: tk.Event) -> None:
-        selection = self.variable_tree.selection()
-        if not selection:
+    # -- variables ---------------------------------------------------------
+    def on_variable_select(self) -> None:
+        index = self._table_selected_store_index(self.variable_tree)
+        if index is None:
             return
-        variable = self.store.variables[int(selection[0])]
+        variable = self.store.variables[index]
         self.current_variable = variable
-        self.variable_name_var.set(variable.name)
-        self.variable_type_var.set(variable.type)
-        self.variable_prompt_var.set(variable.prompt_text)
-        self.variable_default_var.set(variable.default_value)
-        self.variable_options_text.delete("1.0", tk.END)
-        self.variable_options_text.insert("1.0", "\n".join(variable.list_options))
-        self.variable_notes_text.delete("1.0", tk.END)
-        self.variable_notes_text.insert("1.0", variable.notes)
+        self.variable_name_edit.setText(variable.name)
+        self.variable_type_combo.setCurrentText(variable.type)
+        self.variable_prompt_edit.setText(variable.prompt_text)
+        self.variable_default_edit.setText(variable.default_value)
+        self.variable_options_text.setPlainText("\n".join(variable.list_options))
+        self.variable_notes_text.setPlainText(variable.notes)
 
-    def on_template_select(self, _event: tk.Event) -> None:
-        selection = self.template_tree.selection()
-        if not selection:
+    def on_template_select(self) -> None:
+        index = self._table_selected_store_index(self.template_tree)
+        if index is None:
             return
-        template = self.store.templates[int(selection[0])]
+        template = self.store.templates[index]
         self.current_template = template
-        self.template_name_var.set(template.name)
-        self.template_description_var.set(template.description)
-        self.template_body_text.delete("1.0", tk.END)
-        self.template_body_text.insert("1.0", template.body)
-        self.template_notes_text.delete("1.0", tk.END)
-        self.template_notes_text.insert("1.0", template.notes)
+        self.template_name_edit.setText(template.name)
+        self.template_description_edit.setText(template.description)
+        self.template_body_text.setPlainText(template.body)
+        self.template_notes_text.setPlainText(template.notes)
 
     def new_variable(self) -> None:
         self.current_variable = None
-        self.variable_name_var.set("")
-        self.variable_type_var.set("text_input")
-        self.variable_prompt_var.set("")
-        self.variable_default_var.set("")
-        self.variable_options_text.delete("1.0", tk.END)
-        self.variable_notes_text.delete("1.0", tk.END)
+        self.variable_name_edit.clear()
+        self.variable_type_combo.setCurrentText("text_input")
+        self.variable_prompt_edit.clear()
+        self.variable_default_edit.clear()
+        self.variable_options_text.clear()
+        self.variable_notes_text.clear()
 
     def new_template(self) -> None:
         self.current_template = None
-        self.template_name_var.set("")
-        self.template_description_var.set("")
-        self.template_body_text.delete("1.0", tk.END)
-        self.template_notes_text.delete("1.0", tk.END)
+        self.template_name_edit.clear()
+        self.template_description_edit.clear()
+        self.template_body_text.clear()
+        self.template_notes_text.clear()
 
     def read_variable_form(self) -> VariableDef:
         variable = VariableDef(
-            name=self.variable_name_var.get().strip(),
-            type=self.variable_type_var.get().strip(),
-            prompt_text=self.variable_prompt_var.get().strip(),
-            default_value=self.variable_default_var.get().strip(),
+            name=self.variable_name_edit.text().strip(),
+            type=self.variable_type_combo.currentText().strip(),
+            prompt_text=self.variable_prompt_edit.text().strip(),
+            default_value=self.variable_default_edit.text().strip(),
             list_options=[
                 line.strip()
-                for line in self.variable_options_text.get("1.0", "end-1c").splitlines()
+                for line in self.variable_options_text.toPlainText().splitlines()
                 if line.strip()
             ],
-            notes=self.variable_notes_text.get("1.0", "end-1c").strip(),
+            notes=self.variable_notes_text.toPlainText().strip(),
         )
         validate_variable(variable)
         return variable
 
     def read_template_form(self) -> TemplateDef:
         template = TemplateDef(
-            name=self.template_name_var.get().strip(),
-            description=self.template_description_var.get().strip(),
-            body=self.template_body_text.get("1.0", "end-1c"),
-            notes=self.template_notes_text.get("1.0", "end-1c").strip(),
+            name=self.template_name_edit.text().strip(),
+            description=self.template_description_edit.text().strip(),
+            body=self.template_body_text.toPlainText(),
+            notes=self.template_notes_text.toPlainText().strip(),
         )
         validate_template(template)
         parse_replacement_template(template.body)
@@ -789,7 +1168,7 @@ class ExpansionApp(tk.Tk):
             variable = self.read_variable_form()
             self.ensure_unique_variable_name(variable.name, self.current_variable)
         except ValueError as exc:
-            messagebox.showerror("Variable error", str(exc))
+            show_error(self, "Variable error", str(exc))
             return
         if self.current_variable is None:
             self.store.variables.append(variable)
@@ -821,7 +1200,7 @@ class ExpansionApp(tk.Tk):
             )
             resolve_variable_segments(segments, self.store.variables)
         except ValueError as exc:
-            messagebox.showerror("Template error", str(exc))
+            show_error(self, "Template error", str(exc))
             return
         if self.current_template is None:
             self.store.templates.append(template)
@@ -845,12 +1224,12 @@ class ExpansionApp(tk.Tk):
                 raise ValueError(f'Duplicate template name "{name}".')
 
     def delete_variable(self) -> None:
-        selection = self.variable_tree.selection()
-        if not selection:
-            messagebox.showinfo("Delete variable", "Select a variable first.")
+        index = self._table_selected_store_index(self.variable_tree)
+        if index is None:
+            show_info(self, "Delete variable", "Select a variable first.")
             return
-        variable = self.store.variables[int(selection[0])]
-        if not messagebox.askyesno("Delete variable", f'Delete variable "{variable.name}"?'):
+        variable = self.store.variables[index]
+        if not confirm(self, "Delete variable", f'Delete variable "{variable.name}"?'):
             return
         self.store.variables.remove(variable)
         self.current_variable = None
@@ -858,12 +1237,12 @@ class ExpansionApp(tk.Tk):
         self.refresh_variables()
 
     def delete_template(self) -> None:
-        selection = self.template_tree.selection()
-        if not selection:
-            messagebox.showinfo("Delete template", "Select a template first.")
+        index = self._table_selected_store_index(self.template_tree)
+        if index is None:
+            show_info(self, "Delete template", "Select a template first.")
             return
-        template = self.store.templates[int(selection[0])]
-        if not messagebox.askyesno("Delete template", f'Delete template "{template.name}"?'):
+        template = self.store.templates[index]
+        if not confirm(self, "Delete template", f'Delete template "{template.name}"?'):
             return
         self.store.templates.remove(template)
         self.current_template = None
@@ -871,11 +1250,11 @@ class ExpansionApp(tk.Tk):
         self.refresh_templates()
 
     def duplicate_template(self) -> None:
-        selection = self.template_tree.selection()
-        if not selection:
-            messagebox.showinfo("Duplicate template", "Select a template first.")
+        index = self._table_selected_store_index(self.template_tree)
+        if index is None:
+            show_info(self, "Duplicate template", "Select a template first.")
             return
-        template = self.store.templates[int(selection[0])]
+        template = self.store.templates[index]
         base_name = f"{template.name} Copy"
         name = base_name
         suffix = 2
@@ -886,9 +1265,10 @@ class ExpansionApp(tk.Tk):
         self.store.templates.append(copy)
         self.current_template = copy
         self.refresh_templates()
-        self.template_tree.selection_set(str(len(self.store.templates) - 1))
-        self.on_template_select(None)
+        self.template_tree.selectRow(len(self.store.templates) - 1)
+        self.on_template_select()
 
+    # -- expansion filtering / preview ------------------------------------
     def _matches_filter(self, expansion: Expansion, section: str, query: str) -> bool:
         if expansion.section != section:
             return False
@@ -903,62 +1283,64 @@ class ExpansionApp(tk.Tk):
         clean_text = " ".join(text.split())
         return clean_text if len(clean_text) <= limit else clean_text[: limit - 3] + "..."
 
-    def on_section_select(self, _event: tk.Event) -> None:
-        selection = self.section_list.curselection()
-        if not selection:
+    # -- section handling --------------------------------------------------
+    def on_section_select(self, row: int) -> None:
+        if row < 0:
             return
-        section = self.section_list.get(selection[0])
-        self.selected_section.set(section)
-        self.section_var.set(section)
+        item = self.section_list.item(row)
+        if item is None:
+            return
+        section = item.text()
+        self.selected_section = section
+        self.section_combo.setCurrentText(section)
         self.current_expansion = None
         self.refresh_expansions()
         self.clear_form(keep_section=True)
 
-    def on_expansion_select(self, _event: tk.Event) -> None:
+    def on_expansion_select(self) -> None:
         self.load_selected_expansion()
 
     def selected_expansion_index(self) -> int | None:
-        selection = self.tree.selection()
-        if not selection:
-            return None
-        return int(selection[0])
+        return self._table_selected_store_index(self.tree)
 
     def add_section(self) -> None:
-        name = simpledialog.askstring("Add section", "Section name:", parent=self)
-        if name is None:
+        name, ok = QInputDialog.getText(self, "Add section", "Section name:")
+        if not ok:
             return
         try:
             self.store.add_section(name)
         except ValueError as exc:
-            messagebox.showerror("Section error", str(exc))
+            show_error(self, "Section error", str(exc))
             return
-        self.selected_section.set(name.strip())
+        self.selected_section = name.strip()
         self.refresh_sections()
         self.refresh_expansions()
         self.set_status(f'Added section "{name.strip()}".')
 
     def rename_section(self) -> None:
-        old_name = self.selected_section.get()
-        new_name = simpledialog.askstring("Rename section", "New section name:", initialvalue=old_name, parent=self)
-        if new_name is None:
+        old_name = self.selected_section
+        new_name, ok = QInputDialog.getText(
+            self, "Rename section", "New section name:", text=old_name
+        )
+        if not ok:
             return
         try:
             self.store.rename_section(old_name, new_name)
         except ValueError as exc:
-            messagebox.showerror("Section error", str(exc))
+            show_error(self, "Section error", str(exc))
             return
-        self.selected_section.set(new_name.strip())
+        self.selected_section = new_name.strip()
         self.refresh_sections()
         self.refresh_expansions()
         self.set_status(f'Renamed section to "{new_name.strip()}".')
 
     def delete_section(self) -> None:
-        section = self.selected_section.get()
+        section = self.selected_section
         count = sum(1 for expansion in self.store.expansions if expansion.section == section)
-        if not messagebox.askyesno("Delete section", f'Delete "{section}" and {count} expansion(s)?'):
+        if not confirm(self, "Delete section", f'Delete "{section}" and {count} expansion(s)?'):
             return
         self.store.delete_section(section)
-        self.selected_section.set(self.store.sections[0])
+        self.selected_section = self.store.sections[0]
         self.refresh_sections()
         self.refresh_expansions()
         self.clear_form()
@@ -967,7 +1349,7 @@ class ExpansionApp(tk.Tk):
     def new_expansion(self) -> None:
         self.current_expansion = None
         self.clear_form(keep_section=True)
-        self.tree.selection_remove(self.tree.selection())
+        self.tree.clearSelection()
 
     def load_selected_expansion(self) -> None:
         index = self.selected_expansion_index()
@@ -975,72 +1357,71 @@ class ExpansionApp(tk.Tk):
             return
         expansion = self.store.expansions[index]
         self.current_expansion = expansion
-        self.section_var.set(expansion.section)
-        self.trigger_var.set(expansion.trigger)
-        self.enabled_var.set(expansion.enabled)
-        self.replacement_text.delete("1.0", tk.END)
-        self.replacement_text.insert("1.0", expansion.replacement)
-        self.notes_text.delete("1.0", tk.END)
-        self.notes_text.insert("1.0", expansion.notes)
+        self.section_combo.setCurrentText(expansion.section)
+        self.trigger_edit.setText(expansion.trigger)
+        self.enabled_check.setChecked(expansion.enabled)
+        self.replacement_text.setPlainText(expansion.replacement)
+        self.notes_text.setPlainText(expansion.notes)
 
-    def insert_date_time(self, target: tk.Text | None = None) -> None:
+    # -- insertion actions -------------------------------------------------
+    def insert_date_time(self, target: QPlainTextEdit | None = None) -> None:
         dialog = DateTimeDialog(self)
-        if dialog.result:
+        if dialog.exec() and dialog.result:
             self.insert_snippet(dialog.result, target)
 
-    def insert_input_box(self, target: tk.Text | None = None) -> None:
+    def insert_input_box(self, target: QPlainTextEdit | None = None) -> None:
         dialog = InputPlaceholderDialog(self)
-        if dialog.result:
+        if dialog.exec() and dialog.result:
             self.insert_snippet(dialog.result, target)
 
-    def insert_list_selection(self, target: tk.Text | None = None) -> None:
+    def insert_list_selection(self, target: QPlainTextEdit | None = None) -> None:
         dialog = SelectPlaceholderDialog(self)
-        if dialog.result:
+        if dialog.exec() and dialog.result:
             self.insert_snippet(dialog.result, target)
 
-    def insert_tab(self, target: tk.Text | None = None) -> None:
+    def insert_tab(self, target: QPlainTextEdit | None = None) -> None:
         self.insert_snippet("{AHK_KEY:Tab}", target)
 
-    def insert_image(self, target: tk.Text | None = None) -> None:
-        file_path = filedialog.askopenfilename(
-            title="Choose image to insert",
-            filetypes=IMAGE_FILE_TYPES,
+    def insert_image(self, target: QPlainTextEdit | None = None) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Choose image to insert", "", IMAGE_FILE_FILTER
         )
         if not file_path:
             return
         self.insert_snippet(f"{{AHK_IMAGE:{file_path}}}", target)
 
-    def insert_variable(self, target: tk.Text | None = None) -> None:
+    def insert_variable(self, target: QPlainTextEdit | None = None) -> None:
         names = [variable.name for variable in self.store.variables]
         if not names:
-            messagebox.showinfo("Insert Variable", "Create a variable first.")
+            show_info(self, "Insert Variable", "Create a variable first.")
             return
         dialog = LibrarySelectionDialog(self, "Insert Variable", names)
-        if dialog.result:
+        if dialog.exec() and dialog.result:
             self.insert_snippet(f"{{VAR:{dialog.result}}}", target)
 
-    def insert_template(self, target: tk.Text | None = None) -> None:
+    def insert_template(self, target: QPlainTextEdit | None = None) -> None:
         names = [template.name for template in self.store.templates]
         if not names:
-            messagebox.showinfo("Insert Template", "Create a template first.")
+            show_info(self, "Insert Template", "Create a template first.")
             return
         dialog = LibrarySelectionDialog(self, "Insert Template", names)
-        if dialog.result:
+        if dialog.exec() and dialog.result:
             self.insert_snippet(f"{{TPL:{dialog.result}}}", target)
 
     def insert_replacement_snippet(self, snippet: str) -> None:
         self.insert_snippet(snippet, self.replacement_text)
 
-    def insert_snippet(self, snippet: str, target: tk.Text | None = None) -> None:
+    def insert_snippet(self, snippet: str, target: QPlainTextEdit | None = None) -> None:
         target = target or self.replacement_text
-        target.insert(tk.INSERT, snippet)
-        target.focus_set()
+        target.insertPlainText(snippet)
+        target.setFocus()
 
+    # -- expansion form ----------------------------------------------------
     def apply_form(self) -> None:
         try:
             expansion = self.read_form()
         except ValueError as exc:
-            messagebox.showerror("Expansion error", str(exc))
+            show_error(self, "Expansion error", str(exc))
             return
 
         if self.current_expansion is None:
@@ -1055,16 +1436,16 @@ class ExpansionApp(tk.Tk):
             self.current_expansion.notes = expansion.notes
             self.set_status(f'Updated trigger "{expansion.trigger}".')
 
-        self.selected_section.set(expansion.section)
+        self.selected_section = expansion.section
         self.refresh_sections()
         self.refresh_expansions()
         self.warn_if_duplicate(expansion.trigger)
 
     def read_form(self) -> Expansion:
-        section = self.section_var.get().strip()
-        trigger = self.trigger_var.get().strip()
-        replacement = self.replacement_text.get("1.0", "end-1c")
-        notes = self.notes_text.get("1.0", "end-1c").strip()
+        section = self.section_combo.currentText().strip()
+        trigger = self.trigger_edit.text().strip()
+        replacement = self.replacement_text.toPlainText()
+        notes = self.notes_text.toPlainText().strip()
 
         if not section:
             raise ValueError("Choose a section.")
@@ -1080,15 +1461,15 @@ class ExpansionApp(tk.Tk):
         except ValueError as exc:
             raise ValueError(f"Replacement placeholder is invalid: {exc}") from exc
 
-        return Expansion(section, trigger, replacement, self.enabled_var.get(), notes)
+        return Expansion(section, trigger, replacement, self.enabled_check.isChecked(), notes)
 
     def delete_expansion(self) -> None:
         index = self.selected_expansion_index()
         if index is None:
-            messagebox.showinfo("Delete expansion", "Select an expansion first.")
+            show_info(self, "Delete expansion", "Select an expansion first.")
             return
         expansion = self.store.expansions[index]
-        if not messagebox.askyesno("Delete expansion", f'Delete trigger "{expansion.trigger}"?'):
+        if not confirm(self, "Delete expansion", f'Delete trigger "{expansion.trigger}"?'):
             return
         del self.store.expansions[index]
         self.current_expansion = None
@@ -1099,40 +1480,42 @@ class ExpansionApp(tk.Tk):
     def toggle_enabled(self) -> None:
         index = self.selected_expansion_index()
         if index is None:
-            messagebox.showinfo("Toggle enabled", "Select an expansion first.")
+            show_info(self, "Toggle enabled", "Select an expansion first.")
             return
         expansion = self.store.expansions[index]
         expansion.enabled = not expansion.enabled
         self.refresh_expansions()
         self.set_status(f'{"Enabled" if expansion.enabled else "Disabled"} "{expansion.trigger}".')
 
+    # -- AHK path / settings ----------------------------------------------
     def current_ahk_path(self) -> Path:
-        configured_path = self.ahk_path_var.get().strip()
+        configured_path = self.ahk_path_edit.text().strip()
         if not configured_path:
             return AHK_PATH
         return Path(configured_path).expanduser()
 
     def browse_ahk_path(self) -> None:
         current_path = self.current_ahk_path()
-        file_path = filedialog.asksaveasfilename(
-            title="Choose generated AutoHotkey script path",
-            initialdir=str(current_path.parent if current_path.parent.exists() else APP_DIR),
-            initialfile=current_path.name or DEFAULT_AHK,
-            defaultextension=".ahk",
-            filetypes=[("AutoHotkey files", "*.ahk"), ("All files", "*.*")],
+        initial_dir = str(current_path.parent if current_path.parent.exists() else APP_DIR)
+        initial = str(Path(initial_dir) / (current_path.name or DEFAULT_AHK))
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Choose generated AutoHotkey script path",
+            initial,
+            AHK_FILE_FILTER,
         )
         if not file_path:
             return
-        self.ahk_path_var.set(file_path)
+        self.ahk_path_edit.setText(file_path)
         self.save_settings()
 
     def save_settings(self) -> None:
         self.settings.generated_ahk_path = str(self.current_ahk_path())
-        self.ahk_path_var.set(self.settings.generated_ahk_path)
+        self.ahk_path_edit.setText(self.settings.generated_ahk_path)
         try:
             self.settings.save(SETTINGS_PATH)
         except OSError as exc:
-            messagebox.showerror("Settings error", f"Could not save {SETTINGS_PATH.name}: {exc}")
+            show_error(self, "Settings error", f"Could not save {SETTINGS_PATH.name}: {exc}")
             return
         self.set_status(f"Saved {SETTINGS_PATH.name}.")
 
@@ -1140,7 +1523,7 @@ class ExpansionApp(tk.Tk):
         try:
             self.store.save(JSON_PATH)
         except OSError as exc:
-            messagebox.showerror("Save error", f"Could not save {JSON_PATH.name}: {exc}")
+            show_error(self, "Save error", f"Could not save {JSON_PATH.name}: {exc}")
             return
         self.set_status(f"Saved {JSON_PATH.name}.")
 
@@ -1151,24 +1534,24 @@ class ExpansionApp(tk.Tk):
             self.store.save(JSON_PATH)
             backup_path = generate_ahk(self.store, ahk_path, backup=True)
         except (OSError, ValueError) as exc:
-            messagebox.showerror("Generate error", str(exc))
+            show_error(self, "Generate error", str(exc))
             return
 
         message = f"Generated {ahk_path}."
         if backup_path:
             message += f" Backup: {backup_path.name}."
         self.set_status(message)
-        messagebox.showinfo("Generate .ahk", message)
+        show_info(self, "Generate .ahk", message)
 
     def run_ahk(self) -> None:
         if self.ahk_process is not None and self.ahk_process.poll() is None:
-            messagebox.showinfo("Run AHK", "The generated AHK script is already running from this app.")
+            show_info(self, "Run AHK", "The generated AHK script is already running from this app.")
             return
 
         try:
             self.ahk_process = self._launch_ahk()
         except ValueError as exc:
-            messagebox.showerror("Run AHK", str(exc))
+            show_error(self, "Run AHK", str(exc))
             return
         self.set_status(f"Running {self.current_ahk_path()}.")
 
@@ -1183,10 +1566,10 @@ class ExpansionApp(tk.Tk):
             try:
                 self.ahk_process = self._launch_ahk()
             except ValueError as launch_exc:
-                messagebox.showerror("Reload AHK", f"{inspect_warning}\n\nAlso failed to launch: {launch_exc}")
+                show_error(self, "Reload AHK", f"{inspect_warning}\n\nAlso failed to launch: {launch_exc}")
                 return
         except ValueError as exc:
-            messagebox.showerror("Reload AHK", str(exc))
+            show_error(self, "Reload AHK", str(exc))
             return
 
         message = f"Reloaded {self.current_ahk_path()}."
@@ -1197,7 +1580,7 @@ class ExpansionApp(tk.Tk):
         else:
             message += " No existing matching process was found."
         self.set_status(message)
-        messagebox.showinfo("Reload AHK", message)
+        show_info(self, "Reload AHK", message)
 
     def _launch_ahk(self) -> subprocess.Popen:
         ahk_path = self.current_ahk_path()
@@ -1293,10 +1676,10 @@ class ExpansionApp(tk.Tk):
             return [item for item in data if isinstance(item, dict)]
         return []
 
+    # -- import ------------------------------------------------------------
     def import_ahk(self) -> None:
-        file_path = filedialog.askopenfilename(
-            title="Import AutoHotkey file",
-            filetypes=[("AutoHotkey files", "*.ahk"), ("All files", "*.*")],
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Import AutoHotkey file", "", AHK_FILE_FILTER
         )
         if not file_path:
             return
@@ -1304,19 +1687,21 @@ class ExpansionApp(tk.Tk):
         try:
             imported = import_ahk(Path(file_path))
         except ValueError as exc:
-            messagebox.showerror("Import error", str(exc))
+            show_error(self, "Import error", str(exc))
             return
 
         conflict_count = count_import_conflicts(self.store, imported)
         conflict_action = "skip"
         if conflict_count:
             dialog = ImportConflictDialog(self, conflict_count)
+            if not dialog.exec():
+                return
             conflict_action = dialog.result
             if conflict_action is None:
                 return
 
         result = merge_imported_store(self.store, imported, conflict_action)
-        self.selected_section.set(imported.sections[0] if imported.sections else self.store.sections[0])
+        self.selected_section = imported.sections[0] if imported.sections else self.store.sections[0]
         self.current_expansion = None
         self.refresh_sections()
         self.refresh_expansions()
@@ -1328,31 +1713,39 @@ class ExpansionApp(tk.Tk):
             f"{result.renamed} renamed, {result.skipped} skipped."
         )
 
+    # -- misc --------------------------------------------------------------
     def clear_search(self) -> None:
-        self.search_var.set("")
+        self.search_edit.clear()
         self.refresh_expansions()
 
     def clear_form(self, keep_section: bool = False) -> None:
         if not keep_section:
-            self.section_var.set(self.selected_section.get())
-        self.trigger_var.set("")
-        self.enabled_var.set(True)
-        self.replacement_text.delete("1.0", tk.END)
-        self.notes_text.delete("1.0", tk.END)
+            self.section_combo.setCurrentText(self.selected_section)
+        self.trigger_edit.clear()
+        self.enabled_check.setChecked(True)
+        self.replacement_text.clear()
+        self.notes_text.clear()
 
     def warn_if_duplicate(self, trigger: str) -> None:
         duplicates = self.store.duplicate_triggers()
         if trigger in duplicates:
             sections = ", ".join(expansion.section for expansion in duplicates[trigger])
-            messagebox.showwarning(
+            show_warning(
+                self,
                 "Duplicate trigger",
                 f'Trigger "{trigger}" appears in multiple expansions: {sections}.',
             )
 
     def set_status(self, message: str) -> None:
-        self.status_var.set(message)
+        self.status_label.setText(message)
+
+
+def main() -> None:
+    app = QApplication.instance() or QApplication(sys.argv)
+    window = ExpansionApp()
+    window.show()
+    app.exec()
 
 
 if __name__ == "__main__":
-    app = ExpansionApp()
-    app.mainloop()
+    main()

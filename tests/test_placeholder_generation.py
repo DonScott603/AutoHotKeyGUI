@@ -12,8 +12,21 @@ class PlaceholderGenerationTests(unittest.TestCase):
 
         output = render_ahk(store)
 
-        self.assertIn(":C:brb::Be right back", output)
+        self.assertIn(":CT:brb::Be right back", output)
         self.assertNotIn("SendText(__tem_result)", output)
+
+    def test_static_replacement_with_send_special_chars_uses_text_mode(self) -> None:
+        # "!", "^", "+", "#", "{", "}" are Send modifiers/keys in AutoHotkey's
+        # default hotstring mode; the "T" (Text) option sends them literally so a
+        # leading/trailing "!" (or "+50% ^power {done}") is not corrupted.
+        store = ExpansionStore(
+            sections=["Common"],
+            expansions=[Expansion("Common", "excited", "!Hello world!")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn(":CT:excited::!Hello world!", output)
 
     def test_date_time_expression_placeholder_generates_dynamic_hotstring(self) -> None:
         store = ExpansionStore(
@@ -153,8 +166,8 @@ class PlaceholderGenerationTests(unittest.TestCase):
 
         output = render_ahk(store)
 
-        self.assertIn(":C:Hsa::Has", output)
-        self.assertIn(":C:hsa::has", output)
+        self.assertIn(":CT:Hsa::Has", output)
+        self.assertIn(":CT:hsa::has", output)
         self.assertIn(":C:Dyn::\n{", output)
 
     def test_unsupported_key_raises_clear_error(self) -> None:
