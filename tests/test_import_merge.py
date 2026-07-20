@@ -2,7 +2,13 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from ahk_manager import Expansion, ExpansionStore, import_ahk, merge_imported_store
+from ahk_manager import (
+    Expansion,
+    ExpansionStore,
+    generate_ahk,
+    import_ahk,
+    merge_imported_store,
+)
 
 
 class ImportMergeTests(unittest.TestCase):
@@ -111,6 +117,60 @@ class ImportMergeTests(unittest.TestCase):
         self.assertEqual(result.conflicts, 0)
         self.assertEqual(result.added, 1)
         self.assertEqual([item.trigger for item in target.expansions], ["Hsa", "hsa"])
+
+
+    def test_generated_dynamic_expansion_round_trips_through_import(self) -> None:
+        # A date/variable expansion generates as an empty-replacement hotstring
+        # plus a code block. The embedded source marker must let it re-import
+        # with its original template intact (generate -> import -> generate).
+        store = ExpansionStore(
+            sections=["Dates", "Work"],
+            expansions=[
+                Expansion("Dates", ";ld", '{AHK_EXPR:FormatTime(A_Now, "yyyy-MM-dd")}'),
+                Expansion("Work", ";ask", "Hello {AHK_INPUT:name|Enter name|Name|}", notes="prompt"),
+            ],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "gen.ahk"
+            generate_ahk(store, ahk_path, backup=False)
+            imported = import_ahk(ahk_path)
+
+        by_trigger = {item.trigger: item for item in imported.expansions}
+        self.assertEqual(by_trigger[";ld"].replacement, '{AHK_EXPR:FormatTime(A_Now, "yyyy-MM-dd")}')
+        self.assertEqual(by_trigger[";ask"].replacement, "Hello {AHK_INPUT:name|Enter name|Name|}")
+        self.assertEqual(by_trigger[";ask"].notes, "prompt")
+
+    def test_static_expansion_round_trips_with_notes(self) -> None:
+        store = ExpansionStore(
+            sections=["General"],
+            expansions=[Expansion("General", "brb", "Be right back!", notes="quick")],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "gen.ahk"
+            generate_ahk(store, ahk_path, backup=False)
+            imported = import_ahk(ahk_path)
+
+        self.assertEqual(imported.expansions[0].replacement, "Be right back!")
+        self.assertEqual(imported.expansions[0].notes, "quick")
+
+    def test_unmarked_code_block_hotstring_is_skipped(self) -> None:
+        # An old generated file (no source marker) whose dynamic logic lives in a
+        # code block must be skipped, not imported as a corrupt empty expansion.
+        content = (
+            "; === Dates ===\n"
+            ":C:;ld::\n"
+            "{\n"
+            '    __tem_result := ""\n'
+            "}\n"
+        )
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "old.ahk"
+            ahk_path.write_text(content, encoding="utf-8")
+            imported = import_ahk(ahk_path)
+
+        self.assertEqual(imported.expansions, [])
 
 
 if __name__ == "__main__":

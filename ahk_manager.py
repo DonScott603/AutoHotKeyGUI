@@ -272,6 +272,11 @@ class RenderedExpansion:
 
 SECTION_RE = re.compile(r"^\s*;\s*=+\s*(?P<section>.*?)\s*=+\s*$")
 HOTSTRING_RE = re.compile(r"^\s*(?P<disabled>;\s*)?:(?P<options>[^:]*)?:(?P<trigger>[^:\s][^:]*)::(?P<replacement>.*)$")
+# Machine-readable marker written before each generated hotstring. It carries the
+# original replacement template (and notes) as JSON so dynamic expansions —
+# whose AutoHotkey code block cannot be reversed into template syntax — survive a
+# re-import (generate -> import -> generate) round trip.
+SOURCE_MARKER_RE = re.compile(r"^\s*;\s*@tem:\s*(?P<json>.*)$")
 PLACEHOLDER_RE = re.compile(r"\{(AHK_EXPR|AHK_INPUT|AHK_SELECT|AHK_KEY|AHK_IMAGE|VAR|TPL):([^{}]*)\}")
 PLACEHOLDER_START_RE = re.compile(r"\{(?:AHK_(?:EXPR|INPUT|SELECT|KEY|IMAGE)|VAR|TPL):")
 VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -297,30 +302,73 @@ def import_ahk(path: Path) -> ExpansionStore:
     except OSError as exc:
         raise ValueError(f"Could not read {path.name}: {exc}") from exc
 
-    for line in lines:
+    pending_source: dict[str, Any] | None = None
+
+    for index, line in enumerate(lines):
+        marker_match = SOURCE_MARKER_RE.match(line)
+        if marker_match:
+            try:
+                data = json.loads(marker_match.group("json"))
+            except json.JSONDecodeError:
+                data = None
+            pending_source = data if isinstance(data, dict) else None
+            continue
+
         section_match = SECTION_RE.match(line)
         if section_match:
             current_section = section_match.group("section").strip() or "General"
             if current_section not in sections:
                 sections.append(current_section)
+            pending_source = None
             continue
 
         hotstring_match = HOTSTRING_RE.match(line)
         if hotstring_match:
             if current_section not in sections:
                 sections.append(current_section)
-            expansions.append(
-                Expansion(
-                    section=current_section,
-                    trigger=hotstring_match.group("trigger").strip(),
-                    replacement=hotstring_match.group("replacement"),
-                    enabled=not bool(hotstring_match.group("disabled")),
+            trigger = hotstring_match.group("trigger").strip()
+            enabled = not bool(hotstring_match.group("disabled"))
+            if pending_source is not None:
+                # Generated file: the marker holds the authoritative template, so
+                # dynamic (variable/input/date) expansions round-trip correctly.
+                expansions.append(
+                    Expansion(
+                        section=current_section,
+                        trigger=trigger,
+                        replacement=str(pending_source.get("replacement", "")),
+                        enabled=enabled,
+                        notes=str(pending_source.get("notes", "")),
+                    )
                 )
-            )
+            elif hotstring_match.group("replacement") == "" and _hotstring_has_code_block(lines, index):
+                # A dynamic hotstring from an unmarked file: its logic lives in a
+                # code block that cannot be reversed into template syntax. Skip it
+                # rather than import a corrupt empty expansion.
+                pass
+            else:
+                expansions.append(
+                    Expansion(
+                        section=current_section,
+                        trigger=trigger,
+                        replacement=hotstring_match.group("replacement"),
+                        enabled=enabled,
+                    )
+                )
+            pending_source = None
 
     if not sections:
         sections.append("General")
     return ExpansionStore(sections=sections, expansions=expansions)
+
+
+def _hotstring_has_code_block(lines: list[str], index: int) -> bool:
+    """Return True if the hotstring at ``index`` is followed by a ``{`` block."""
+    for follow in lines[index + 1:]:
+        stripped = follow.strip()
+        if not stripped:
+            continue
+        return stripped.lstrip(";").strip() == "{"
+    return False
 
 
 def count_import_conflicts(target: ExpansionStore, imported: ExpansionStore) -> int:
@@ -443,7 +491,8 @@ def render_expansion(
         lines = [line]
         if expansion.notes:
             lines.append(f"; Notes: {expansion.notes}")
-        return RenderedExpansion(_maybe_disable_lines(lines, expansion.enabled))
+        body = [_source_marker(expansion), *_maybe_disable_lines(lines, expansion.enabled)]
+        return RenderedExpansion(body)
 
     lines = [f":{HOTSTRING_OPTIONS}:{expansion.trigger}::", "{"]
     lines.append("    __tem_result := \"\"")
@@ -497,8 +546,9 @@ def render_expansion(
     lines.append("}")
     if expansion.notes:
         lines.append(f"; Notes: {expansion.notes}")
+    body = [_source_marker(expansion), *_maybe_disable_lines(lines, expansion.enabled)]
     return RenderedExpansion(
-        _maybe_disable_lines(lines, expansion.enabled),
+        body,
         needs_select_helper,
         needs_image_helper,
     )
@@ -736,6 +786,13 @@ def _validate_unmatched_placeholders(text: str, matched_starts: set[int]) -> Non
 def _validate_variable_name(value: str, placeholder_name: str) -> None:
     if not VARIABLE_RE.match(value):
         raise ValueError(f"{placeholder_name} variable must be a valid AutoHotkey identifier.")
+
+
+def _source_marker(expansion: Expansion) -> str:
+    payload: dict[str, str] = {"replacement": expansion.replacement}
+    if expansion.notes:
+        payload["notes"] = expansion.notes
+    return "; @tem: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def _maybe_disable_lines(lines: list[str], enabled: bool) -> list[str]:
