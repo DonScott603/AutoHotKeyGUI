@@ -3,3 +3,4 @@ __pycache__/
 *.bak.ahk
 settings.json
 ui_prefs.json
+expansions.json
