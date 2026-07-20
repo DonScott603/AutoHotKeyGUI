@@ -5,3 +5,5 @@ settings.json
 ui_prefs.json
 expansions.json
 text_expansions.ahk
+build/
+dist/

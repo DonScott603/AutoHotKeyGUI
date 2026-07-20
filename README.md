@@ -30,6 +30,28 @@ If `expansions.json` is absent, the app simply starts with an empty store. It al
 
 The window uses a left sidebar to switch between the **Expansions**, **Variables**, and **Templates** views, and a theme toggle at the bottom of the sidebar switches between light and dark mode (defaulting to your OS setting).
 
+## Build a standalone executable
+
+To distribute the app without requiring Python, build a single `.exe` with
+[PyInstaller](https://pyinstaller.org/):
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m PyInstaller AutoHotkeyExpansionManager.spec
+```
+
+The executable is written to `dist\AutoHotkeyExpansionManager.exe`. It is
+portable: it reads and writes `expansions.json`, `settings.json`, and
+`ui_prefs.json` **in the same folder as the `.exe`**, so run it from a
+user-writable location (e.g. its own folder, not `C:\Program Files`).
+
+The bundled `.spec` produces a one-file, windowed (no console) build. Delete it
+to regenerate defaults, or rebuild from scratch with:
+
+```powershell
+python -m PyInstaller --onefile --windowed --name AutoHotkeyExpansionManager app.py
+```
+
 ## Generate the AutoHotkey script
 
 Use the **Generated AHK path** field to choose where the generated script should be written. If no setting exists yet, it defaults to:

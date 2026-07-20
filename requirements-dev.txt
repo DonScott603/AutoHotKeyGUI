@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Tooling for building a distributable Windows executable.
+PyInstaller>=6.0

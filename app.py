@@ -58,7 +58,16 @@ from ahk_manager import (
 )
 
 
-APP_DIR = Path(__file__).resolve().parent
+def _app_dir() -> Path:
+    # When frozen by PyInstaller, __file__ points at a temp extraction folder
+    # that is wiped on exit. Store data next to the executable instead so the
+    # user's expansions and settings persist (portable-app layout).
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+APP_DIR = _app_dir()
 JSON_PATH = APP_DIR / DEFAULT_JSON
 AHK_PATH = APP_DIR / DEFAULT_AHK
 SETTINGS_PATH = APP_DIR / DEFAULT_SETTINGS
