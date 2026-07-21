@@ -251,6 +251,22 @@ Image files are stored as file paths only. The image binary is not embedded in `
 
 Image insertion is implemented as a clipboard paste helper in the generated AutoHotkey v2 script. It checks that the file exists, uses PowerShell/.NET to place the image on the Windows clipboard, then sends `Ctrl+V`. This works best in rich-text targets that accept pasted images, such as Word, Outlook, Teams, or browser editors. Plain text editors such as Notepad cannot accept pasted images.
 
+## Previews
+
+Use preview buttons to inspect app data without writing files:
+
+- **Preview Expansion** shows section, trigger, enabled status, raw replacement text, resolved replacement text, placeholder summary, and the exact AutoHotkey v2 code for that expansion.
+- **Preview Variable** shows the saved variable definition, example `{VAR:name}` placeholder, resolved lower-level placeholder form, and whether it requires dynamic runtime generation.
+- **Preview Template** shows raw template body, resolved template body, placeholder summary, and nested templates expanded into readable placeholder form.
+
+Preview terms:
+
+- Raw text is exactly what is stored in app data.
+- Resolved text expands `{TPL:...}` and `{VAR:...}` into readable placeholder form, but not raw generated AutoHotkey code.
+- Generated AHK is the AutoHotkey v2 code that export would emit.
+
+Previews are read-only and do not write `expansions.json` or `.ahk` files. If a preview reports undefined variables, undefined templates, malformed placeholders, or circular template references, fix those errors before generating or reloading AHK.
+
 ## Import an existing `.ahk` file
 
 Use **Import .ahk** to parse basic section comments and single-line hotstrings like:

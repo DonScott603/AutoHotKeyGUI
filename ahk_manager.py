@@ -270,6 +270,12 @@ class RenderedExpansion:
     needs_image_helper: bool = False
 
 
+@dataclass
+class PreviewResult:
+    title: str
+    content: str
+
+
 SECTION_RE = re.compile(r"^\s*;\s*=+\s*(?P<section>.*?)\s*=+\s*$")
 HOTSTRING_RE = re.compile(r"^\s*(?P<disabled>;\s*)?:(?P<options>[^:]*)?:(?P<trigger>[^:\s][^:]*)::(?P<replacement>.*)$")
 # Machine-readable marker written before each generated hotstring. It carries the
@@ -699,6 +705,219 @@ def render_expansion(
         needs_select_helper,
         needs_image_helper,
     )
+
+
+def resolve_expansion_preview(expansion: Expansion, store: ExpansionStore) -> PreviewResult:
+    raw_segments = parse_replacement_template(expansion.replacement)
+    resolved_segments = resolve_preview_segments(raw_segments, store)
+    generated = render_expansion(expansion, store.variables, store.templates)
+    content = "\n".join(
+        [
+            "Expansion Preview",
+            "=================",
+            "",
+            f"Section: {expansion.section}",
+            f"Trigger: {expansion.trigger}",
+            f"Enabled: {'Yes' if expansion.enabled else 'No'}",
+            "",
+            "Raw Replacement Text",
+            "--------------------",
+            expansion.replacement or "",
+            "",
+            "Resolved Replacement Text",
+            "-------------------------",
+            segments_to_readable_text(resolved_segments),
+            "",
+            "Placeholder Summary",
+            "-------------------",
+            collect_placeholder_summary(raw_segments, store),
+            "",
+            "Generated AutoHotkey v2 Code",
+            "----------------------------",
+            "\n".join(generated.lines),
+        ]
+    )
+    return PreviewResult(f"Expansion: {expansion.trigger}", content)
+
+
+def resolve_variable_preview(variable: VariableDef) -> PreviewResult:
+    placeholder = variable_to_placeholder(variable)
+    resolved = placeholder_to_text(placeholder)
+    dynamic = "Yes" if placeholder.kind in {"AHK_INPUT", "AHK_SELECT", "AHK_EXPR"} else "No"
+    options = "\n".join(f"- {option}" for option in variable.list_options) or "(none)"
+    content = "\n".join(
+        [
+            "Variable Preview",
+            "================",
+            "",
+            f"Name: {variable.name}",
+            f"Type: {variable.type}",
+            f"Prompt text: {variable.prompt_text or '(none)'}",
+            f"Default value: {variable.default_value or '(none)'}",
+            "",
+            "List Options",
+            "------------",
+            options,
+            "",
+            f"Example placeholder: {{VAR:{variable.name}}}",
+            f"Resolved placeholder form: {resolved}",
+            f"Requires dynamic runtime generation: {dynamic}",
+        ]
+    )
+    return PreviewResult(f"Variable: {variable.name}", content)
+
+
+def resolve_template_preview(template: TemplateDef, store: ExpansionStore) -> PreviewResult:
+    raw_segments = parse_replacement_template(template.body)
+    resolved_segments = resolve_preview_segments(raw_segments, store, stack=(template.name,))
+    content = "\n".join(
+        [
+            "Template Preview",
+            "================",
+            "",
+            f"Name: {template.name}",
+            f"Description: {template.description or '(none)'}",
+            "",
+            "Raw Template Body",
+            "-----------------",
+            template.body or "",
+            "",
+            "Resolved Template Body",
+            "----------------------",
+            segments_to_readable_text(resolved_segments),
+            "",
+            "Placeholder Summary",
+            "-------------------",
+            collect_placeholder_summary(raw_segments, store, stack=(template.name,)),
+        ]
+    )
+    return PreviewResult(f"Template: {template.name}", content)
+
+
+def resolve_preview_segments(
+    segments: list[str | TemplatePlaceholder],
+    store: ExpansionStore,
+    stack: tuple[str, ...] = (),
+) -> list[str | TemplatePlaceholder]:
+    template_map = {template.name: template for template in store.templates}
+    resolved: list[str | TemplatePlaceholder] = []
+    for segment in segments:
+        if isinstance(segment, str):
+            resolved.append(segment)
+        elif segment.kind == "VAR":
+            variable = store.variable_by_name(segment.value)
+            if variable is None:
+                raise ValueError(f'Undefined variable "{segment.value}".')
+            resolved.append(variable_to_placeholder(variable))
+        elif segment.kind == "TPL":
+            template = template_map.get(segment.value)
+            if template is None:
+                raise ValueError(f'Undefined template "{segment.value}".')
+            if segment.value in stack:
+                cycle = " -> ".join([*stack, segment.value])
+                raise ValueError(f"Circular template reference detected: {cycle}.")
+            resolved.extend(
+                resolve_preview_segments(
+                    parse_replacement_template(template.body),
+                    store,
+                    (*stack, segment.value),
+                )
+            )
+        else:
+            resolved.append(segment)
+    return resolved
+
+
+def collect_placeholder_summary(
+    segments: list[str | TemplatePlaceholder],
+    store: ExpansionStore | None = None,
+    stack: tuple[str, ...] = (),
+) -> str:
+    found = {
+        "Variables": [],
+        "Date/Time": 0,
+        "Input boxes": 0,
+        "List selections": 0,
+        "Keystrokes": [],
+        "Images": [],
+        "Nested templates": [],
+    }
+    _collect_placeholder_summary(segments, found, store, stack)
+    lines: list[str] = []
+    if found["Variables"]:
+        lines.append(f"- Variables: {', '.join(dict.fromkeys(found['Variables']))}")
+    if found["Date/Time"]:
+        lines.append(f"- Date/Time: {found['Date/Time']}")
+    if found["Input boxes"]:
+        lines.append(f"- Input boxes: {found['Input boxes']}")
+    if found["List selections"]:
+        lines.append(f"- List selections: {found['List selections']}")
+    if found["Keystrokes"]:
+        lines.append(f"- Keystrokes: {', '.join(dict.fromkeys(found['Keystrokes']))}")
+    if found["Images"]:
+        lines.append(f"- Images: {', '.join(dict.fromkeys(found['Images']))}")
+    if found["Nested templates"]:
+        lines.append(f"- Nested templates: {', '.join(dict.fromkeys(found['Nested templates']))}")
+    return "\n".join(lines) if lines else "No placeholders found."
+
+
+def _collect_placeholder_summary(
+    segments: list[str | TemplatePlaceholder],
+    found: dict[str, Any],
+    store: ExpansionStore | None,
+    stack: tuple[str, ...],
+) -> None:
+    for segment in segments:
+        if isinstance(segment, str):
+            continue
+        if segment.kind == "VAR":
+            found["Variables"].append(segment.value)
+            if store:
+                variable = store.variable_by_name(segment.value)
+                if variable:
+                    _collect_placeholder_summary([variable_to_placeholder(variable)], found, store, stack)
+        elif segment.kind == "TPL":
+            found["Nested templates"].append(segment.value)
+            if store:
+                template = store.template_by_name(segment.value)
+                if template:
+                    if segment.value in stack:
+                        cycle = " -> ".join([*stack, segment.value])
+                        raise ValueError(f"Circular template reference detected: {cycle}.")
+                    _collect_placeholder_summary(
+                        parse_replacement_template(template.body),
+                        found,
+                        store,
+                        (*stack, segment.value),
+                    )
+        elif segment.kind == "AHK_EXPR":
+            found["Date/Time"] += 1
+        elif segment.kind == "AHK_INPUT":
+            found["Input boxes"] += 1
+        elif segment.kind == "AHK_SELECT":
+            found["List selections"] += 1
+        elif segment.kind == "AHK_KEY":
+            found["Keystrokes"].append(segment.value)
+        elif segment.kind == "AHK_IMAGE":
+            found["Images"].append(segment.value)
+
+
+def segments_to_readable_text(segments: list[str | TemplatePlaceholder]) -> str:
+    return "".join(segment if isinstance(segment, str) else placeholder_to_text(segment) for segment in segments)
+
+
+def placeholder_to_text(placeholder: TemplatePlaceholder) -> str:
+    if placeholder.kind == "AHK_EXPR":
+        return f"{{AHK_EXPR:{placeholder.value}}}"
+    if placeholder.kind == "AHK_INPUT":
+        variable, prompt, title, default = placeholder.args
+        return f"{{AHK_INPUT:{variable}|{prompt}|{title}|{default}}}"
+    if placeholder.kind == "AHK_SELECT":
+        variable, prompt, title, *options = placeholder.args
+        return f"{{AHK_SELECT:{variable}|{prompt}|{title}|{'||'.join(options)}}}"
+    if placeholder.kind in {"AHK_KEY", "AHK_IMAGE", "VAR", "TPL"}:
+        return f"{{{placeholder.kind}:{placeholder.value}}}"
+    return f"{{{placeholder.kind}:{placeholder.value}}}"
 
 
 def validate_store_placeholders(store: ExpansionStore) -> None:

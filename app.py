@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QGuiApplication, QIcon
+from PySide6.QtGui import QFont, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -51,7 +51,10 @@ from ahk_manager import (
     import_ahk,
     merge_imported_store,
     parse_replacement_template,
+    resolve_expansion_preview,
+    resolve_template_preview,
     resolve_template_segments,
+    resolve_variable_preview,
     resolve_variable_segments,
     validate_template,
     validate_variable,
@@ -555,6 +558,33 @@ INSERTION_ACTIONS = (
 )
 
 
+class PreviewDialog(QDialog):
+    def __init__(self, parent, title: str, content: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(760, 620)
+        self.setMinimumSize(520, 360)
+
+        layout = QVBoxLayout(self)
+        self._text = QPlainTextEdit()
+        self._text.setReadOnly(True)
+        self._text.setFont(QFont("Consolas", 10))
+        self._text.setPlainText(content)
+        layout.addWidget(self._text)
+
+        buttons = QDialogButtonBox()
+        copy_button = buttons.addButton(
+            "Copy to Clipboard", QDialogButtonBox.ButtonRole.ActionRole
+        )
+        copy_button.clicked.connect(self._copy_to_clipboard)
+        close_button = buttons.addButton(QDialogButtonBox.StandardButton.Close)
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(buttons)
+
+    def _copy_to_clipboard(self) -> None:
+        QGuiApplication.clipboard().setText(self._text.toPlainText())
+
+
 class ExpansionApp(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -793,8 +823,11 @@ class ExpansionApp(QMainWindow):
         apply_button.clicked.connect(self.apply_form)
         reset_button = QPushButton("Reset")
         reset_button.clicked.connect(self.new_expansion)
+        preview_button = QPushButton("Preview Expansion")
+        preview_button.clicked.connect(self.preview_expansion)
         form_actions.addWidget(apply_button)
         form_actions.addWidget(reset_button)
+        form_actions.addWidget(preview_button)
         form_actions.addStretch(1)
         layout.addLayout(form_actions)
         return panel
@@ -868,7 +901,13 @@ class ExpansionApp(QMainWindow):
         apply_button = QPushButton("Apply Variable")
         apply_button.setObjectName("Primary")
         apply_button.clicked.connect(self.apply_variable)
-        form_layout.addWidget(apply_button, 6, 1, Qt.AlignmentFlag.AlignLeft)
+        preview_button = QPushButton("Preview Variable")
+        preview_button.clicked.connect(self.preview_variable)
+        variable_actions = QHBoxLayout()
+        variable_actions.addWidget(apply_button)
+        variable_actions.addWidget(preview_button)
+        variable_actions.addStretch(1)
+        form_layout.addLayout(variable_actions, 6, 1)
         form_layout.setRowStretch(5, 1)
         form_layout.setColumnStretch(1, 1)
 
@@ -931,7 +970,13 @@ class ExpansionApp(QMainWindow):
         apply_button = QPushButton("Apply Template")
         apply_button.setObjectName("Primary")
         apply_button.clicked.connect(self.apply_template)
-        form_layout.addWidget(apply_button, 5, 1, Qt.AlignmentFlag.AlignLeft)
+        preview_button = QPushButton("Preview Template")
+        preview_button.clicked.connect(self.preview_template)
+        template_actions = QHBoxLayout()
+        template_actions.addWidget(apply_button)
+        template_actions.addWidget(preview_button)
+        template_actions.addStretch(1)
+        form_layout.addLayout(template_actions, 5, 1)
         form_layout.setRowStretch(3, 1)
         form_layout.setColumnStretch(1, 1)
 
@@ -1204,6 +1249,15 @@ class ExpansionApp(QMainWindow):
         self.refresh_variables()
         self.set_status(f'Saved variable "{variable.name}".')
 
+    def preview_variable(self) -> None:
+        try:
+            variable = self.read_variable_form()
+            result = resolve_variable_preview(variable)
+        except ValueError as exc:
+            show_error(self, "Preview Variable", str(exc))
+            return
+        PreviewDialog(self, result.title, result.content).exec()
+
     def apply_template(self) -> None:
         try:
             template = self.read_template_form()
@@ -1233,6 +1287,27 @@ class ExpansionApp(QMainWindow):
             self.current_template.notes = template.notes
         self.refresh_templates()
         self.set_status(f'Saved template "{template.name}".')
+
+    def preview_template(self) -> None:
+        try:
+            template = self.read_template_form()
+            candidate_templates = [
+                template if item is self.current_template else item
+                for item in self.store.templates
+            ]
+            if self.current_template is None:
+                candidate_templates.append(template)
+            preview_store = ExpansionStore(
+                sections=self.store.sections,
+                expansions=self.store.expansions,
+                variables=self.store.variables,
+                templates=candidate_templates,
+            )
+            result = resolve_template_preview(template, preview_store)
+        except ValueError as exc:
+            show_error(self, "Preview Template", str(exc))
+            return
+        PreviewDialog(self, result.title, result.content).exec()
 
     def ensure_unique_variable_name(self, name: str, current: VariableDef | None) -> None:
         for variable in self.store.variables:
@@ -1461,6 +1536,15 @@ class ExpansionApp(QMainWindow):
         self.refresh_sections()
         self.refresh_expansions()
         self.warn_if_duplicate(expansion.trigger)
+
+    def preview_expansion(self) -> None:
+        try:
+            expansion = self.read_form()
+            result = resolve_expansion_preview(expansion, self.store)
+        except ValueError as exc:
+            show_error(self, "Preview Expansion", str(exc))
+            return
+        PreviewDialog(self, result.title, result.content).exec()
 
     def read_form(self) -> Expansion:
         section = self.section_combo.currentText().strip()
