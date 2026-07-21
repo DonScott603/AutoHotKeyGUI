@@ -250,6 +250,8 @@ class ImportMergeResult:
     skipped: int = 0
     renamed: int = 0
     conflicts: int = 0
+    variables_added: int = 0
+    templates_added: int = 0
 
     @property
     def total_changed(self) -> int:
@@ -283,6 +285,11 @@ HOTSTRING_RE = re.compile(r"^\s*(?P<disabled>;\s*)?:(?P<options>[^:]*)?:(?P<trig
 # whose AutoHotkey code block cannot be reversed into template syntax — survive a
 # re-import (generate -> import -> generate) round trip.
 SOURCE_MARKER_RE = re.compile(r"^\s*;\s*@tem:\s*(?P<json>.*)$")
+# Variable and template definitions are inlined into each expansion's generated
+# code, so the raw AHK cannot be reversed into the library. These header markers
+# carry the definitions verbatim so they survive a generate -> import round trip.
+VAR_MARKER_RE = re.compile(r"^\s*;\s*@tem-var:\s*(?P<json>.*)$")
+TEMPLATE_MARKER_RE = re.compile(r"^\s*;\s*@tem-template:\s*(?P<json>.*)$")
 PLACEHOLDER_RE = re.compile(r"\{(AHK_EXPR|AHK_INPUT|AHK_SELECT|AHK_KEY|AHK_IMAGE|VAR|TPL):([^{}]*)\}")
 PLACEHOLDER_START_RE = re.compile(r"\{(?:AHK_(?:EXPR|INPUT|SELECT|KEY|IMAGE)|VAR|TPL):")
 VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -301,6 +308,8 @@ def import_ahk(path: Path) -> ExpansionStore:
 
     sections: list[str] = []
     expansions: list[Expansion] = []
+    variables: list[VariableDef] = []
+    templates: list[TemplateDef] = []
     current_section = "General"
 
     try:
@@ -311,6 +320,26 @@ def import_ahk(path: Path) -> ExpansionStore:
     pending_source: dict[str, Any] | None = None
 
     for index, line in enumerate(lines):
+        var_match = VAR_MARKER_RE.match(line)
+        if var_match:
+            try:
+                data = json.loads(var_match.group("json"))
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict):
+                variables.append(VariableDef.from_dict(data))
+            continue
+
+        template_match = TEMPLATE_MARKER_RE.match(line)
+        if template_match:
+            try:
+                data = json.loads(template_match.group("json"))
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict):
+                templates.append(TemplateDef.from_dict(data))
+            continue
+
         marker_match = SOURCE_MARKER_RE.match(line)
         if marker_match:
             try:
@@ -376,7 +405,12 @@ def import_ahk(path: Path) -> ExpansionStore:
 
     if not sections:
         sections.append("General")
-    return ExpansionStore(sections=sections, expansions=expansions)
+    return ExpansionStore(
+        sections=sections,
+        expansions=expansions,
+        variables=variables,
+        templates=templates,
+    )
 
 
 _BLOCK_OPEN_RE = re.compile(r"^;?\s?\{\s*$")
@@ -559,6 +593,23 @@ def merge_imported_store(
             target.expansions.append(expansion)
             result.renamed += 1
 
+    # Variables and templates form a shared, name-keyed library rather than
+    # section-scoped entries. Add any the target lacks; leave existing
+    # definitions of the same name untouched so a merge never clobbers them.
+    existing_variable_names = {variable.name for variable in target.variables}
+    for imported_variable in imported.variables:
+        if imported_variable.name and imported_variable.name not in existing_variable_names:
+            target.variables.append(VariableDef.from_dict(imported_variable.to_dict()))
+            existing_variable_names.add(imported_variable.name)
+            result.variables_added += 1
+
+    existing_template_names = {template.name for template in target.templates}
+    for imported_template in imported.templates:
+        if imported_template.name and imported_template.name not in existing_template_names:
+            target.templates.append(TemplateDef.from_dict(imported_template.to_dict()))
+            existing_template_names.add(imported_template.name)
+            result.templates_added += 1
+
     return result
 
 
@@ -585,6 +636,12 @@ def render_ahk(store: ExpansionStore) -> str:
         "; Edit expansions.json through the GUI, then regenerate this file.",
         "",
     ]
+    if store.variables or store.templates:
+        for variable in store.variables:
+            lines.append(_variable_marker(variable))
+        for template in store.templates:
+            lines.append(_template_marker(template))
+        lines.append("")
     rendered_sections: list[tuple[str, list[RenderedExpansion]]] = []
     needs_select_helper = False
     needs_image_helper = False
@@ -1159,6 +1216,18 @@ def _source_marker(expansion: Expansion) -> str:
     if expansion.notes:
         payload["notes"] = expansion.notes
     return "; @tem: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _variable_marker(variable: VariableDef) -> str:
+    return "; @tem-var: " + json.dumps(
+        variable.to_dict(), ensure_ascii=False, separators=(",", ":")
+    )
+
+
+def _template_marker(template: TemplateDef) -> str:
+    return "; @tem-template: " + json.dumps(
+        template.to_dict(), ensure_ascii=False, separators=(",", ":")
+    )
 
 
 def _maybe_disable_lines(lines: list[str], enabled: bool) -> list[str]:

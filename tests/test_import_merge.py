@@ -5,9 +5,12 @@ from tempfile import TemporaryDirectory
 from ahk_manager import (
     Expansion,
     ExpansionStore,
+    TemplateDef,
+    VariableDef,
     generate_ahk,
     import_ahk,
     merge_imported_store,
+    render_ahk,
 )
 
 
@@ -196,6 +199,64 @@ class ImportMergeTests(unittest.TestCase):
             imported = import_ahk(ahk_path)
 
         self.assertEqual(imported.expansions, [])
+
+    def test_variables_and_templates_round_trip_through_ahk(self) -> None:
+        store = ExpansionStore(
+            sections=["General"],
+            expansions=[
+                Expansion("General", "hi", "Hi {{VAR:name}} from [[TEMPLATE:sig]]"),
+            ],
+            variables=[
+                VariableDef(
+                    name="name",
+                    type="list_selection",
+                    prompt_text="Your name?",
+                    default_value="Scott",
+                    list_options=["Scott", "Sam"],
+                    notes="who",
+                ),
+            ],
+            templates=[
+                TemplateDef(name="sig", description="signature", body="Best, Scott"),
+            ],
+        )
+
+        imported = self._render_and_import(store)
+
+        self.assertEqual(len(imported.variables), 1)
+        self.assertEqual(len(imported.templates), 1)
+        self.assertEqual(imported.variables[0], store.variables[0])
+        self.assertEqual(imported.templates[0], store.templates[0])
+
+    def test_imported_variables_and_templates_are_merged_by_name(self) -> None:
+        imported = ExpansionStore(
+            sections=["General"],
+            variables=[
+                VariableDef(name="name", type="text_input"),
+                VariableDef(name="city", type="text_input"),
+            ],
+            templates=[TemplateDef(name="sig", body="new body")],
+        )
+        target = ExpansionStore(
+            sections=["General"],
+            variables=[VariableDef(name="name", type="text_input", notes="keep me")],
+            templates=[TemplateDef(name="sig", body="existing body")],
+        )
+
+        result = merge_imported_store(target, imported)
+
+        self.assertEqual(result.variables_added, 1)
+        self.assertEqual(result.templates_added, 0)
+        self.assertEqual([v.name for v in target.variables], ["name", "city"])
+        # Existing same-name definitions are left untouched.
+        self.assertEqual(target.variables[0].notes, "keep me")
+        self.assertEqual(target.templates[0].body, "existing body")
+
+    def _render_and_import(self, store: ExpansionStore) -> ExpansionStore:
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "out.ahk"
+            ahk_path.write_text(render_ahk(store), encoding="utf-8")
+            return import_ahk(ahk_path)
 
 
 if __name__ == "__main__":

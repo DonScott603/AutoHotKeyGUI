@@ -1816,13 +1816,21 @@ class ExpansionApp(QMainWindow):
         self.current_expansion = None
         self.refresh_sections()
         self.refresh_expansions()
+        self.refresh_variables()
+        self.refresh_templates()
         self.clear_form()
-        self.set_status(
+        status = (
             "Imported "
             f"{result.total_changed} expansion(s): "
             f"{result.added} added, {result.overwritten} overwritten, "
             f"{result.renamed} renamed, {result.skipped} skipped."
         )
+        if result.variables_added or result.templates_added:
+            status += (
+                f" Added {result.variables_added} variable(s), "
+                f"{result.templates_added} template(s)."
+            )
+        self.set_status(status)
 
     # -- misc --------------------------------------------------------------
     def clear_search(self) -> None:
