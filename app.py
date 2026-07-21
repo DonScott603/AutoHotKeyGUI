@@ -237,6 +237,32 @@ def build_stylesheet(theme: str) -> str:
         font-weight: 600;
     }}
     QPushButton#Primary:hover {{ background-color: {c['accent']}; }}
+    QRadioButton, QCheckBox {{
+        background: transparent;
+        spacing: 8px;
+    }}
+    QRadioButton::indicator, QCheckBox::indicator {{
+        width: 16px;
+        height: 16px;
+        border: 1px solid {c['border']};
+        background-color: {c['panel']};
+    }}
+    QRadioButton::indicator {{ border-radius: 9px; }}
+    QCheckBox::indicator {{ border-radius: 4px; }}
+    QRadioButton::indicator:hover, QCheckBox::indicator:hover {{
+        border-color: {c['accent']};
+    }}
+    QRadioButton::indicator:checked {{
+        border: 1px solid {c['accent']};
+        background-color: qradialgradient(cx:0.5, cy:0.5, radius:0.5,
+            fx:0.5, fy:0.5,
+            stop:0 {c['accent']}, stop:0.5 {c['accent']},
+            stop:0.55 {c['panel']}, stop:1 {c['panel']});
+    }}
+    QCheckBox::indicator:checked {{
+        border: 1px solid {c['accent']};
+        background-color: {c['accent']};
+    }}
     QSplitter::handle {{ background-color: {c['border']}; }}
     QStatusBar {{ background: transparent; }}
     """
@@ -1020,7 +1046,7 @@ class ExpansionApp(QMainWindow):
         action_row.addWidget(self.status_label, 1)
         for text, slot, primary in (
             ("Save JSON", self.save_json, False),
-            ("Generate & Run AHK", self.generate_and_run_ahk, True),
+            ("Generate && Run AHK", self.generate_and_run_ahk, True),
             ("Run AHK", self.run_ahk, False),
             ("Import .ahk", self.import_ahk, False),
         ):
