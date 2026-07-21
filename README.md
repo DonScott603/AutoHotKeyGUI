@@ -67,7 +67,7 @@ text_expansions.ahk
 
 Use **Browse** to choose a different location. The path is persisted in `settings.json`.
 
-Use the **Generate .ahk** button to write the configured file.
+Use the **Generate & Run AHK** button to write the configured file and launch it (details below).
 
 If that file already exists, the app creates a timestamped backup before overwriting it, for example:
 
@@ -79,10 +79,10 @@ Only the five most recent generated `.ahk` backups for that configured output fi
 
 Run the generated `.ahk` file with AutoHotkey v2, or use the app controls:
 
-- **Run AHK** launches the configured generated script.
-- **Reload AHK** stops and relaunches only running AutoHotkey processes whose command line references the configured generated script path.
+- **Generate & Run AHK** writes the configured file (creating a backup first, as above), stops any already-running instance of that script, then launches it. This is the usual way to apply your changes.
+- **Run AHK** launches the configured generated script without regenerating it.
 
-The app does not kill all AutoHotkey processes globally. Reload targets only the configured generated `.ahk` file, so unrelated AutoHotkey scripts are left alone. If process inspection is unavailable, the app warns and launches the configured script without stopping anything.
+The app does not kill all AutoHotkey processes globally. Generate & Run AHK only stops AutoHotkey processes whose command line references the configured generated `.ahk` file, so unrelated AutoHotkey scripts are left alone. If process inspection is unavailable, the app warns and launches the configured script without stopping anything.
 
 ## Template insertion helpers
 

@@ -61,6 +61,15 @@ from ahk_manager import (
 )
 
 
+# Console programs (powershell, taskkill) each flash a command-prompt window
+# when the frozen, windowed app shells out to them. CREATE_NO_WINDOW suppresses
+# that; it only exists on Windows, so fall back to 0 elsewhere.
+if sys.platform == "win32":
+    _NO_WINDOW = subprocess.CREATE_NO_WINDOW
+else:
+    _NO_WINDOW = 0
+
+
 def _app_dir() -> Path:
     # When frozen by PyInstaller, __file__ points at a temp extraction folder
     # that is wiped on exit. Store data next to the executable instead so the
@@ -1011,9 +1020,8 @@ class ExpansionApp(QMainWindow):
         action_row.addWidget(self.status_label, 1)
         for text, slot, primary in (
             ("Save JSON", self.save_json, False),
-            ("Generate .ahk", self.generate_ahk, True),
+            ("Generate & Run AHK", self.generate_and_run_ahk, True),
             ("Run AHK", self.run_ahk, False),
-            ("Reload AHK", self.reload_ahk, False),
             ("Import .ahk", self.import_ahk, False),
         ):
             button = QPushButton(text)
@@ -1632,21 +1640,45 @@ class ExpansionApp(QMainWindow):
             return
         self.set_status(f"Saved {JSON_PATH.name}.")
 
-    def generate_ahk(self) -> None:
+    def generate_and_run_ahk(self) -> None:
         ahk_path = self.current_ahk_path()
         try:
             self.save_settings()
             self.store.save(JSON_PATH)
             backup_path = generate_ahk(self.store, ahk_path, backup=True)
         except (OSError, ValueError) as exc:
-            show_error(self, "Generate error", str(exc))
+            show_error(self, "Generate & Run AHK", str(exc))
             return
 
-        message = f"Generated {ahk_path}."
+        terminated = 0
+        inspect_warning = ""
+        try:
+            terminated = self._terminate_matching_ahk_processes(ahk_path)
+            self.ahk_process = self._launch_ahk()
+        except ProcessLookupError as exc:
+            inspect_warning = str(exc)
+            try:
+                self.ahk_process = self._launch_ahk()
+            except ValueError as launch_exc:
+                show_error(
+                    self,
+                    "Generate & Run AHK",
+                    f"{inspect_warning}\n\nAlso failed to launch: {launch_exc}",
+                )
+                return
+        except ValueError as exc:
+            show_error(self, "Generate & Run AHK", str(exc))
+            return
+
+        message = f"Generated and ran {ahk_path}."
         if backup_path:
             message += f" Backup: {backup_path.name}."
+        if terminated:
+            message += f" Stopped {terminated} matching running script process(es)."
+        elif inspect_warning:
+            message += f" Warning: {inspect_warning}"
         self.set_status(message)
-        show_info(self, "Generate .ahk", message)
+        show_info(self, "Generate & Run AHK", message)
 
     def run_ahk(self) -> None:
         if self.ahk_process is not None and self.ahk_process.poll() is None:
@@ -1660,33 +1692,6 @@ class ExpansionApp(QMainWindow):
             return
         self.set_status(f"Running {self.current_ahk_path()}.")
 
-    def reload_ahk(self) -> None:
-        terminated = 0
-        inspect_warning = ""
-        try:
-            terminated = self._terminate_matching_ahk_processes(self.current_ahk_path())
-            self.ahk_process = self._launch_ahk()
-        except ProcessLookupError as exc:
-            inspect_warning = str(exc)
-            try:
-                self.ahk_process = self._launch_ahk()
-            except ValueError as launch_exc:
-                show_error(self, "Reload AHK", f"{inspect_warning}\n\nAlso failed to launch: {launch_exc}")
-                return
-        except ValueError as exc:
-            show_error(self, "Reload AHK", str(exc))
-            return
-
-        message = f"Reloaded {self.current_ahk_path()}."
-        if terminated:
-            message += f" Stopped {terminated} matching running script process(es)."
-        elif inspect_warning:
-            message += f" Warning: {inspect_warning}"
-        else:
-            message += " No existing matching process was found."
-        self.set_status(message)
-        show_info(self, "Reload AHK", message)
-
     def _launch_ahk(self) -> subprocess.Popen:
         ahk_path = self.current_ahk_path()
         if not ahk_path.exists():
@@ -1699,7 +1704,7 @@ class ExpansionApp(QMainWindow):
             )
 
         try:
-            return subprocess.Popen([str(executable), str(ahk_path)])
+            return subprocess.Popen([str(executable), str(ahk_path)], creationflags=_NO_WINDOW)
         except OSError as exc:
             raise ValueError(f"Could not launch AutoHotkey: {exc}") from exc
 
@@ -1741,6 +1746,7 @@ class ExpansionApp(QMainWindow):
                     check=True,
                     capture_output=True,
                     text=True,
+                    creationflags=_NO_WINDOW,
                 )
                 terminated += 1
             except (OSError, subprocess.CalledProcessError) as exc:
@@ -1760,7 +1766,7 @@ class ExpansionApp(QMainWindow):
             ),
         ]
         try:
-            result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW)
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             raise ProcessLookupError(
                 "Could not inspect running AutoHotkey processes; launching without stopping any existing script."
