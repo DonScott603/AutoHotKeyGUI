@@ -270,6 +270,7 @@ class RenderedExpansion:
     lines: list[str]
     needs_select_helper: bool = False
     needs_image_helper: bool = False
+    needs_paste_helper: bool = False
 
 
 @dataclass
@@ -645,6 +646,7 @@ def render_ahk(store: ExpansionStore) -> str:
     rendered_sections: list[tuple[str, list[RenderedExpansion]]] = []
     needs_select_helper = False
     needs_image_helper = False
+    needs_paste_helper = False
 
     for section in store.sections:
         rendered_expansions = [
@@ -659,12 +661,18 @@ def render_ahk(store: ExpansionStore) -> str:
         needs_image_helper = needs_image_helper or any(
             item.needs_image_helper for item in rendered_expansions
         )
+        needs_paste_helper = needs_paste_helper or any(
+            item.needs_paste_helper for item in rendered_expansions
+        )
 
     if needs_select_helper:
         lines.extend(_select_helper_lines())
         lines.append("")
     if needs_image_helper:
         lines.extend(_image_helper_lines())
+        lines.append("")
+    if needs_paste_helper:
+        lines.extend(_paste_helper_lines())
         lines.append("")
 
     for section, rendered_expansions in rendered_sections:
@@ -696,22 +704,39 @@ def render_expansion(
     )
     segments = resolve_variable_segments(segments, variables or [])
     dynamic = any(isinstance(segment, TemplatePlaceholder) for segment in segments)
+    # Paste delivery is auto-selected when the literal text contains a spaced or
+    # double hyphen, which Word would otherwise autoformat into a dash. Only
+    # literal string segments are inspected; placeholder argument text (prompts,
+    # option lists) is not part of the emitted output.
+    use_paste = any(
+        isinstance(segment, str) and _needs_paste_delivery(segment)
+        for segment in segments
+    )
+
     if not dynamic:
-        line = f":{STATIC_HOTSTRING_OPTIONS}:{expansion.trigger}::{_single_line_replacement(expansion.replacement)}"
-        lines = [line]
+        if use_paste:
+            lines = [f":{HOTSTRING_OPTIONS}:{expansion.trigger}::", "{"]
+            lines.append(f"    TEM_Paste({_ahk_string(expansion.replacement)})")
+            lines.extend(_end_char_lines())
+            lines.append("}")
+        else:
+            lines = [
+                f":{STATIC_HOTSTRING_OPTIONS}:{expansion.trigger}::{_single_line_replacement(expansion.replacement)}"
+            ]
         if expansion.notes:
             lines.append(f"; Notes: {expansion.notes}")
         body = [_source_marker(expansion), *_maybe_disable_lines(lines, expansion.enabled)]
-        return RenderedExpansion(body)
+        return RenderedExpansion(body, needs_paste_helper=use_paste)
 
     lines = [f":{HOTSTRING_OPTIONS}:{expansion.trigger}::", "{"]
     lines.append("    __tem_result := \"\"")
     needs_select_helper = False
     needs_image_helper = False
+    send_call = "TEM_Paste(__tem_result)" if use_paste else "SendText(__tem_result)"
 
     def flush_result() -> None:
         lines.append("    if (__tem_result != \"\") {")
-        lines.append("        SendText(__tem_result)")
+        lines.append(f"        {send_call}")
         lines.append("        __tem_result := \"\"")
         lines.append("    }")
 
@@ -761,6 +786,7 @@ def render_expansion(
         body,
         needs_select_helper,
         needs_image_helper,
+        use_paste,
     )
 
 
@@ -1309,6 +1335,35 @@ def _end_char_lines() -> list[str]:
 
 def _single_line_replacement(text: str) -> str:
     return text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+
+
+# Word's "AutoFormat As You Type" rewrites a hyphen followed by a space ("- ",
+# which also covers a spaced hyphen " - " and a leading "- ") into a dash, and a
+# double hyphen ("--") into an em dash, when text is *typed*. Pasting bypasses
+# that, so literal text matching these patterns is delivered via TEM_Paste.
+def _needs_paste_delivery(text: str) -> bool:
+    return "- " in text or "--" in text
+
+
+def _paste_helper_lines() -> list[str]:
+    return [
+        "TEM_Paste(text) {",
+        "    if (text = \"\")",
+        "        return",
+        "    saved := ClipboardAll()",
+        "    A_Clipboard := text",
+        "    if (!ClipWait(1)) {",
+        "        A_Clipboard := saved",
+        "        saved := \"\"",
+        "        SendText(text)",
+        "        return",
+        "    }",
+        "    Send(\"^v\")",
+        "    Sleep(120)",
+        "    A_Clipboard := saved",
+        "    saved := \"\"",
+        "}",
+    ]
 
 
 def _backup_path(path: Path) -> Path:

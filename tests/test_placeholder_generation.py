@@ -222,6 +222,107 @@ class PlaceholderGenerationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires an image file path"):
             render_ahk(store)
 
+    def test_static_spaced_hyphen_uses_paste_delivery(self) -> None:
+        # Word autoformats a typed " - " into an en dash; pasting avoids that, so
+        # a literal spaced hyphen switches the expansion to TEM_Paste.
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", "co", "Acme - Widgets")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn("TEM_Paste(text) {", output)
+        self.assertIn(":C:co::\n{", output)
+        self.assertIn('TEM_Paste("Acme - Widgets")', output)
+        self.assertNotIn(":CT:co::Acme - Widgets", output)
+
+    def test_static_leading_dash_uses_paste_delivery(self) -> None:
+        # A leading "- " (e.g. a signature dash) is also autoformatted by Word.
+        store = ExpansionStore(
+            sections=["Email"],
+            expansions=[Expansion("Email", "-sig", "- Crane & Associates")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn('TEM_Paste("- Crane & Associates")', output)
+        self.assertNotIn(":CT:-sig::", output)
+
+    def test_static_double_hyphen_uses_paste_delivery(self) -> None:
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", "dd", "wait--stop")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn('TEM_Paste("wait--stop")', output)
+
+    def test_paste_helper_preserves_existing_clipboard(self) -> None:
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", "co", "Acme - Widgets")],
+        )
+
+        output = render_ahk(store)
+
+        # Clipboard is backed up before use and restored afterwards.
+        self.assertIn("saved := ClipboardAll()", output)
+        self.assertIn("A_Clipboard := text", output)
+        self.assertIn("A_Clipboard := saved", output)
+
+    def test_hyphen_without_surrounding_spaces_stays_static(self) -> None:
+        # A hyphen touching characters (dates, hyphenated words) is not
+        # autoformatted by Word, so it stays a plain static hotstring.
+        store = ExpansionStore(
+            sections=["Common"],
+            expansions=[Expansion("Common", "em", "well-known")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn(":CT:em::well-known", output)
+        self.assertNotIn("TEM_Paste", output)
+
+    def test_dynamic_spaced_hyphen_literal_uses_paste_delivery(self) -> None:
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion(
+                    "Work",
+                    "ach",
+                    "{AHK_INPUT:name|Client|Client|} - ACH",
+                )
+            ],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn("TEM_Paste(__tem_result)", output)
+        self.assertNotIn("SendText(__tem_result)", output)
+        # The input dialog is unaffected by paste delivery.
+        self.assertIn('InputBox("Client", "Client", , "")', output)
+
+    def test_placeholder_argument_hyphen_does_not_trigger_paste(self) -> None:
+        # A " - " inside a prompt/option string is not part of the emitted text,
+        # so it must not switch the expansion to paste delivery.
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion(
+                    "Work",
+                    "pick",
+                    "{AHK_SELECT:dir|In - Out|Selection|Deposit||Withdrawal}",
+                )
+            ],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn("SendText(__tem_result)", output)
+        self.assertNotIn("TEM_Paste", output)
+
 
 if __name__ == "__main__":
     unittest.main()
