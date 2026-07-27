@@ -62,7 +62,7 @@ class PlaceholderGenerationTests(unittest.TestCase):
         self.assertIn('__tem_result .= FormatTime(A_Now, "yyyy-MM-dd")', output)
         self.assertIn("SendText(__tem_result)", output)
 
-    def test_input_placeholder_generates_inputbox_logic(self) -> None:
+    def test_input_placeholder_generates_form_logic(self) -> None:
         store = ExpansionStore(
             sections=["Letters"],
             expansions=[
@@ -76,9 +76,78 @@ class PlaceholderGenerationTests(unittest.TestCase):
 
         output = render_ahk(store)
 
-        self.assertIn('InputBox("Enter client name", "Client Name", , "")', output)
-        self.assertIn("client_name := __tem_input_client_name.Value", output)
+        self.assertIn("TEM_Form(title, fields, parts)", output)
+        self.assertIn(
+            'Map("name", "client_name", "label", "Enter client name", '
+            '"title", "Client Name", "kind", "input", "default", "")',
+            output,
+        )
+        self.assertIn('__tem_vals := TEM_Form("dear", __tem_fields, __tem_parts)', output)
+        self.assertIn('client_name := __tem_vals["client_name"]', output)
         self.assertIn("__tem_result .= client_name", output)
+        self.assertNotIn("InputBox(", output)
+
+    def test_form_preview_parts_carry_literals_and_field_references(self) -> None:
+        # The preview the dialog renders is assembled from these parts, so the
+        # literals and field references must appear in reading order.
+        store = ExpansionStore(
+            sections=["Letters"],
+            expansions=[
+                Expansion(
+                    "Letters",
+                    "dear",
+                    "Dear {AHK_INPUT:client_name|Enter client name|Client Name|},",
+                )
+            ],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn(
+            '__tem_parts := ["Dear ", Map("var", "client_name"), ","]',
+            output,
+        )
+
+    def test_repeated_variable_becomes_one_shared_form_field(self) -> None:
+        # One field, asked once, feeding both occurrences.
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion(
+                    "Work",
+                    "twice",
+                    "{AHK_INPUT:amount|Amount|Amount|} and again {AHK_INPUT:amount|Amount|Amount|}",
+                )
+            ],
+        )
+
+        output = render_ahk(store)
+
+        self.assertEqual(output.count('Map("name", "amount"'), 1)
+        self.assertEqual(output.count('amount := __tem_vals["amount"]'), 1)
+        self.assertEqual(output.count("__tem_result .= amount"), 2)
+
+    def test_multiple_selects_use_the_form_rather_than_separate_popups(self) -> None:
+        # The lightweight TEM_Select popup is kept only for a lone dropdown.
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion(
+                    "Work",
+                    "two",
+                    "{AHK_SELECT:a|A|A|x||y} {AHK_SELECT:b|B|B|p||q}",
+                )
+            ],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn("TEM_Form(title, fields, parts)", output)
+        self.assertNotIn("TEM_Select(", output)
+        self.assertIn(
+            'Map("name", "a", "label", "A", "title", "A", "kind", "select", "options", ["x", "y"])',
+            output,
+        )
 
     def test_select_placeholder_generates_selection_helper_and_logic(self) -> None:
         store = ExpansionStore(
@@ -302,7 +371,11 @@ class PlaceholderGenerationTests(unittest.TestCase):
         self.assertIn("TEM_Paste(__tem_result)", output)
         self.assertNotIn("SendText(__tem_result)", output)
         # The input dialog is unaffected by paste delivery.
-        self.assertIn('InputBox("Client", "Client", , "")', output)
+        self.assertIn(
+            'Map("name", "name", "label", "Client", "title", "Client", '
+            '"kind", "input", "default", "")',
+            output,
+        )
 
     def test_placeholder_argument_hyphen_does_not_trigger_paste(self) -> None:
         # A " - " inside a prompt/option string is not part of the emitted text,

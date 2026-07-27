@@ -271,6 +271,7 @@ class RenderedExpansion:
     needs_select_helper: bool = False
     needs_image_helper: bool = False
     needs_paste_helper: bool = False
+    needs_form_helper: bool = False
 
 
 @dataclass
@@ -418,6 +419,65 @@ _BLOCK_OPEN_RE = re.compile(r"^;?\s?\{\s*$")
 _BLOCK_CLOSE_RE = re.compile(r"^;?\s?\}\s*$")
 _AHK_QUOTED_RE = re.compile(r'"((?:`.|[^"`])*)"')
 
+# Field entries inside a generated __tem_fields array. The key order is the one
+# _form_fields_literal emits; the quoted-string subpattern is escape-aware so a
+# prompt containing a quote or bracket does not end the match early.
+_AHK_STR = r'"((?:`.|[^"`])*)"'
+_FORM_FIELD_HEAD = (
+    r'Map\("name", ' + _AHK_STR + r', "label", ' + _AHK_STR + r', "title", ' + _AHK_STR
+)
+_FORM_INPUT_FIELD_RE = re.compile(
+    _FORM_FIELD_HEAD + r', "kind", "input", "default", ' + _AHK_STR + r"\)"
+)
+_FORM_SELECT_FIELD_RE = re.compile(
+    _FORM_FIELD_HEAD
+    + r', "kind", "select", "options", \[((?:'
+    + _AHK_STR
+    + r"(?:, )?)*)\]\)"
+)
+_FORM_FIELD_COUNT_RE = re.compile(r'Map\("name", ')
+
+
+def _parse_form_fields(line: str) -> dict[str, dict[str, Any]] | None:
+    """Rebuild the field table from a generated ``__tem_fields`` line.
+
+    Returns None if any entry fails to match, so a block that is not in the
+    generated form is refused rather than silently reconstructed short a field.
+    """
+    fields: dict[str, dict[str, Any]] = {}
+    for match in _FORM_INPUT_FIELD_RE.finditer(line):
+        name, label, title, default = (_unescape_ahk(g) for g in match.groups())
+        fields[name] = {
+            "name": name,
+            "kind": "input",
+            "label": label,
+            "title": title,
+            "default": default,
+        }
+    for match in _FORM_SELECT_FIELD_RE.finditer(line):
+        name, label, title = (_unescape_ahk(g) for g in match.groups()[:3])
+        fields[name] = {
+            "name": name,
+            "kind": "select",
+            "label": label,
+            "title": title,
+            "options": [
+                _unescape_ahk(option) for option in _AHK_QUOTED_RE.findall(match.group(4))
+            ],
+        }
+    if len(fields) != len(_FORM_FIELD_COUNT_RE.findall(line)):
+        return None
+    return fields
+
+
+def _form_field_placeholder(field: dict[str, Any]) -> str:
+    if field["kind"] == "select":
+        options = "||".join(field["options"])
+        return f"{{AHK_SELECT:{field['name']}|{field['label']}|{field['title']}|{options}}}"
+    return (
+        f"{{AHK_INPUT:{field['name']}|{field['label']}|{field['title']}|{field['default']}}}"
+    )
+
 
 def _find_block_open(lines: list[str], index: int) -> int | None:
     """Return the index of a top-level ``{`` immediately following a hotstring."""
@@ -464,6 +524,10 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
 
     body = [_strip_disabled(lines[k]).strip() for k in range(open_index + 1, close_index)]
     parts: list[str] = []
+    # Populated when the block gathers its prompts through TEM_Form, in which
+    # case the placeholders are rebuilt at the "__tem_result .= <var>" lines
+    # rather than at the prompt call itself.
+    form_fields: dict[str, dict[str, Any]] = {}
     i = 0
     while i < len(body):
         line = body[i]
@@ -485,6 +549,21 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
         literal = re.fullmatch(r'__tem_result \.= "(.*)"', line)
         if literal:
             parts.append(_unescape_ahk(literal.group(1)))
+            i += 1
+            continue
+        # Form block: the fields array carries every prompt's arguments; the
+        # parts array and TEM_Form call add nothing the parts list needs.
+        if line.startswith("__tem_fields := "):
+            parsed = _parse_form_fields(line)
+            if parsed is None:
+                return None
+            form_fields = parsed
+            i += 1
+            continue
+        if line.startswith("__tem_parts := ") or line.startswith("__tem_vals := TEM_Form("):
+            i += 1
+            continue
+        if re.fullmatch(r'\w+ := __tem_vals\["\w+"\]', line):
             i += 1
             continue
         # Input box: 5 lines.
@@ -534,7 +613,14 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
         if expr:
             value = expr.group(1).strip()
             if re.fullmatch(r"\w+", value):
-                # A bare variable reference already emitted by an input/select block.
+                if value in form_fields:
+                    # A form field: this is where its placeholder belongs, and a
+                    # variable used twice correctly yields two placeholders.
+                    parts.append(_form_field_placeholder(form_fields[value]))
+                else:
+                    # A bare variable reference already emitted by an input/select block.
+                    i += 1
+                    continue
                 i += 1
                 continue
             parts.append(f"{{AHK_EXPR:{value}}}")
@@ -649,6 +735,7 @@ def render_ahk(store: ExpansionStore) -> str:
     needs_select_helper = False
     needs_image_helper = False
     needs_paste_helper = False
+    needs_form_helper = False
 
     for section in store.sections:
         rendered_expansions = [
@@ -666,7 +753,13 @@ def render_ahk(store: ExpansionStore) -> str:
         needs_paste_helper = needs_paste_helper or any(
             item.needs_paste_helper for item in rendered_expansions
         )
+        needs_form_helper = needs_form_helper or any(
+            item.needs_form_helper for item in rendered_expansions
+        )
 
+    if needs_form_helper:
+        lines.extend(_form_helper_lines())
+        lines.append("")
     if needs_select_helper:
         lines.extend(_select_helper_lines())
         lines.append("")
@@ -686,6 +779,112 @@ def render_ahk(store: ExpansionStore) -> str:
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _form_fields(segments: list[Any]) -> list[dict[str, Any]]:
+    """Collect the prompted placeholders into one ordered list of form fields.
+
+    A variable used more than once yields a single field -- the first occurrence
+    defines its prompt, default and options -- so the form asks once and every
+    occurrence receives the same answer.
+    """
+    fields: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for segment in segments:
+        if isinstance(segment, str) or segment.kind not in ("AHK_INPUT", "AHK_SELECT"):
+            continue
+        variable = segment.args[0]
+        if variable in seen:
+            continue
+        seen.add(variable)
+        if segment.kind == "AHK_INPUT":
+            _, prompt, title, default = segment.args
+            fields.append(
+                {
+                    "name": variable,
+                    "kind": "input",
+                    "label": prompt,
+                    "title": title,
+                    "default": default,
+                }
+            )
+        else:
+            _, prompt, title, *options = segment.args
+            fields.append(
+                {
+                    "name": variable,
+                    "kind": "select",
+                    "label": prompt,
+                    "title": title,
+                    "options": options,
+                }
+            )
+    return fields
+
+
+def _use_form(fields: list[dict[str, Any]]) -> bool:
+    """Whether to gather these fields in one form dialog.
+
+    An expansion whose only prompt is a single dropdown keeps the lighter
+    TEM_Select popup; a whole form would be overkill for one pick. Everything
+    else -- any text input, or more than one prompt -- gets the form, where the
+    live preview supplies the context a bare prompt cannot.
+    """
+    if not fields:
+        return False
+    return not (len(fields) == 1 and fields[0]["kind"] == "select")
+
+
+def _form_fields_literal(fields: list[dict[str, Any]]) -> str:
+    """Emit the fields array TEM_Form builds its controls from.
+
+    The title is emitted even though the dialog titles itself with the trigger
+    and never draws it: it is the one placeholder argument the generated code
+    would otherwise lose, and _reconstruct_replacement needs it to rebuild the
+    template from a file whose @tem markers have been stripped.
+
+    Key order is fixed because the reconstruction regexes match on it.
+    """
+    items = []
+    for field in fields:
+        head = (
+            f'Map("name", {_ahk_string(field["name"])}, '
+            f'"label", {_ahk_string(field["label"])}, '
+            f'"title", {_ahk_string(field["title"])}'
+        )
+        if field["kind"] == "select":
+            options = ", ".join(_ahk_string(option) for option in field["options"])
+            items.append(f'{head}, "kind", "select", "options", [{options}])')
+        else:
+            items.append(
+                f'{head}, "kind", "input", "default", {_ahk_string(field["default"])})'
+            )
+    return "[" + ", ".join(items) + "]"
+
+
+def _form_parts_literal(segments: list[Any]) -> str:
+    """Emit the parts array TEM_Form assembles its live preview from.
+
+    Literals become strings and prompted placeholders become {var} references
+    the preview substitutes as the user types. AHK_EXPR is emitted unquoted so
+    it evaluates when the array is built -- the user sees the real date rather
+    than the expression. Key presses and images have no text form, so they show
+    as a bracketed chip standing in for the action.
+    """
+    items = []
+    for segment in segments:
+        if isinstance(segment, str):
+            if segment:
+                items.append(_ahk_string(segment))
+        elif segment.kind == "AHK_EXPR":
+            items.append(segment.value)
+        elif segment.kind in ("AHK_INPUT", "AHK_SELECT"):
+            items.append(f'Map("var", {_ahk_string(segment.args[0])})')
+        elif segment.kind == "AHK_KEY":
+            items.append(_ahk_string(f"[{segment.value}]"))
+        elif segment.kind == "AHK_IMAGE":
+            items.append(_ahk_string("[image]"))
+    return "[" + ", ".join(items) + "]"
 
 
 def render_expansion(
@@ -736,6 +935,23 @@ def render_expansion(
     needs_image_helper = False
     send_call = "TEM_Paste(__tem_result)" if use_paste else "SendText(__tem_result)"
 
+    # Every prompt is gathered up front in one dialog, so the user answers with
+    # the whole resolved text in view and can revise any field before inserting.
+    fields = _form_fields(segments)
+    use_form = _use_form(fields)
+    if use_form:
+        lines.append(f"    __tem_fields := {_form_fields_literal(fields)}")
+        lines.append(f"    __tem_parts := {_form_parts_literal(segments)}")
+        lines.append(
+            f"    __tem_vals := TEM_Form({_ahk_string(expansion.trigger)}, __tem_fields, __tem_parts)"
+        )
+        lines.append("    if (!IsObject(__tem_vals))")
+        lines.append("        return")
+        for field in fields:
+            lines.append(
+                f'    {field["name"]} := __tem_vals[{_ahk_string(field["name"])}]'
+            )
+
     def flush_result() -> None:
         lines.append("    if (__tem_result != \"\") {")
         lines.append(f"        {send_call}")
@@ -751,21 +967,25 @@ def render_expansion(
         if segment.kind == "AHK_EXPR":
             lines.append(f"    __tem_result .= {segment.value}")
         elif segment.kind == "AHK_INPUT":
+            # The form already assigned the variable, including for a repeat
+            # occurrence, so the value is only appended here.
             variable, prompt, title, default = segment.args
-            lines.append(f"    __tem_input_{variable} := InputBox({_ahk_string(prompt)}, {_ahk_string(title)}, , {_ahk_string(default)})")
-            lines.append(f"    if (__tem_input_{variable}.Result = \"Cancel\")")
-            lines.append("        return")
-            lines.append(f"    {variable} := __tem_input_{variable}.Value")
+            if not use_form:
+                lines.append(f"    __tem_input_{variable} := InputBox({_ahk_string(prompt)}, {_ahk_string(title)}, , {_ahk_string(default)})")
+                lines.append(f"    if (__tem_input_{variable}.Result = \"Cancel\")")
+                lines.append("        return")
+                lines.append(f"    {variable} := __tem_input_{variable}.Value")
             lines.append(f"    __tem_result .= {variable}")
         elif segment.kind == "AHK_SELECT":
             variable, prompt, title, *options = segment.args
-            option_list = ", ".join(_ahk_string(option) for option in options)
-            lines.append(f"    __tem_select_{variable} := TEM_Select({_ahk_string(prompt)}, {_ahk_string(title)}, [{option_list}])")
-            lines.append(f"    if (!__tem_select_{variable}.ok)")
-            lines.append("        return")
-            lines.append(f"    {variable} := __tem_select_{variable}.value")
+            if not use_form:
+                option_list = ", ".join(_ahk_string(option) for option in options)
+                lines.append(f"    __tem_select_{variable} := TEM_Select({_ahk_string(prompt)}, {_ahk_string(title)}, [{option_list}])")
+                lines.append(f"    if (!__tem_select_{variable}.ok)")
+                lines.append("        return")
+                lines.append(f"    {variable} := __tem_select_{variable}.value")
+                needs_select_helper = True
             lines.append(f"    __tem_result .= {variable}")
-            needs_select_helper = True
         elif segment.kind == "AHK_KEY":
             key_name = segment.value
             flush_result()
@@ -789,6 +1009,7 @@ def render_expansion(
         needs_select_helper,
         needs_image_helper,
         use_paste,
+        use_form,
     )
 
 
@@ -1291,6 +1512,64 @@ def _select_helper_lines() -> list[str]:
         "    guiHwnd := selectGui.Hwnd",
         "    WinWaitClose(\"ahk_id \" guiHwnd)",
         "    return result",
+        "}",
+    ]
+
+
+def _form_helper_lines() -> list[str]:
+    """One dialog gathering every prompt, above a preview of the resolved text.
+
+    updatePreview reads the live controls on each keystroke rather than closing
+    over per-field state, which also sidesteps the v2 closure-in-a-loop trap
+    where every handler would otherwise capture the last field.
+    """
+    return [
+        "TEM_Form(title, fields, parts) {",
+        "    formGui := Gui(\"+AlwaysOnTop +OwnDialogs\", title)",
+        "    formGui.SetFont(\"s9\")",
+        "    formGui.AddText(\"xm w460\", \"Preview\")",
+        "    preview := formGui.AddEdit(\"xm w460 r4 Multi ReadOnly\")",
+        "    controls := Map()",
+        "    state := Map(\"ok\", false, \"values\", \"\")",
+        "    updatePreview() {",
+        "        text := \"\"",
+        "        for part in parts {",
+        "            if (part is Map)",
+        "                text .= controls.Has(part[\"var\"]) ? controls[part[\"var\"]].Text : \"\"",
+        "            else",
+        "                text .= part",
+        "        }",
+        "        preview.Value := text",
+        "    }",
+        "    for field in fields {",
+        "        formGui.AddText(\"xm w140 Right\", field[\"label\"])",
+        "        if (field[\"kind\"] = \"select\")",
+        "            ctrl := formGui.AddDropDownList(\"x+8 yp-4 w312 Choose1\", field[\"options\"])",
+        "        else",
+        "            ctrl := formGui.AddEdit(\"x+8 yp-4 w312\", field[\"default\"])",
+        "        ctrl.OnEvent(\"Change\", (*) => updatePreview())",
+        "        controls[field[\"name\"]] := ctrl",
+        "    }",
+        "    okButton := formGui.AddButton(\"xm+272 y+16 w90 Default\", \"Insert\")",
+        "    cancelButton := formGui.AddButton(\"x+8 w90\", \"Cancel\")",
+        "    okButton.OnEvent(\"Click\", (*) => (state[\"ok\"] := true, state[\"values\"] := TEM_FormValues(fields, controls), formGui.Destroy()))",
+        "    cancelButton.OnEvent(\"Click\", (*) => formGui.Destroy())",
+        "    formGui.OnEvent(\"Close\", (*) => formGui.Destroy())",
+        "    formGui.OnEvent(\"Escape\", (*) => formGui.Destroy())",
+        "    updatePreview()",
+        "    formGui.Show()",
+        "    if (fields.Length)",
+        "        controls[fields[1][\"name\"]].Focus()",
+        "    guiHwnd := formGui.Hwnd",
+        "    WinWaitClose(\"ahk_id \" guiHwnd)",
+        "    return state[\"ok\"] ? state[\"values\"] : \"\"",
+        "}",
+        "",
+        "TEM_FormValues(fields, controls) {",
+        "    values := Map()",
+        "    for field in fields",
+        "        values[field[\"name\"]] := controls[field[\"name\"]].Text",
+        "    return values",
         "}",
     ]
 
