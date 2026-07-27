@@ -757,6 +757,10 @@ def render_ahk(store: ExpansionStore) -> str:
             item.needs_form_helper for item in rendered_expansions
         )
 
+    # Both prompts position themselves through the same helper.
+    if needs_form_helper or needs_select_helper:
+        lines.extend(_position_helper_lines())
+        lines.append("")
     if needs_form_helper:
         lines.extend(_form_helper_lines())
         lines.append("")
@@ -1499,6 +1503,7 @@ def _ahk_string(value: str) -> str:
 def _select_helper_lines() -> list[str]:
     return [
         "TEM_Select(prompt, title, options) {",
+        "    point := TEM_TargetPoint()",
         "    selectGui := Gui(\"+AlwaysOnTop\", title)",
         "    selectGui.AddText(\"w280\", prompt)",
         "    dropdown := selectGui.AddDropDownList(\"w280 Choose1\", options)",
@@ -1508,10 +1513,66 @@ def _select_helper_lines() -> list[str]:
         "    okButton.OnEvent(\"Click\", (*) => (result.ok := true, result.value := dropdown.Text, selectGui.Destroy()))",
         "    cancelButton.OnEvent(\"Click\", (*) => selectGui.Destroy())",
         "    selectGui.OnEvent(\"Close\", (*) => selectGui.Destroy())",
-        "    selectGui.Show()",
+        "    TEM_ShowAt(selectGui, point)",
         "    guiHwnd := selectGui.Hwnd",
         "    WinWaitClose(\"ahk_id \" guiHwnd)",
         "    return result",
+        "}",
+    ]
+
+
+def _position_helper_lines() -> list[str]:
+    """Place a prompt on the monitor the trigger was typed on.
+
+    Showing a dialog with no coordinates lands it on whichever monitor Windows
+    picks, which on a multi-monitor desk is routinely not the one the user is
+    typing on. The anchor is taken before the dialog exists, because showing it
+    makes the script the active window and loses the target.
+
+    The caret is the most accurate anchor but is unavailable in a fair number of
+    apps -- Chrome and most Electron shells among them -- so the active window's
+    centre and finally the mouse stand in for it.
+    """
+    return [
+        "TEM_TargetPoint() {",
+        # Both default to Client, which would report the caret relative to the
+        # typed-in window and pick the wrong monitor. Restored so the calling
+        # hotstring is not left with modes it did not set.
+        "    priorCaret := A_CoordModeCaret",
+        "    priorMouse := A_CoordModeMouse",
+        "    CoordMode(\"Caret\", \"Screen\")",
+        "    CoordMode(\"Mouse\", \"Screen\")",
+        "    try {",
+        "        if (CaretGetPos(&caretX, &caretY) && (caretX || caretY))",
+        "            return [caretX, caretY]",
+        "        if (targetHwnd := WinExist(\"A\")) {",
+        "            WinGetPos(&winX, &winY, &winW, &winH, targetHwnd)",
+        "            return [winX + winW // 2, winY + winH // 2]",
+        "        }",
+        "        MouseGetPos(&mouseX, &mouseY)",
+        "        return [mouseX, mouseY]",
+        "    } finally {",
+        "        CoordMode(\"Caret\", priorCaret)",
+        "        CoordMode(\"Mouse\", priorMouse)",
+        "    }",
+        "}",
+        "",
+        "TEM_MonitorAt(x, y) {",
+        "    loop MonitorGetCount() {",
+        "        MonitorGetWorkArea(A_Index, &left, &top, &right, &bottom)",
+        "        if (x >= left && x < right && y >= top && y < bottom)",
+        "            return A_Index",
+        "    }",
+        "    return MonitorGetPrimary()",
+        "}",
+        "",
+        "TEM_ShowAt(targetGui, point) {",
+        "    MonitorGetWorkArea(TEM_MonitorAt(point[1], point[2]), &left, &top, &right, &bottom)",
+        "    targetGui.Show(\"Hide\")",
+        "    targetGui.GetPos(, , &guiW, &guiH)",
+        "    x := Max(left, left + ((right - left) - guiW) // 2)",
+        "    y := Max(top, top + ((bottom - top) - guiH) // 2)",
+        "    targetGui.Show(\"x\" x \" y\" y)",
         "}",
     ]
 
@@ -1525,6 +1586,7 @@ def _form_helper_lines() -> list[str]:
     """
     return [
         "TEM_Form(title, fields, parts) {",
+        "    point := TEM_TargetPoint()",
         "    formGui := Gui(\"+AlwaysOnTop +OwnDialogs\", title)",
         "    formGui.SetFont(\"s9\")",
         "    formGui.AddText(\"xm w460\", \"Preview\")",
@@ -1557,7 +1619,7 @@ def _form_helper_lines() -> list[str]:
         "    formGui.OnEvent(\"Close\", (*) => formGui.Destroy())",
         "    formGui.OnEvent(\"Escape\", (*) => formGui.Destroy())",
         "    updatePreview()",
-        "    formGui.Show()",
+        "    TEM_ShowAt(formGui, point)",
         "    if (fields.Length)",
         "        controls[fields[1][\"name\"]].Focus()",
         "    guiHwnd := formGui.Hwnd",

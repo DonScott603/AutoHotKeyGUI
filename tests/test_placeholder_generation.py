@@ -127,6 +127,29 @@ class PlaceholderGenerationTests(unittest.TestCase):
         self.assertEqual(output.count('amount := __tem_vals["amount"]'), 1)
         self.assertEqual(output.count("__tem_result .= amount"), 2)
 
+    def test_prompts_are_positioned_on_the_typed_on_monitor(self) -> None:
+        # Both prompts anchor to where the trigger was typed. The shared helper
+        # is emitted once even when both dialogs are in play, and neither may
+        # fall back to a coordinate-less Show().
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion("Work", "one", "{AHK_INPUT:a|A|A|}"),
+                Expansion("Work", "two", "{AHK_SELECT:b|B|B|x||y}"),
+            ],
+        )
+
+        output = render_ahk(store)
+
+        self.assertEqual(output.count("TEM_TargetPoint() {"), 1)
+        # Screen coordinates: the default Client mode reports the caret relative
+        # to the typed-in window and would pick the wrong monitor.
+        self.assertIn('CoordMode("Caret", "Screen")', output)
+        self.assertIn("TEM_ShowAt(formGui, point)", output)
+        self.assertIn("TEM_ShowAt(selectGui, point)", output)
+        self.assertNotIn("formGui.Show()", output)
+        self.assertNotIn("selectGui.Show()", output)
+
     def test_multiple_selects_use_the_form_rather_than_separate_popups(self) -> None:
         # The lightweight TEM_Select popup is kept only for a lone dropdown.
         store = ExpansionStore(
