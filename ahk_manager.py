@@ -488,11 +488,12 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
             i += 1
             continue
         # Input box: 5 lines.
-        if re.match(r"__tem_input_\w+ := InputBox\(", line):
+        input_box = re.match(r"__tem_input_(\w+) := InputBox\(", line)
+        if input_box:
             quoted = _AHK_QUOTED_RE.findall(line)
             if len(quoted) < 2:
                 return None
-            var = re.match(r"__tem_input_(\w+) :=", line).group(1)
+            var = input_box.group(1)
             prompt = _unescape_ahk(quoted[0])
             title = _unescape_ahk(quoted[1])
             default = _unescape_ahk(quoted[2]) if len(quoted) > 2 else ""
@@ -500,11 +501,12 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
             i += 5
             continue
         # List selection: 5 lines.
-        if re.match(r"__tem_select_\w+ := TEM_Select\(", line):
+        selection = re.match(r"__tem_select_(\w+) := TEM_Select\(", line)
+        if selection:
             quoted = _AHK_QUOTED_RE.findall(line)
             if len(quoted) < 2:
                 return None
-            var = re.match(r"__tem_select_(\w+) :=", line).group(1)
+            var = selection.group(1)
             prompt = _unescape_ahk(quoted[0])
             title = _unescape_ahk(quoted[1])
             options = [_unescape_ahk(option) for option in quoted[2:]]
