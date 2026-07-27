@@ -8,3 +8,4 @@ text_expansions*.ahk
 build/
 dist/
 Issues/
+*Screenshot*.png

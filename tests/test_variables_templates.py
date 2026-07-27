@@ -56,8 +56,12 @@ class VariableTemplateTests(unittest.TestCase):
 
         output = render_ahk(store)
 
-        self.assertIn('InputBox("Enter client name", "Client Name", , "")', output)
-        self.assertIn("client_name := __tem_input_client_name.Value", output)
+        self.assertIn(
+            'Map("name", "client_name", "label", "Enter client name", '
+            '"title", "Client Name", "kind", "input", "default", "")',
+            output,
+        )
+        self.assertIn('client_name := __tem_vals["client_name"]', output)
 
     def test_list_selection_variable_resolves_to_select_logic(self) -> None:
         store = ExpansionStore(
@@ -185,7 +189,7 @@ class VariableTemplateTests(unittest.TestCase):
 
         output = render_ahk(store)
 
-        self.assertIn('InputBox("Enter client name", "Client Name", , "")', output)
+        self.assertIn('client_name := __tem_vals["client_name"]', output)
         self.assertIn('__tem_result .= "`nThank you."', output)
 
     def test_circular_template_reference_is_rejected(self) -> None:

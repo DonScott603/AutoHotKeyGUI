@@ -183,6 +183,37 @@ class ImportMergeTests(unittest.TestCase):
         self.assertEqual(by_trigger[";ld"], '{AHK_EXPR:FormatTime(A_Now, "yyyy-MM-dd")}')
         self.assertEqual(by_trigger[";ask"], "Hi {AHK_INPUT:name|Enter name|Name|}, ok")
 
+    def test_unmarked_form_block_round_trips_every_field(self) -> None:
+        # The form gathers all prompts in one dialog, so an unmarked block must
+        # be reversed from its fields array: a select's options must survive,
+        # and a variable used twice must come back as two placeholders even
+        # though the form declares it once.
+        replacement = (
+            "{AHK_INPUT:client|Client name|Client|Acme} owes "
+            "{AHK_SELECT:kind|Kind|Kind|ACH||Wire} "
+            "of ${AHK_INPUT:amount|Amount|Amount|} on {AHK_INPUT:client|Client name|Client|Acme}"
+        )
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";owe", replacement)],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "old.ahk"
+            generate_ahk(store, ahk_path, backup=False)
+            text = ahk_path.read_text(encoding="utf-8")
+            ahk_path.write_text(
+                "\n".join(
+                    line
+                    for line in text.splitlines()
+                    if not line.strip().startswith("; @tem:")
+                ),
+                encoding="utf-8",
+            )
+            imported = import_ahk(ahk_path)
+
+        self.assertEqual(imported.expansions[0].replacement, replacement)
+
     def test_unrecognised_code_block_hotstring_is_skipped(self) -> None:
         # A code block that is not in the generated form cannot be reversed and
         # must be skipped rather than imported as a corrupt empty expansion.
