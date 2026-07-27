@@ -46,6 +46,7 @@ from ahk_manager import (
     TemplateDef,
     VariableDef,
     VARIABLE_TYPES,
+    backup_file,
     count_import_conflicts,
     generate_ahk,
     import_ahk,
@@ -634,6 +635,8 @@ class ExpansionApp(QMainWindow):
         self.settings = self._load_settings()
         self.ahk_process: subprocess.Popen | None = None
         self.theme = load_theme_pref() or detect_system_theme()
+        # One backup per session, taken before the first write. See _backup_once.
+        self._session_backed_up = False
 
         self.selected_section = self.store.sections[0]
         self.current_expansion: Expansion | None = None
@@ -1046,8 +1049,9 @@ class ExpansionApp(QMainWindow):
         self.status_label = QLabel("Ready.")
         self.status_label.setObjectName("Muted")
         action_row.addWidget(self.status_label, 1)
+        # No separate save button: every edit persists as it is applied, and
+        # Generate & Run writes the store before generating regardless.
         for text, slot, primary in (
-            ("Save JSON", self.save_json, False),
             ("Generate && Run AHK", self.generate_and_run_ahk, True),
             ("Run AHK", self.run_ahk, False),
             ("Import .ahk", self.import_ahk, False),
@@ -1284,6 +1288,7 @@ class ExpansionApp(QMainWindow):
             self.current_variable.default_value = variable.default_value
             self.current_variable.list_options = variable.list_options
             self.current_variable.notes = variable.notes
+        self.persist()
         self.refresh_variables()
         self.set_status(f'Saved variable "{variable.name}".')
 
@@ -1323,6 +1328,7 @@ class ExpansionApp(QMainWindow):
             self.current_template.description = template.description
             self.current_template.body = template.body
             self.current_template.notes = template.notes
+        self.persist()
         self.refresh_templates()
         self.set_status(f'Saved template "{template.name}".')
 
@@ -1366,6 +1372,7 @@ class ExpansionApp(QMainWindow):
         if not confirm(self, "Delete variable", f'Delete variable "{variable.name}"?'):
             return
         self.store.variables.remove(variable)
+        self.persist()
         self.current_variable = None
         self.new_variable()
         self.refresh_variables()
@@ -1379,6 +1386,7 @@ class ExpansionApp(QMainWindow):
         if not confirm(self, "Delete template", f'Delete template "{template.name}"?'):
             return
         self.store.templates.remove(template)
+        self.persist()
         self.current_template = None
         self.new_template()
         self.refresh_templates()
@@ -1397,6 +1405,7 @@ class ExpansionApp(QMainWindow):
             suffix += 1
         copy = TemplateDef(name, template.description, template.body, template.notes)
         self.store.templates.append(copy)
+        self.persist()
         self.current_template = copy
         self.refresh_templates()
         self.template_tree.selectRow(len(self.store.templates) - 1)
@@ -1446,6 +1455,7 @@ class ExpansionApp(QMainWindow):
         except ValueError as exc:
             show_error(self, "Section error", str(exc))
             return
+        self.persist()
         self.selected_section = name.strip()
         self.refresh_sections()
         self.refresh_expansions()
@@ -1463,6 +1473,7 @@ class ExpansionApp(QMainWindow):
         except ValueError as exc:
             show_error(self, "Section error", str(exc))
             return
+        self.persist()
         self.selected_section = new_name.strip()
         self.refresh_sections()
         self.refresh_expansions()
@@ -1474,6 +1485,7 @@ class ExpansionApp(QMainWindow):
         if not confirm(self, "Delete section", f'Delete "{section}" and {count} expansion(s)?'):
             return
         self.store.delete_section(section)
+        self.persist()
         self.selected_section = self.store.sections[0]
         self.refresh_sections()
         self.refresh_expansions()
@@ -1570,6 +1582,7 @@ class ExpansionApp(QMainWindow):
             self.current_expansion.notes = expansion.notes
             self.set_status(f'Updated trigger "{expansion.trigger}".')
 
+        self.persist()
         self.selected_section = expansion.section
         self.refresh_sections()
         self.refresh_expansions()
@@ -1615,6 +1628,7 @@ class ExpansionApp(QMainWindow):
         if not confirm(self, "Delete expansion", f'Delete trigger "{expansion.trigger}"?'):
             return
         del self.store.expansions[index]
+        self.persist()
         self.current_expansion = None
         self.refresh_expansions()
         self.clear_form(keep_section=True)
@@ -1627,6 +1641,7 @@ class ExpansionApp(QMainWindow):
             return
         expansion = self.store.expansions[index]
         expansion.enabled = not expansion.enabled
+        self.persist()
         self.refresh_expansions()
         self.set_status(f'{"Enabled" if expansion.enabled else "Disabled"} "{expansion.trigger}".')
 
@@ -1662,13 +1677,48 @@ class ExpansionApp(QMainWindow):
             return
         self.set_status(f"Saved {SETTINGS_PATH.name}.")
 
-    def save_json(self) -> None:
+    def _backup_once(self) -> None:
+        """Copy the store file aside before this session's first write.
+
+        Taken here rather than at launch because the file on disk is still the
+        previous session's state until that first write -- so this captures the
+        same thing a start-up backup would, while a session that only browses
+        writes no backup at all. That matters: with a retention limit, backing
+        up on every launch would rotate genuinely useful copies out.
+
+        Autosave is what makes this necessary. Leaving without saving used to
+        be an implicit undo, and it no longer is.
+        """
+        if self._session_backed_up:
+            return
+        # Set before attempting, so a failing backup is not retried on every
+        # subsequent save.
+        self._session_backed_up = True
+        try:
+            backup_file(JSON_PATH)
+        except OSError as exc:
+            show_warning(
+                self,
+                "Backup",
+                f"Could not back up {JSON_PATH.name}: {exc}\n\n"
+                "Your changes will still be saved.",
+            )
+
+    def persist(self) -> bool:
+        """Write the store to disk immediately after a change to it.
+
+        Every edit saves as it is applied, so closing the window cannot lose
+        work and there is no separate save step to remember. Returns False
+        having already reported the failure, so callers that want to say more
+        about it can; the in-memory change stands either way.
+        """
+        self._backup_once()
         try:
             self.store.save(JSON_PATH)
         except OSError as exc:
             show_error(self, "Save error", f"Could not save {JSON_PATH.name}: {exc}")
-            return
-        self.set_status(f"Saved {JSON_PATH.name}.")
+            return False
+        return True
 
     def generate_and_run_ahk(self) -> None:
         ahk_path = self.current_ahk_path()
@@ -1842,6 +1892,7 @@ class ExpansionApp(QMainWindow):
                 return
 
         result = merge_imported_store(self.store, imported, conflict_action)
+        self.persist()
         self.selected_section = imported.sections[0] if imported.sections else self.store.sections[0]
         self.current_expansion = None
         self.refresh_sections()

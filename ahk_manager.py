@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -33,7 +34,7 @@ class AppSettings:
 
     def save(self, path: Path) -> None:
         data = {"generated_ahk_path": self.generated_ahk_path}
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        _atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
 @dataclass
@@ -173,7 +174,7 @@ class ExpansionStore:
             "variables": [variable.to_dict() for variable in self.variables],
             "templates": [template.to_dict() for template in self.templates],
         }
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        _atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
     def add_section(self, name: str) -> None:
         clean_name = name.strip()
@@ -702,17 +703,53 @@ def merge_imported_store(
     return result
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write text so that a failure part-way cannot truncate the existing file.
+
+    The content lands in a temporary file alongside the target -- the same
+    directory, so the closing rename stays on one volume and is atomic -- and is
+    flushed to the platform before that rename. A crash, a full disk or a
+    process kill therefore leaves either the previous file or the complete new
+    one, never a half-written mix of both.
+
+    Newline handling is left at the default so the line endings match what
+    Path.write_text produced before this existed.
+    """
+    temp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except OSError:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def backup_file(path: Path) -> Path | None:
+    """Copy a file aside, keeping the newest BACKUP_RETENTION_LIMIT copies.
+
+    Returns the backup's path, or None when there was nothing to copy.
+    """
+    if not path.exists():
+        return None
+    backup_path = _backup_path(path)
+    shutil.copy2(path, backup_path)
+    _cleanup_old_backups(path)
+    return backup_path
+
+
 def generate_ahk(store: ExpansionStore, path: Path, backup: bool = True) -> Path | None:
     validate_store_placeholders(store)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if backup and path.exists():
-        backup_path = _backup_path(path)
-        shutil.copy2(path, backup_path)
-        _cleanup_old_backups(path)
-    else:
-        backup_path = None
-
-    path.write_text(render_ahk(store), encoding="utf-8")
+    backup_path = backup_file(path) if backup else None
+    # Atomic too: a truncated .ahk would break every hotstring at once, and the
+    # running script is reloaded from it immediately after this returns.
+    _atomic_write_text(path, render_ahk(store))
     return backup_path
 
 
