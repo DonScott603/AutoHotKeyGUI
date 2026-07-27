@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -39,6 +40,7 @@ from PySide6.QtWidgets import (
 from ahk_manager import (
     DEFAULT_AHK,
     DEFAULT_JSON,
+    BACKUP_RETENTION_LIMIT,
     DEFAULT_SETTINGS,
     AppSettings,
     Expansion,
@@ -47,10 +49,13 @@ from ahk_manager import (
     VariableDef,
     VARIABLE_TYPES,
     backup_file,
+    backup_timestamp,
     count_import_conflicts,
     generate_ahk,
     import_ahk,
+    list_backups,
     merge_imported_store,
+    restore_backup,
     parse_replacement_template,
     resolve_expansion_preview,
     resolve_template_preview,
@@ -95,6 +100,72 @@ JSON_PATH = APP_DIR / DEFAULT_JSON
 AHK_PATH = APP_DIR / DEFAULT_AHK
 SETTINGS_PATH = APP_DIR / DEFAULT_SETTINGS
 UI_PREFS_PATH = APP_DIR / "ui_prefs.json"
+
+# Shown in the Help page. No colours are set anywhere in this markup: the text
+# has to stay readable in both themes, so it inherits the widget's palette.
+HELP_HTML = f"""
+<h3>What this does</h3>
+<p>You keep a library of short <b>triggers</b> here. This app turns that library
+into an AutoHotkey script, and while that script is running, typing a trigger in
+any application replaces it with the matching text.</p>
+<p>Nothing you type here takes effect until you press
+<b>Generate &amp; Run AHK</b>, which rewrites <code>{DEFAULT_AHK}</code> and
+restarts the running script.</p>
+
+<h3>Expansions</h3>
+<p>An expansion is a trigger plus its replacement text, filed under a section.
+Sections are only for organising the list; they do not affect behaviour.</p>
+<ul>
+<li>A trigger cannot contain spaces or <code>::</code>.</li>
+<li>Triggers are case sensitive, and a leading character such as
+<code>;</code> makes accidental firing much less likely.</li>
+<li>Clear the <b>Enabled</b> box to keep an expansion but leave it out of the
+generated script.</li>
+<li>Duplicate triggers are flagged, and the last one generated wins.</li>
+</ul>
+
+<h3>Placeholders</h3>
+<p>Replacement text can contain placeholders that are filled in at the moment
+the expansion fires. Use the buttons under the replacement box to insert them
+rather than typing the syntax by hand.</p>
+<ul>
+<li><code>{{AHK_INPUT:...}}</code> asks for a value in a text field.</li>
+<li><code>{{AHK_SELECT:...}}</code> offers a dropdown of fixed choices.</li>
+<li><code>{{AHK_EXPR:...}}</code> inserts a date or time, evaluated as it
+fires.</li>
+<li><code>{{AHK_KEY:...}}</code> presses a key, such as Tab.</li>
+<li><code>{{AHK_IMAGE:...}}</code> pastes an image from a file.</li>
+<li><code>{{VAR:name}}</code> and <code>{{TPL:name}}</code> pull in a variable
+or a template.</li>
+</ul>
+<p>When an expansion asks for anything, you get <b>one dialog</b> with a field
+per question and a preview of the finished text above them that updates as you
+type. A value asked for twice is asked for once and used in both places. The
+dialog opens on the monitor you were typing on. Press Escape to cancel and
+nothing is inserted.</p>
+
+<h3>Variables and templates</h3>
+<p>A <b>variable</b> is a named placeholder you define once and reuse by name.
+A <b>template</b> is a named block of replacement text that can itself contain
+variables and other templates. Both keep you from repeating the same definition
+across many expansions; change the definition and every expansion using it
+changes too.</p>
+
+<h3>Saving</h3>
+<p>Every change is written to <code>{DEFAULT_JSON}</code> the moment you apply
+it, so there is no save step and closing the window cannot lose work. Because of
+that, use the backup buttons below rather than closing without saving if you
+want to undo a session's worth of edits.</p>
+
+<h3>Buttons along the bottom</h3>
+<ul>
+<li><b>Generate &amp; Run AHK</b> writes the script and restarts it. This is
+the one to press after making changes.</li>
+<li><b>Run AHK</b> starts the existing script without rewriting it.</li>
+<li><b>Import .ahk</b> reads expansions out of an AutoHotkey file and merges
+them in, asking what to do about any that clash.</li>
+</ul>
+"""
 
 # Qt file-dialog filter strings (";;"-separated) rather than tkinter tuples.
 IMAGE_FILE_FILTER = (
@@ -188,14 +259,14 @@ def build_stylesheet(theme: str) -> str:
     QLabel#Heading {{ font-size: 12pt; font-weight: 600; }}
     QLabel#Warn {{ color: {c['warn']}; }}
     QLabel#Muted {{ color: {c['muted']}; }}
-    QListWidget, QTableWidget, QPlainTextEdit, QLineEdit, QComboBox {{
+    QListWidget, QTableWidget, QPlainTextEdit, QTextBrowser, QLineEdit, QComboBox {{
         background-color: {c['panel']};
         border: 1px solid {c['border']};
         border-radius: 6px;
         selection-background-color: {c['selection']};
         selection-color: {c['text']};
     }}
-    QPlainTextEdit, QLineEdit {{ padding: 4px 6px; }}
+    QPlainTextEdit, QTextBrowser, QLineEdit {{ padding: 4px 6px; }}
     QComboBox {{ padding: 4px 6px; }}
     QTableWidget {{ gridline-color: {c['border']}; }}
     QHeaderView::section {{
@@ -690,6 +761,7 @@ class ExpansionApp(QMainWindow):
         self.stack.addWidget(self._build_expansions_page())
         self.stack.addWidget(self._build_variables_page())
         self.stack.addWidget(self._build_templates_page())
+        self.stack.addWidget(self._build_help_page())
         body.addWidget(self.stack, 1)
 
         root.addLayout(body, 1)
@@ -706,7 +778,7 @@ class ExpansionApp(QMainWindow):
 
         self.nav = QListWidget()
         self.nav.setObjectName("Sidebar")
-        for label in ("⌨  Expansions", "ƒ  Variables", "▤  Templates"):
+        for label in ("⌨  Expansions", "ƒ  Variables", "▤  Templates", "?  Help"):
             QListWidgetItem(label, self.nav)
         self.nav.currentRowChanged.connect(self.stack_set_index)
         layout.addWidget(self.nav, 1)
@@ -739,6 +811,45 @@ class ExpansionApp(QMainWindow):
         splitter.setStretchFactor(2, 3)
         splitter.setSizes([232, 540, 360])
         layout.addWidget(splitter)
+        return page
+
+    def _build_help_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        heading = QLabel("Help")
+        heading.setObjectName("Heading")
+        layout.addWidget(heading)
+
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(False)
+        browser.setHtml(HELP_HTML)
+        layout.addWidget(browser, 1)
+
+        restore_heading = QLabel("Restore from backup")
+        restore_heading.setObjectName("Heading")
+        layout.addWidget(restore_heading)
+
+        note = QLabel(
+            f"A copy of {JSON_PATH.name} is kept the first time you change "
+            f"anything in a session, and of {AHK_PATH.name} each time you "
+            f"generate. The {BACKUP_RETENTION_LIMIT} most recent of each are "
+            "kept. Restoring replaces the current file, backing it up first."
+        )
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        button_row = QHBoxLayout()
+        json_button = QPushButton("Restore expansions backup...")
+        json_button.clicked.connect(self.restore_json_backup)
+        button_row.addWidget(json_button)
+        ahk_button = QPushButton("Restore AHK script backup...")
+        ahk_button.clicked.connect(self.restore_ahk_backup)
+        button_row.addWidget(ahk_button)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
         return page
 
     def _build_sections_panel(self) -> QWidget:
@@ -1703,6 +1814,88 @@ class ExpansionApp(QMainWindow):
                 f"Could not back up {JSON_PATH.name}: {exc}\n\n"
                 "Your changes will still be saved.",
             )
+
+    # -- restore -----------------------------------------------------------
+    def _restore_from_backup(self, target: Path, label: str) -> Path | None:
+        """Ask which backup of target to restore, and restore it.
+
+        Returns the restored-from path so the caller can reload whatever the
+        file feeds, or None if nothing was restored.
+        """
+        backups = list_backups(target)
+        if not backups:
+            show_info(
+                self,
+                f"Restore {label}",
+                f"There are no backups of {target.name} yet.",
+            )
+            return None
+
+        choices = [f"{backup_timestamp(item)}    ({item.name})" for item in backups]
+        choice, ok = QInputDialog.getItem(
+            self,
+            f"Restore {label}",
+            f"Replace {target.name} with this backup:",
+            choices,
+            0,
+            False,
+        )
+        if not ok:
+            return None
+        selected = backups[choices.index(choice)]
+
+        if not confirm(
+            self,
+            f"Restore {label}",
+            f"Replace {target.name} with the backup from "
+            f"{backup_timestamp(selected)}?\n\n"
+            f"The current {target.name} is backed up first, so this can be "
+            "undone.",
+        ):
+            return None
+
+        try:
+            safety_copy = restore_backup(selected, target)
+        except (OSError, ValueError) as exc:
+            show_error(self, f"Restore {label}", str(exc))
+            return None
+
+        message = f"Restored {target.name} from {backup_timestamp(selected)}."
+        if safety_copy:
+            message += f" Previous file kept as {safety_copy.name}."
+        self.set_status(message)
+        show_info(self, f"Restore {label}", message)
+        return selected
+
+    def restore_json_backup(self) -> None:
+        if self._restore_from_backup(JSON_PATH, "expansions") is None:
+            return
+        # The file underneath the UI changed, so everything on screen is stale.
+        self.store = self._load_store()
+        self.current_expansion = None
+        self.current_variable = None
+        self.current_template = None
+        self.selected_section = self.store.sections[0]
+        self.refresh_sections()
+        self.refresh_expansions()
+        self.refresh_variables()
+        self.refresh_templates()
+        self.clear_form()
+
+    def restore_ahk_backup(self) -> None:
+        target = self.current_ahk_path()
+        if self._restore_from_backup(target, "AHK script") is None:
+            return
+        # The restored script is only inert text until something runs it, and
+        # Generate & Run would immediately overwrite it from the library.
+        if confirm(
+            self,
+            "Restore AHK script",
+            f"Run the restored {target.name} now?\n\n"
+            "Note that Generate & Run AHK will overwrite it again from the "
+            "expansions library.",
+        ):
+            self.run_ahk()
 
     def persist(self) -> bool:
         """Write the store to disk immediately after a change to it.

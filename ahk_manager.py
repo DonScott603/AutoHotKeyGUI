@@ -743,6 +743,43 @@ def backup_file(path: Path) -> Path | None:
     return backup_path
 
 
+def list_backups(path: Path) -> list[Path]:
+    """Existing backups of a file, newest first."""
+    backups = _app_backup_paths(path)
+    backups.sort(key=_backup_sort_key, reverse=True)
+    return backups
+
+
+def backup_timestamp(path: Path) -> str:
+    """The time a backup was taken, read back out of its filename."""
+    match = re.search(r"\.(\d{8})_(\d{6})(?:_(\d+))?\.bak", path.name)
+    if not match:
+        return path.name
+    try:
+        taken = datetime.strptime(match.group(1) + match.group(2), "%Y%m%d%H%M%S")
+    except ValueError:
+        return path.name
+    label = taken.strftime("%Y-%m-%d %H:%M:%S")
+    # Several backups within the same second are numbered rather than lost.
+    if match.group(3):
+        label += f" (#{match.group(3)})"
+    return label
+
+
+def restore_backup(backup_path: Path, target_path: Path) -> Path | None:
+    """Replace a file with one of its backups.
+
+    The file being replaced is itself backed up first, so restoring the wrong
+    copy is recoverable rather than the end of the current data. Returns that
+    safety copy's path, or None when there was no file to replace.
+    """
+    if not backup_path.exists():
+        raise ValueError(f"{backup_path.name} no longer exists.")
+    safety_copy = backup_file(target_path)
+    shutil.copy2(backup_path, target_path)
+    return safety_copy
+
+
 def generate_ahk(store: ExpansionStore, path: Path, backup: bool = True) -> Path | None:
     validate_store_placeholders(store)
     path.parent.mkdir(parents=True, exist_ok=True)
