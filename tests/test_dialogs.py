@@ -4,8 +4,10 @@ import unittest
 # Run Qt without a real display so the GUI tests work headlessly (e.g. in CI).
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QDialog
+from PySide6.QtCore import QEvent
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget
 
+import app as app_module
 from app import DateTimeDialog, ImportConflictDialog
 
 # A single QApplication must exist for the lifetime of the process.
@@ -66,6 +68,68 @@ class DialogChoiceTests(unittest.TestCase):
             self.assertTrue(dialog.choice.startswith("{AHK_EXPR:FormatTime("))
         finally:
             dialog.deleteLater()
+
+
+class TitleBarThemeFilterTests(unittest.TestCase):
+    """Windows colours a title bar per window, from an attribute Qt does not
+    manage, so theming the main window leaves every dialog's bar untouched. The
+    filter is installed on the application because the QMessageBox convenience
+    statics build and run their dialog internally and never return it.
+    """
+
+    def setUp(self) -> None:
+        self.themed: list[str] = []
+        self._real = app_module.apply_titlebar_theme
+        app_module.apply_titlebar_theme = (  # type: ignore[assignment]
+            lambda widget, repaint=False: self.themed.append(
+                widget.windowTitle() or widget.__class__.__name__
+            )
+        )
+        self.addCleanup(
+            lambda: setattr(app_module, "apply_titlebar_theme", self._real)
+        )
+
+    def test_a_message_box_is_themed_when_shown(self) -> None:
+        box = QMessageBox()
+        box.setWindowTitle("Generate & Run AHK")
+        filt = app_module.TitleBarThemeFilter()
+        try:
+            filt.eventFilter(box, QEvent(QEvent.Type.Show))
+
+            self.assertEqual(self.themed, ["Generate & Run AHK"])
+        finally:
+            box.deleteLater()
+
+    def test_a_child_widget_is_left_alone(self) -> None:
+        # Only top-level windows have a title bar; theming every widget shown
+        # would mean a DWM call per label.
+        parent = QWidget()
+        child = QWidget(parent)
+        filt = app_module.TitleBarThemeFilter()
+        try:
+            filt.eventFilter(child, QEvent(QEvent.Type.Show))
+
+            self.assertEqual(self.themed, [])
+        finally:
+            parent.deleteLater()
+
+    def test_other_events_are_ignored(self) -> None:
+        box = QMessageBox()
+        filt = app_module.TitleBarThemeFilter()
+        try:
+            filt.eventFilter(box, QEvent(QEvent.Type.Hide))
+
+            self.assertEqual(self.themed, [])
+        finally:
+            box.deleteLater()
+
+    def test_the_filter_never_swallows_the_event(self) -> None:
+        box = QMessageBox()
+        filt = app_module.TitleBarThemeFilter()
+        try:
+            self.assertFalse(filt.eventFilter(box, QEvent(QEvent.Type.Show)))
+        finally:
+            box.deleteLater()
 
 
 if __name__ == "__main__":

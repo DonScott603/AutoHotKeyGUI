@@ -7,7 +7,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-from PySide6.QtCore import QRect, QSize, Qt
+from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -283,6 +283,73 @@ _NAV_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("", "⚙", "Settings"),
     ("", "?", "Help"),
 )
+
+
+# Every dialog is its own top-level window, and Windows colours a title bar
+# from a per-window attribute Qt knows nothing about, so theming the main
+# window does nothing for the popups. _TitleBarThemeFilter applies it to each
+# window as it is shown, reading the theme from here.
+_titlebar_theme = "light"
+
+
+def set_titlebar_theme(theme: str) -> None:
+    global _titlebar_theme
+    _titlebar_theme = theme
+
+
+def apply_titlebar_theme(widget: QWidget, repaint: bool = False) -> None:
+    """Colour a window's native title bar for the current theme (Win 10/11).
+
+    Best effort throughout: the attribute is unsupported on older builds, where
+    the call fails and the title bar simply stays light.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        # winId() creates the native window if it does not exist yet, which is
+        # what lets this run before the window is mapped and so avoids showing
+        # a light title bar for a frame first.
+        hwnd = int(widget.winId())
+        value = ctypes.c_int(1 if _titlebar_theme == "dark" else 0)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            ctypes.byref(value),
+            ctypes.sizeof(value),
+        )
+        # Nudge the non-client area to repaint so a change shows immediately on
+        # a window that is already on screen.
+        if repaint and widget.isVisible():
+            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_FRAMECHANGED = 0x2, 0x1, 0x4, 0x20
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, 0, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            )
+    except Exception:
+        pass
+
+
+class TitleBarThemeFilter(QObject):
+    """Theme every window's title bar as it is shown.
+
+    Installed on the application rather than called per dialog because the
+    QMessageBox convenience statics build and run their dialog internally and
+    never hand it back, so there is no other moment to reach it. Filtering the
+    event also runs before the widget handles Show, while the window is still
+    unmapped.
+    """
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            event.type() == QEvent.Type.Show
+            and isinstance(watched, QWidget)
+            and watched.isWindow()
+        ):
+            apply_titlebar_theme(watched)
+        return False
 
 
 @lru_cache(maxsize=1)
@@ -1360,31 +1427,13 @@ class ExpansionApp(QMainWindow):
                 item.setIcon(nav_icon(code_point, fallback, self.theme))
 
     def _apply_titlebar_theme(self) -> None:
-        """Match the native Windows title bar to the current theme (Win 10/11)."""
-        if sys.platform != "win32":
-            return
-        try:
-            import ctypes
+        """Match the native Windows title bar to the current theme (Win 10/11).
 
-            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-            hwnd = int(self.winId())
-            value = ctypes.c_int(1 if self.theme == "dark" else 0)
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                ctypes.byref(value),
-                ctypes.sizeof(value),
-            )
-            # Nudge the non-client area to repaint so the change shows immediately
-            # while the window is already visible.
-            if self.isVisible():
-                SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_FRAMECHANGED = 0x2, 0x1, 0x4, 0x20
-                ctypes.windll.user32.SetWindowPos(
-                    hwnd, 0, 0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
-                )
-        except Exception:
-            pass
+        Publishes the theme for the dialogs as well, which are separate
+        top-level windows and get it through TitleBarThemeFilter.
+        """
+        set_titlebar_theme(self.theme)
+        apply_titlebar_theme(self, repaint=True)
 
     def toggle_theme(self) -> None:
         self.theme = "light" if self.theme == "dark" else "dark"
@@ -2424,6 +2473,9 @@ def main() -> None:
     app = existing if isinstance(existing, QApplication) else QApplication(sys.argv)
     if ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_PATH)))
+    # Parented to the app so it outlives main's frame; a filter that is garbage
+    # collected stops filtering.
+    app.installEventFilter(TitleBarThemeFilter(app))
     window = ExpansionApp()
     window.show()
     app.exec()
