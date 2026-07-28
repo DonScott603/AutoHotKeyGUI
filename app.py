@@ -55,6 +55,7 @@ from ahk_manager import (
     import_ahk,
     list_backups,
     merge_imported_store,
+    migrate_backups,
     restore_backup,
     parse_replacement_template,
     resolve_expansion_preview,
@@ -100,6 +101,10 @@ JSON_PATH = APP_DIR / DEFAULT_JSON
 AHK_PATH = APP_DIR / DEFAULT_AHK
 SETTINGS_PATH = APP_DIR / DEFAULT_SETTINGS
 UI_PREFS_PATH = APP_DIR / "ui_prefs.json"
+# Backups are collected here rather than left beside the files they copy, which
+# scattered them through the working folders -- including wherever the user had
+# pointed the generated script, which may be a synced folder.
+DEFAULT_BACKUP_DIR = APP_DIR / "backups"
 
 # Shown in the Help page. No colours are set anywhere in this markup: the text
 # has to stay readable in both themes, so it inherits the widget's palette.
@@ -151,11 +156,15 @@ variables and other templates. Both keep you from repeating the same definition
 across many expansions; change the definition and every expansion using it
 changes too.</p>
 
-<h3>Saving</h3>
+<h3>Saving and backups</h3>
 <p>Every change is written to <code>{DEFAULT_JSON}</code> the moment you apply
 it, so there is no save step and closing the window cannot lose work. Because of
-that, use the backup buttons below rather than closing without saving if you
-want to undo a session's worth of edits.</p>
+that, closing without saving is no longer a way to abandon a session's edits.</p>
+<p>Instead, a copy of <code>{DEFAULT_JSON}</code> is kept the first time you
+change anything in a session, and a copy of the generated script each time you
+generate. Both live in a <b>backups</b> folder beside the app, and the
+<b>Settings</b> page is where you change that location or restore from a
+copy.</p>
 
 <h3>Buttons along the bottom</h3>
 <ul>
@@ -708,6 +717,10 @@ class ExpansionApp(QMainWindow):
         self.theme = load_theme_pref() or detect_system_theme()
         # One backup per session, taken before the first write. See _backup_once.
         self._session_backed_up = False
+        self._active_backup_dir = self._resolve_backup_dir(
+            self.settings.backup_directory
+        )
+        self._backup_dir_warned = False
 
         self.selected_section = self.store.sections[0]
         self.current_expansion: Expansion | None = None
@@ -720,6 +733,8 @@ class ExpansionApp(QMainWindow):
         self.refresh_expansions()
         self.refresh_variables()
         self.refresh_templates()
+        # After the UI exists, so the count can be reported in the status bar.
+        self._migrate_legacy_backups()
 
         # Derive the window's minimum size from what the widest page actually
         # needs so panels can never be shrunk into overlapping each other.
@@ -761,6 +776,7 @@ class ExpansionApp(QMainWindow):
         self.stack.addWidget(self._build_expansions_page())
         self.stack.addWidget(self._build_variables_page())
         self.stack.addWidget(self._build_templates_page())
+        self.stack.addWidget(self._build_settings_page())
         self.stack.addWidget(self._build_help_page())
         body.addWidget(self.stack, 1)
 
@@ -778,7 +794,13 @@ class ExpansionApp(QMainWindow):
 
         self.nav = QListWidget()
         self.nav.setObjectName("Sidebar")
-        for label in ("⌨  Expansions", "ƒ  Variables", "▤  Templates", "?  Help"):
+        for label in (
+            "⌨  Expansions",
+            "ƒ  Variables",
+            "▤  Templates",
+            "⚙  Settings",
+            "?  Help",
+        ):
             QListWidgetItem(label, self.nav)
         self.nav.currentRowChanged.connect(self.stack_set_index)
         layout.addWidget(self.nav, 1)
@@ -813,6 +835,90 @@ class ExpansionApp(QMainWindow):
         layout.addWidget(splitter)
         return page
 
+    def _settings_group(self, layout: QVBoxLayout, title: str, blurb: str) -> None:
+        heading = QLabel(title)
+        heading.setObjectName("Heading")
+        layout.addSpacing(6)
+        layout.addWidget(heading)
+        note = QLabel(blurb)
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+    def _build_settings_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        heading = QLabel("Settings")
+        heading.setObjectName("Heading")
+        layout.addWidget(heading)
+
+        self._settings_group(
+            layout,
+            "Generated AutoHotkey script",
+            "The full path of the script this app writes and runs, including "
+            "the file name. Generate & Run AHK replaces this file.",
+        )
+        path_row = QHBoxLayout()
+        self.ahk_path_edit = QLineEdit(self.settings.generated_ahk_path)
+        self.ahk_path_edit.editingFinished.connect(self.save_settings)
+        path_row.addWidget(self.ahk_path_edit, 1)
+        ahk_browse = QPushButton("Browse...")
+        ahk_browse.clicked.connect(self.browse_ahk_path)
+        path_row.addWidget(ahk_browse)
+        layout.addLayout(path_row)
+
+        self._settings_group(
+            layout, "Appearance", "The same toggle as the one in the sidebar."
+        )
+        theme_row = QHBoxLayout()
+        self.settings_theme_button = QPushButton()
+        self.settings_theme_button.clicked.connect(self.toggle_theme)
+        theme_row.addWidget(self.settings_theme_button)
+        theme_row.addStretch(1)
+        layout.addLayout(theme_row)
+
+        self._settings_group(
+            layout,
+            "Backup folder",
+            f"Where copies of {JSON_PATH.name} and the generated script are "
+            f"kept. The {BACKUP_RETENTION_LIMIT} most recent of each are "
+            "retained. Leave blank to use the default folder beside the app. "
+            "Changing this offers to move the existing backups across.",
+        )
+        backup_row = QHBoxLayout()
+        self.backup_dir_edit = QLineEdit(self.settings.backup_directory)
+        self.backup_dir_edit.setPlaceholderText(str(DEFAULT_BACKUP_DIR))
+        self.backup_dir_edit.editingFinished.connect(self.apply_backup_dir_change)
+        backup_row.addWidget(self.backup_dir_edit, 1)
+        backup_browse = QPushButton("Browse...")
+        backup_browse.clicked.connect(self.browse_backup_dir)
+        backup_row.addWidget(backup_browse)
+        backup_default = QPushButton("Use default")
+        backup_default.clicked.connect(self.use_default_backup_dir)
+        backup_row.addWidget(backup_default)
+        layout.addLayout(backup_row)
+
+        self._settings_group(
+            layout,
+            "Restore from backup",
+            "Replaces the current file with the backup you pick. The file "
+            "being replaced is backed up first, so this can be undone.",
+        )
+        restore_row = QHBoxLayout()
+        json_button = QPushButton("Restore expansions backup...")
+        json_button.clicked.connect(self.restore_json_backup)
+        restore_row.addWidget(json_button)
+        ahk_button = QPushButton("Restore AHK script backup...")
+        ahk_button.clicked.connect(self.restore_ahk_backup)
+        restore_row.addWidget(ahk_button)
+        restore_row.addStretch(1)
+        layout.addLayout(restore_row)
+
+        layout.addStretch(1)
+        return page
+
     def _build_help_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -826,30 +932,6 @@ class ExpansionApp(QMainWindow):
         browser.setOpenExternalLinks(False)
         browser.setHtml(HELP_HTML)
         layout.addWidget(browser, 1)
-
-        restore_heading = QLabel("Restore from backup")
-        restore_heading.setObjectName("Heading")
-        layout.addWidget(restore_heading)
-
-        note = QLabel(
-            f"A copy of {JSON_PATH.name} is kept the first time you change "
-            f"anything in a session, and of {AHK_PATH.name} each time you "
-            f"generate. The {BACKUP_RETENTION_LIMIT} most recent of each are "
-            "kept. Restoring replaces the current file, backing it up first."
-        )
-        note.setObjectName("Muted")
-        note.setWordWrap(True)
-        layout.addWidget(note)
-
-        button_row = QHBoxLayout()
-        json_button = QPushButton("Restore expansions backup...")
-        json_button.clicked.connect(self.restore_json_backup)
-        button_row.addWidget(json_button)
-        ahk_button = QPushButton("Restore AHK script backup...")
-        ahk_button.clicked.connect(self.restore_ahk_backup)
-        button_row.addWidget(ahk_button)
-        button_row.addStretch(1)
-        layout.addLayout(button_row)
         return page
 
     def _build_sections_panel(self) -> QWidget:
@@ -1146,16 +1228,8 @@ class ExpansionApp(QMainWindow):
         outer.setContentsMargins(12, 8, 12, 10)
         outer.setSpacing(8)
 
-        path_row = QHBoxLayout()
-        path_row.addWidget(QLabel("Generated AHK path"))
-        self.ahk_path_edit = QLineEdit(self.settings.generated_ahk_path)
-        self.ahk_path_edit.editingFinished.connect(self.save_settings)
-        path_row.addWidget(self.ahk_path_edit, 1)
-        browse_button = QPushButton("Browse")
-        browse_button.clicked.connect(self.browse_ahk_path)
-        path_row.addWidget(browse_button)
-        outer.addLayout(path_row)
-
+        # The script path moved to Settings: it is configured once, and it was
+        # taking up a row under every page.
         action_row = QHBoxLayout()
         self.status_label = QLabel("Ready.")
         self.status_label.setObjectName("Muted")
@@ -1188,9 +1262,11 @@ class ExpansionApp(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.setStyleSheet(build_stylesheet(self.theme))
-        self.theme_button.setText(
-            "☀  Light mode" if self.theme == "dark" else "☾  Dark mode"
-        )
+        label = "☀  Light mode" if self.theme == "dark" else "☾  Dark mode"
+        self.theme_button.setText(label)
+        # The Settings page mirrors the sidebar toggle, so both must relabel.
+        if hasattr(self, "settings_theme_button"):
+            self.settings_theme_button.setText(label)
         self._apply_titlebar_theme()
 
     def _apply_titlebar_theme(self) -> None:
@@ -1778,15 +1854,25 @@ class ExpansionApp(QMainWindow):
         self.ahk_path_edit.setText(file_path)
         self.save_settings()
 
-    def save_settings(self) -> None:
+    def save_settings(self, announce: bool = True) -> None:
+        """Write settings out as they change.
+
+        Waiting for Generate & Run was survivable when the only setting was a
+        path that is easy to retype. It is not survivable for the backup
+        folder: a change that moved files but was never persisted would leave
+        the setting pointing at one folder and the backups sitting in another,
+        so the restore lists would come up empty.
+        """
         self.settings.generated_ahk_path = str(self.current_ahk_path())
         self.ahk_path_edit.setText(self.settings.generated_ahk_path)
+        self.settings.backup_directory = self.backup_dir_edit.text().strip()
         try:
             self.settings.save(SETTINGS_PATH)
         except OSError as exc:
             show_error(self, "Settings error", f"Could not save {SETTINGS_PATH.name}: {exc}")
             return
-        self.set_status(f"Saved {SETTINGS_PATH.name}.")
+        if announce:
+            self.set_status(f"Saved {SETTINGS_PATH.name}.")
 
     def _backup_once(self) -> None:
         """Copy the store file aside before this session's first write.
@@ -1806,13 +1892,115 @@ class ExpansionApp(QMainWindow):
         # subsequent save.
         self._session_backed_up = True
         try:
-            backup_file(JSON_PATH)
+            backup_file(JSON_PATH, self.current_backup_dir())
         except OSError as exc:
             show_warning(
                 self,
                 "Backup",
                 f"Could not back up {JSON_PATH.name}: {exc}\n\n"
                 "Your changes will still be saved.",
+            )
+
+    # -- backup location ---------------------------------------------------
+    @staticmethod
+    def _resolve_backup_dir(configured: str) -> Path:
+        cleaned = configured.strip()
+        return Path(cleaned).expanduser() if cleaned else DEFAULT_BACKUP_DIR
+
+    def _backup_targets(self) -> list[Path]:
+        """The files that have backups: the library and the generated script."""
+        return [JSON_PATH, self.current_ahk_path()]
+
+    def current_backup_dir(self) -> Path | None:
+        """The folder backups belong in, or None to fall back beside the file.
+
+        A default folder that cannot be created is an install detail the user
+        never asked about, so it falls back quietly. A folder they chose
+        themselves failing is worth saying out loud -- but only once, or every
+        save would nag.
+        """
+        target = self._active_backup_dir
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            if self.settings.backup_directory.strip() and not self._backup_dir_warned:
+                self._backup_dir_warned = True
+                show_warning(
+                    self,
+                    "Backup folder",
+                    f"Could not use {target}:\n{exc}\n\n"
+                    "Backups will be written next to the files instead.",
+                )
+            return None
+        return target
+
+    def _migrate_legacy_backups(self) -> None:
+        """Collect backups left beside the files by earlier versions."""
+        target = self.current_backup_dir()
+        if target is None:
+            return
+        moved = 0
+        for path in self._backup_targets():
+            try:
+                moved += migrate_backups(path, path.parent, target)
+            except OSError:
+                # Tidying is not worth failing startup over.
+                continue
+        if moved:
+            self.set_status(f"Moved {moved} existing backup(s) into {target}.")
+
+    def browse_backup_dir(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Choose backup folder", str(self._active_backup_dir)
+        )
+        if not chosen:
+            return
+        self.backup_dir_edit.setText(chosen)
+        self.apply_backup_dir_change()
+
+    def use_default_backup_dir(self) -> None:
+        self.backup_dir_edit.setText("")
+        self.apply_backup_dir_change()
+
+    def apply_backup_dir_change(self) -> None:
+        """Persist a new backup folder, offering to bring existing copies along."""
+        new_dir = self._resolve_backup_dir(self.backup_dir_edit.text())
+        if new_dir == self._active_backup_dir:
+            return
+
+        previous_dir = self._active_backup_dir
+        self._active_backup_dir = new_dir
+        self._backup_dir_warned = False
+        self.save_settings(announce=False)
+
+        movable = sum(
+            len(list_backups(path, previous_dir)) for path in self._backup_targets()
+        )
+        if not movable:
+            self.set_status(f"Backups will be written to {new_dir}.")
+            return
+
+        if confirm(
+            self,
+            "Move backups",
+            f"Move the {movable} existing backup(s) from\n{previous_dir}\n"
+            f"to\n{new_dir}?\n\n"
+            "Choosing No leaves them where they are, and they will no longer "
+            "appear in the restore lists.",
+        ):
+            try:
+                moved = sum(
+                    migrate_backups(path, previous_dir, new_dir)
+                    for path in self._backup_targets()
+                )
+            except OSError as exc:
+                show_error(self, "Move backups", f"Could not move backups: {exc}")
+                return
+            self.set_status(f"Moved {moved} backup(s) to {new_dir}.")
+        else:
+            self.set_status(
+                f"Backups will be written to {new_dir}. "
+                f"{movable} older backup(s) left in {previous_dir}."
             )
 
     # -- restore -----------------------------------------------------------
@@ -1822,7 +2010,8 @@ class ExpansionApp(QMainWindow):
         Returns the restored-from path so the caller can reload whatever the
         file feeds, or None if nothing was restored.
         """
-        backups = list_backups(target)
+        backup_dir = self.current_backup_dir()
+        backups = list_backups(target, backup_dir)
         if not backups:
             show_info(
                 self,
@@ -1855,7 +2044,7 @@ class ExpansionApp(QMainWindow):
             return None
 
         try:
-            safety_copy = restore_backup(selected, target)
+            safety_copy = restore_backup(selected, target, backup_dir)
         except (OSError, ValueError) as exc:
             show_error(self, f"Restore {label}", str(exc))
             return None
@@ -1918,7 +2107,9 @@ class ExpansionApp(QMainWindow):
         try:
             self.save_settings()
             self.store.save(JSON_PATH)
-            backup_path = generate_ahk(self.store, ahk_path, backup=True)
+            backup_path = generate_ahk(
+                self.store, ahk_path, backup=True, backup_dir=self.current_backup_dir()
+            )
         except (OSError, ValueError) as exc:
             show_error(self, "Generate & Run AHK", str(exc))
             return

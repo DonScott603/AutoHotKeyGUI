@@ -27,20 +27,39 @@ class AutoSaveTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._temp = TemporaryDirectory()
-        self.json_path = Path(self._temp.name) / "expansions.json"
+        root = Path(self._temp.name)
+        self.json_path = root / "expansions.json"
+        self.backup_dir = root / "backups"
         ExpansionStore(
             sections=["Work"],
             expansions=[Expansion("Work", ";seed", "seed text")],
             variables=[VariableDef("seed_var", "text_input", "Seed", "", [], "")],
             templates=[TemplateDef("Seed Template", "", "seed body", "")],
         ).save(self.json_path)
-        self._original_path = app_module.JSON_PATH
+        # Every path the window reads or writes has to be redirected, not just
+        # the store: it also loads settings, resolves a default backup folder,
+        # and migrates stray backups next to the configured script. Leave any
+        # of those pointing at the real install and the tests edit real data.
+        self._saved_paths = (
+            app_module.JSON_PATH,
+            app_module.SETTINGS_PATH,
+            app_module.AHK_PATH,
+            app_module.DEFAULT_BACKUP_DIR,
+        )
         app_module.JSON_PATH = self.json_path
+        app_module.SETTINGS_PATH = root / "settings.json"
+        app_module.AHK_PATH = root / "text_expansions.ahk"
+        app_module.DEFAULT_BACKUP_DIR = self.backup_dir
         self.app = ExpansionApp()
 
     def tearDown(self) -> None:
         self.app.close()
-        app_module.JSON_PATH = self._original_path
+        (
+            app_module.JSON_PATH,
+            app_module.SETTINGS_PATH,
+            app_module.AHK_PATH,
+            app_module.DEFAULT_BACKUP_DIR,
+        ) = self._saved_paths
         self._temp.cleanup()
 
     def saved(self) -> dict:
@@ -94,7 +113,9 @@ class AutoSaveTests(unittest.TestCase):
         self.assertEqual(self.saved()["expansions"][0]["enabled"], expansion.enabled)
 
     def backups(self) -> list[Path]:
-        return sorted(self.json_path.parent.glob("expansions.*.bak.json"))
+        if not self.backup_dir.is_dir():
+            return []
+        return sorted(self.backup_dir.glob("expansions.*.bak.json"))
 
     def test_browsing_without_editing_writes_no_backup(self) -> None:
         # Backing up on every launch would rotate useful copies out of the
@@ -132,7 +153,7 @@ class AutoSaveTests(unittest.TestCase):
 
     def test_a_failing_backup_does_not_block_the_save(self) -> None:
         # Losing the safety net is bad; losing the edit as well would be worse.
-        def explode(_path: Path) -> Path | None:
+        def explode(_path: Path, _backup_dir: Path | None = None) -> Path | None:
             raise OSError("backup target unavailable")
 
         original_backup = app_module.backup_file

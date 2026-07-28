@@ -3,11 +3,16 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from ahk_manager import Expansion, ExpansionStore, generate_ahk
+from ahk_manager import (
+    BACKUP_RETENTION_LIMIT,
+    Expansion,
+    ExpansionStore,
+    generate_ahk,
+)
 
 
 class BackupRetentionTests(unittest.TestCase):
-    def test_only_five_most_recent_generated_backups_are_kept(self) -> None:
+    def test_only_the_most_recent_generated_backups_are_kept(self) -> None:
         store = ExpansionStore(
             sections=["Common"],
             expansions=[Expansion("Common", "brb", "Be right back")],
@@ -25,7 +30,7 @@ class BackupRetentionTests(unittest.TestCase):
             for file_path in unrelated_files:
                 file_path.write_text("keep me\n", encoding="utf-8")
 
-            for index in range(8):
+            for index in range(BACKUP_RETENTION_LIMIT + 3):
                 store.expansions[0].replacement = f"Replacement {index}"
                 generate_ahk(store, ahk_path, backup=True)
 
@@ -35,7 +40,7 @@ class BackupRetentionTests(unittest.TestCase):
                 for path in Path(temp_dir).glob("text_expansions.*.bak.ahk")
                 if backup_re.match(path.name)
             ]
-            self.assertEqual(len(backups), 5)
+            self.assertEqual(len(backups), BACKUP_RETENTION_LIMIT)
             self.assertTrue(all(path.exists() for path in unrelated_files))
 
     def test_backup_names_are_unique_when_generated_quickly(self) -> None:
@@ -54,6 +59,7 @@ class BackupRetentionTests(unittest.TestCase):
 
             self.assertIsNotNone(first_backup)
             self.assertIsNotNone(second_backup)
+            assert first_backup is not None and second_backup is not None
             self.assertNotEqual(first_backup, second_backup)
             self.assertTrue(first_backup.exists())
             self.assertTrue(second_backup.exists())

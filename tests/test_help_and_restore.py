@@ -16,6 +16,7 @@ from ahk_manager import (
     backup_file,
     backup_timestamp,
     list_backups,
+    migrate_backups,
     restore_backup,
 )
 from app import ExpansionApp
@@ -90,6 +91,83 @@ class BackupRestoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             restore_backup(self.dir / "gone.20260101_000000.bak.json", self.target)
 
+    def test_backups_go_in_the_given_folder_not_beside_the_file(self) -> None:
+        # The whole point of the folder: the working directory stays clean.
+        backup_dir = self.dir / "backups"
+        self.target.write_text("original", encoding="utf-8")
+
+        created = backup_file(self.target, backup_dir)
+
+        assert created is not None
+        self.assertEqual(created.parent, backup_dir)
+        self.assertEqual(list(self.dir.glob("*.bak.json")), [])
+        self.assertEqual(list_backups(self.target, backup_dir), [created])
+
+    def test_the_folder_is_created_on_demand(self) -> None:
+        backup_dir = self.dir / "nested" / "backups"
+        self.target.write_text("original", encoding="utf-8")
+
+        backup_file(self.target, backup_dir)
+
+        self.assertTrue(backup_dir.is_dir())
+
+    def test_listing_a_folder_that_does_not_exist_is_empty_not_an_error(self) -> None:
+        self.target.write_text("original", encoding="utf-8")
+
+        self.assertEqual(list_backups(self.target, self.dir / "absent"), [])
+
+    def test_migration_moves_backups_and_leaves_nothing_behind(self) -> None:
+        backup_dir = self.dir / "backups"
+        self.target.write_text("original", encoding="utf-8")
+        backup_file(self.target)
+        self.target.write_text("second", encoding="utf-8")
+        backup_file(self.target)
+
+        moved = migrate_backups(self.target, self.dir, backup_dir)
+
+        self.assertEqual(moved, 2)
+        self.assertEqual(list(self.dir.glob("*.bak.json")), [])
+        self.assertEqual(len(list_backups(self.target, backup_dir)), 2)
+
+    def test_migration_leaves_unrelated_files_alone(self) -> None:
+        backup_dir = self.dir / "backups"
+        self.target.write_text("original", encoding="utf-8")
+        backup_file(self.target)
+        bystanders = [
+            self.dir / "expansions.json",
+            self.dir / "notes.txt",
+            self.dir / "expansions.old.bak.json",
+            self.dir / "other.20260101_000000.bak.json",
+        ]
+        for path in bystanders:
+            if not path.exists():
+                path.write_text("keep me", encoding="utf-8")
+
+        migrate_backups(self.target, self.dir, backup_dir)
+
+        self.assertTrue(all(path.exists() for path in bystanders))
+
+    def test_migrating_onto_itself_does_nothing(self) -> None:
+        self.target.write_text("original", encoding="utf-8")
+        backup_file(self.target)
+
+        self.assertEqual(migrate_backups(self.target, self.dir, self.dir), 0)
+        self.assertEqual(len(list_backups(self.target)), 1)
+
+    def test_migration_does_not_overwrite_a_name_already_there(self) -> None:
+        backup_dir = self.dir / "backups"
+        backup_dir.mkdir()
+        self.target.write_text("original", encoding="utf-8")
+        created = backup_file(self.target)
+        assert created is not None
+        (backup_dir / created.name).write_text("already here", encoding="utf-8")
+
+        migrate_backups(self.target, self.dir, backup_dir)
+
+        self.assertEqual(
+            (backup_dir / created.name).read_text(encoding="utf-8"), "already here"
+        )
+
     def test_only_the_newest_backups_are_kept(self) -> None:
         self.target.write_text("v0", encoding="utf-8")
         for index in range(BACKUP_RETENTION_LIMIT + 3):
@@ -102,34 +180,57 @@ class BackupRestoreTests(unittest.TestCase):
 class HelpPageTests(unittest.TestCase):
     def setUp(self) -> None:
         self._temp = TemporaryDirectory()
-        self.json_path = Path(self._temp.name) / "expansions.json"
+        root = Path(self._temp.name)
+        self.json_path = root / "expansions.json"
+        self.backup_dir = root / "backups"
         ExpansionStore(
             sections=["Work"], expansions=[Expansion("Work", ";seed", "seed")]
         ).save(self.json_path)
-        self._original_path = app_module.JSON_PATH
+        # See the note in test_autosave: settings, the default backup folder
+        # and the script path all have to be redirected too, or the window
+        # reads and rewrites the real install.
+        self._saved_paths = (
+            app_module.JSON_PATH,
+            app_module.SETTINGS_PATH,
+            app_module.AHK_PATH,
+            app_module.DEFAULT_BACKUP_DIR,
+        )
         app_module.JSON_PATH = self.json_path
+        app_module.SETTINGS_PATH = root / "settings.json"
+        app_module.AHK_PATH = root / "text_expansions.ahk"
+        app_module.DEFAULT_BACKUP_DIR = self.backup_dir
         self.app = ExpansionApp()
 
     def tearDown(self) -> None:
         self.app.close()
-        app_module.JSON_PATH = self._original_path
+        (
+            app_module.JSON_PATH,
+            app_module.SETTINGS_PATH,
+            app_module.AHK_PATH,
+            app_module.DEFAULT_BACKUP_DIR,
+        ) = self._saved_paths
         self._temp.cleanup()
 
-    def test_help_is_the_last_nav_entry(self) -> None:
-        labels = [self.app.nav.item(i).text() for i in range(self.app.nav.count())]
+    def nav_labels(self) -> list[str]:
+        return [self.app.nav.item(i).text() for i in range(self.app.nav.count())]
 
+    def test_settings_sits_above_help_at_the_end_of_the_nav(self) -> None:
+        labels = self.nav_labels()
+
+        self.assertIn("Settings", labels[-2])
         self.assertIn("Help", labels[-1])
         self.assertEqual(self.app.stack.count(), len(labels))
 
-    def test_selecting_help_shows_its_page(self) -> None:
-        help_index = self.app.nav.count() - 1
+    def test_selecting_a_nav_entry_shows_its_page(self) -> None:
+        for index in range(self.app.nav.count()):
+            self.app.nav.setCurrentRow(index)
 
-        self.app.nav.setCurrentRow(help_index)
+            self.assertEqual(self.app.stack.currentIndex(), index)
 
-        self.assertEqual(self.app.stack.currentIndex(), help_index)
-
-    def test_help_page_offers_both_restore_buttons(self) -> None:
-        labels = {button.text() for button in self.app.findChildren(QPushButton)}
+    def test_settings_page_offers_both_restore_buttons(self) -> None:
+        settings_page = self.app.stack.widget(self.app.nav.count() - 2)
+        assert settings_page is not None
+        labels = {button.text() for button in settings_page.findChildren(QPushButton)}
 
         self.assertTrue(
             any("Restore" in label and "expansions" in label for label in labels),
@@ -138,6 +239,27 @@ class HelpPageTests(unittest.TestCase):
         self.assertTrue(
             any("Restore" in label and "AHK" in label for label in labels),
             f"no AHK restore button in {sorted(labels)}",
+        )
+
+    def test_settings_page_owns_the_script_path_not_the_footer(self) -> None:
+        # The path used to sit under every page; it belongs with the settings.
+        settings_page = self.app.stack.widget(self.app.nav.count() - 2)
+        assert settings_page is not None
+        edits = settings_page.findChildren(type(self.app.ahk_path_edit))
+
+        self.assertIn(self.app.ahk_path_edit, edits)
+        self.assertIn(self.app.backup_dir_edit, edits)
+
+    def test_both_theme_toggles_relabel_together(self) -> None:
+        # The sidebar keeps its one-click toggle and Settings mirrors it, so
+        # a stale label on either would misreport the current theme.
+        before = self.app.theme
+
+        self.app.toggle_theme()
+
+        self.assertNotEqual(self.app.theme, before)
+        self.assertEqual(
+            self.app.theme_button.text(), self.app.settings_theme_button.text()
         )
 
     def test_help_text_covers_the_placeholders_it_documents(self) -> None:

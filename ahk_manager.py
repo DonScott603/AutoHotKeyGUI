@@ -11,12 +11,16 @@ from typing import Any
 DEFAULT_JSON = "expansions.json"
 DEFAULT_AHK = "text_expansions.ahk"
 DEFAULT_SETTINGS = "settings.json"
-BACKUP_RETENTION_LIMIT = 5
+BACKUP_RETENTION_LIMIT = 10
 
 
 @dataclass
 class AppSettings:
     generated_ahk_path: str
+    # Blank means the application's default backup folder. Storing the choice
+    # rather than the resolved path keeps a default-configured install working
+    # after it is moved.
+    backup_directory: str = ""
 
     @classmethod
     def load(cls, path: Path, default_ahk_path: Path) -> "AppSettings":
@@ -30,10 +34,14 @@ class AppSettings:
             raise ValueError(f"Could not load {path.name}: {exc}") from exc
 
         configured_path = str(data.get("generated_ahk_path") or "").strip()
-        return cls(configured_path or str(default_ahk_path))
+        backup_directory = str(data.get("backup_directory") or "").strip()
+        return cls(configured_path or str(default_ahk_path), backup_directory)
 
     def save(self, path: Path) -> None:
-        data = {"generated_ahk_path": self.generated_ahk_path}
+        data = {
+            "generated_ahk_path": self.generated_ahk_path,
+            "backup_directory": self.backup_directory,
+        }
         _atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
@@ -730,22 +738,50 @@ def _atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
-def backup_file(path: Path) -> Path | None:
+def backup_file(path: Path, backup_dir: Path | None = None) -> Path | None:
     """Copy a file aside, keeping the newest BACKUP_RETENTION_LIMIT copies.
 
-    Returns the backup's path, or None when there was nothing to copy.
+    Backups go in backup_dir when given, otherwise beside the file. Returns the
+    backup's path, or None when there was nothing to copy.
     """
     if not path.exists():
         return None
-    backup_path = _backup_path(path)
+    _backup_dir(path, backup_dir).mkdir(parents=True, exist_ok=True)
+    backup_path = _backup_path(path, backup_dir)
     shutil.copy2(path, backup_path)
-    _cleanup_old_backups(path)
+    _cleanup_old_backups(path, backup_dir=backup_dir)
     return backup_path
 
 
-def list_backups(path: Path) -> list[Path]:
+def migrate_backups(path: Path, source_dir: Path, target_dir: Path) -> int:
+    """Move backups of path from one folder to another, returning how many.
+
+    Only files matching the backup naming pattern are touched, and they are
+    moved rather than copied, so the folder being emptied is genuinely tidied
+    and nothing is duplicated. A name already taken in the target is left
+    alone rather than overwritten.
+    """
+    if source_dir.resolve() == target_dir.resolve():
+        return 0
+    existing = _app_backup_paths(path, source_dir)
+    if not existing:
+        return 0
+    target_dir.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for candidate in existing:
+        destination = target_dir / candidate.name
+        if destination.exists():
+            continue
+        shutil.move(str(candidate), str(destination))
+        moved += 1
+    if moved:
+        _cleanup_old_backups(path, backup_dir=target_dir)
+    return moved
+
+
+def list_backups(path: Path, backup_dir: Path | None = None) -> list[Path]:
     """Existing backups of a file, newest first."""
-    backups = _app_backup_paths(path)
+    backups = _app_backup_paths(path, backup_dir)
     backups.sort(key=_backup_sort_key, reverse=True)
     return backups
 
@@ -766,7 +802,9 @@ def backup_timestamp(path: Path) -> str:
     return label
 
 
-def restore_backup(backup_path: Path, target_path: Path) -> Path | None:
+def restore_backup(
+    backup_path: Path, target_path: Path, backup_dir: Path | None = None
+) -> Path | None:
     """Replace a file with one of its backups.
 
     The file being replaced is itself backed up first, so restoring the wrong
@@ -775,15 +813,20 @@ def restore_backup(backup_path: Path, target_path: Path) -> Path | None:
     """
     if not backup_path.exists():
         raise ValueError(f"{backup_path.name} no longer exists.")
-    safety_copy = backup_file(target_path)
+    safety_copy = backup_file(target_path, backup_dir)
     shutil.copy2(backup_path, target_path)
     return safety_copy
 
 
-def generate_ahk(store: ExpansionStore, path: Path, backup: bool = True) -> Path | None:
+def generate_ahk(
+    store: ExpansionStore,
+    path: Path,
+    backup: bool = True,
+    backup_dir: Path | None = None,
+) -> Path | None:
     validate_store_placeholders(store)
     path.parent.mkdir(parents=True, exist_ok=True)
-    backup_path = backup_file(path) if backup else None
+    backup_path = backup_file(path, backup_dir) if backup else None
     # Atomic too: a truncated .ahk would break every hotstring at once, and the
     # running script is reloaded from it immediately after this returns.
     _atomic_write_text(path, render_ahk(store))
@@ -1783,17 +1826,27 @@ def _paste_helper_lines() -> list[str]:
     ]
 
 
-def _backup_path(path: Path) -> Path:
+def _backup_dir(path: Path, backup_dir: Path | None) -> Path:
+    """Where backups of path live: a dedicated folder, or beside the file."""
+    return path.parent if backup_dir is None else backup_dir
+
+
+def _backup_path(path: Path, backup_dir: Path | None = None) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    suffixes = _existing_backup_suffixes(path, timestamp)
+    target_dir = _backup_dir(path, backup_dir)
+    suffixes = _existing_backup_suffixes(path, timestamp, backup_dir)
     if not suffixes:
-        return path.with_name(f"{path.stem}.{timestamp}.bak{path.suffix}")
+        return target_dir / f"{path.stem}.{timestamp}.bak{path.suffix}"
     next_suffix = max(suffixes) + 1
-    return path.with_name(f"{path.stem}.{timestamp}_{next_suffix}.bak{path.suffix}")
+    return target_dir / f"{path.stem}.{timestamp}_{next_suffix}.bak{path.suffix}"
 
 
-def _cleanup_old_backups(path: Path, keep: int = BACKUP_RETENTION_LIMIT) -> None:
-    backups = _app_backup_paths(path)
+def _cleanup_old_backups(
+    path: Path,
+    keep: int = BACKUP_RETENTION_LIMIT,
+    backup_dir: Path | None = None,
+) -> None:
+    backups = _app_backup_paths(path, backup_dir)
     if len(backups) <= keep:
         return
 
@@ -1802,7 +1855,10 @@ def _cleanup_old_backups(path: Path, keep: int = BACKUP_RETENTION_LIMIT) -> None
         backup_path.unlink()
 
 
-def _app_backup_paths(path: Path) -> list[Path]:
+def _app_backup_paths(path: Path, backup_dir: Path | None = None) -> list[Path]:
+    target_dir = _backup_dir(path, backup_dir)
+    if not target_dir.is_dir():
+        return []
     escaped_stem = re.escape(path.stem)
     escaped_suffix = re.escape(path.suffix)
     backup_re = re.compile(
@@ -1810,7 +1866,7 @@ def _app_backup_paths(path: Path) -> list[Path]:
     )
     return [
         candidate
-        for candidate in path.parent.iterdir()
+        for candidate in target_dir.iterdir()
         if candidate.is_file() and backup_re.match(candidate.name)
     ]
 
@@ -1823,14 +1879,19 @@ def _backup_sort_key(path: Path) -> tuple[str, int, str]:
     return (match.group(1), suffix, path.name)
 
 
-def _existing_backup_suffixes(path: Path, timestamp: str) -> list[int]:
+def _existing_backup_suffixes(
+    path: Path, timestamp: str, backup_dir: Path | None = None
+) -> list[int]:
+    target_dir = _backup_dir(path, backup_dir)
+    if not target_dir.is_dir():
+        return []
     escaped_stem = re.escape(path.stem)
     escaped_suffix = re.escape(path.suffix)
     backup_re = re.compile(
         rf"^{escaped_stem}\.{re.escape(timestamp)}(?:_(\d+))?\.bak{escaped_suffix}$"
     )
     suffixes: list[int] = []
-    for candidate in path.parent.iterdir():
+    for candidate in target_dir.iterdir():
         if not candidate.is_file():
             continue
         match = backup_re.match(candidate.name)

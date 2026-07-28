@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *.bak.ahk
 *.bak.json
+backups/
 settings.json
 ui_prefs.json
 expansions.json
