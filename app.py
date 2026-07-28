@@ -412,7 +412,7 @@ class ImportConflictDialog(QDialog):
     def __init__(self, parent, conflict_count: int) -> None:
         super().__init__(parent)
         self.setWindowTitle("Import conflicts")
-        self.result: str | None = None
+        self.choice: str | None = None
 
         layout = QVBoxLayout(self)
         label = QLabel(
@@ -438,11 +438,11 @@ class ImportConflictDialog(QDialog):
 
     def accept(self) -> None:
         if self._overwrite.isChecked():
-            self.result = "overwrite"
+            self.choice = "overwrite"
         elif self._rename.isChecked():
-            self.result = "rename"
+            self.choice = "rename"
         else:
-            self.result = "skip"
+            self.choice = "skip"
         super().accept()
 
 
@@ -459,7 +459,7 @@ class DateTimeDialog(QDialog):
     def __init__(self, parent) -> None:
         super().__init__(parent)
         self.setWindowTitle("Insert Date/Time")
-        self.result: str | None = None
+        self.choice: str | None = None
 
         layout = QGridLayout(self)
         layout.addWidget(QLabel("Format"), 0, 0)
@@ -492,7 +492,7 @@ class DateTimeDialog(QDialog):
         if any(char in date_format for char in '{}"'):
             show_error(self, "Date/Time format", "Format cannot contain braces or double quotes.")
             return
-        self.result = f'{{AHK_EXPR:FormatTime(A_Now, "{date_format}")}}'
+        self.choice = f'{{AHK_EXPR:FormatTime(A_Now, "{date_format}")}}'
         super().accept()
 
 
@@ -500,7 +500,7 @@ class InputPlaceholderDialog(QDialog):
     def __init__(self, parent) -> None:
         super().__init__(parent)
         self.setWindowTitle("Insert Input Box")
-        self.result: str | None = None
+        self.choice: str | None = None
 
         layout = QGridLayout(self)
         self._variable = QLineEdit("name")
@@ -549,7 +549,7 @@ class InputPlaceholderDialog(QDialog):
         except ValueError as exc:
             show_error(self, "Input Box placeholder", str(exc))
             return
-        self.result = self._placeholder()
+        self.choice = self._placeholder()
         super().accept()
 
 
@@ -557,7 +557,7 @@ class SelectPlaceholderDialog(QDialog):
     def __init__(self, parent) -> None:
         super().__init__(parent)
         self.setWindowTitle("Insert List Selection")
-        self.result: str | None = None
+        self.choice: str | None = None
 
         layout = QGridLayout(self)
         self._variable = QLineEdit("choice")
@@ -621,7 +621,7 @@ class SelectPlaceholderDialog(QDialog):
         except ValueError as exc:
             show_error(self, "List Selection placeholder", str(exc))
             return
-        self.result = self._placeholder()
+        self.choice = self._placeholder()
         super().accept()
 
 
@@ -629,7 +629,7 @@ class LibrarySelectionDialog(QDialog):
     def __init__(self, parent, title: str, items: list[str]) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.result: str | None = None
+        self.choice: str | None = None
 
         layout = QVBoxLayout(self)
         self._list = QListWidget()
@@ -652,7 +652,7 @@ class LibrarySelectionDialog(QDialog):
         if item is None:
             show_error(self, "Selection", "Select an item first.")
             return
-        self.result = item.text()
+        self.choice = item.text()
         super().accept()
 
 
@@ -1259,8 +1259,11 @@ class ExpansionApp(QMainWindow):
 
     # -- theming -----------------------------------------------------------
     def apply_theme(self) -> None:
+        # instance() is inherited from QCoreApplication and typed as returning
+        # it, but the stylesheet lives on QApplication. isinstance both narrows
+        # the type and covers the None case.
         app = QApplication.instance()
-        if app is not None:
+        if isinstance(app, QApplication):
             app.setStyleSheet(build_stylesheet(self.theme))
         label = "☀  Light mode" if self.theme == "dark" else "☾  Dark mode"
         self.theme_button.setText(label)
@@ -1699,18 +1702,18 @@ class ExpansionApp(QMainWindow):
     # -- insertion actions -------------------------------------------------
     def insert_date_time(self, target: QPlainTextEdit | None = None) -> None:
         dialog = DateTimeDialog(self)
-        if dialog.exec() and dialog.result:
-            self.insert_snippet(dialog.result, target)
+        if dialog.exec() and dialog.choice:
+            self.insert_snippet(dialog.choice, target)
 
     def insert_input_box(self, target: QPlainTextEdit | None = None) -> None:
         dialog = InputPlaceholderDialog(self)
-        if dialog.exec() and dialog.result:
-            self.insert_snippet(dialog.result, target)
+        if dialog.exec() and dialog.choice:
+            self.insert_snippet(dialog.choice, target)
 
     def insert_list_selection(self, target: QPlainTextEdit | None = None) -> None:
         dialog = SelectPlaceholderDialog(self)
-        if dialog.exec() and dialog.result:
-            self.insert_snippet(dialog.result, target)
+        if dialog.exec() and dialog.choice:
+            self.insert_snippet(dialog.choice, target)
 
     def insert_tab(self, target: QPlainTextEdit | None = None) -> None:
         self.insert_snippet("{AHK_KEY:Tab}", target)
@@ -1729,8 +1732,8 @@ class ExpansionApp(QMainWindow):
             show_info(self, "Insert Variable", "Create a variable first.")
             return
         dialog = LibrarySelectionDialog(self, "Insert Variable", names)
-        if dialog.exec() and dialog.result:
-            self.insert_snippet(f"{{VAR:{dialog.result}}}", target)
+        if dialog.exec() and dialog.choice:
+            self.insert_snippet(f"{{VAR:{dialog.choice}}}", target)
 
     def insert_template(self, target: QPlainTextEdit | None = None) -> None:
         names = [template.name for template in self.store.templates]
@@ -1738,8 +1741,8 @@ class ExpansionApp(QMainWindow):
             show_info(self, "Insert Template", "Create a template first.")
             return
         dialog = LibrarySelectionDialog(self, "Insert Template", names)
-        if dialog.exec() and dialog.result:
-            self.insert_snippet(f"{{TPL:{dialog.result}}}", target)
+        if dialog.exec() and dialog.choice:
+            self.insert_snippet(f"{{TPL:{dialog.choice}}}", target)
 
     def insert_replacement_snippet(self, snippet: str) -> None:
         self.insert_snippet(snippet, self.replacement_text)
@@ -2198,7 +2201,7 @@ class ExpansionApp(QMainWindow):
 
         for process in processes:
             pid = process.get("ProcessId")
-            command_line = process.get("CommandLine") or ""
+            command_line = str(process.get("CommandLine") or "")
             name = str(process.get("Name") or "").lower()
             if name not in AHK_PROCESS_NAMES or not isinstance(pid, int) or pid == current_pid:
                 continue
@@ -2271,7 +2274,7 @@ class ExpansionApp(QMainWindow):
             dialog = ImportConflictDialog(self, conflict_count)
             if not dialog.exec():
                 return
-            conflict_action = dialog.result
+            conflict_action = dialog.choice
             if conflict_action is None:
                 return
 
@@ -2325,7 +2328,8 @@ class ExpansionApp(QMainWindow):
 
 
 def main() -> None:
-    app = QApplication.instance() or QApplication(sys.argv)
+    existing = QApplication.instance()
+    app = existing if isinstance(existing, QApplication) else QApplication(sys.argv)
     if ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_PATH)))
     window = ExpansionApp()
