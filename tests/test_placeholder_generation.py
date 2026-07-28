@@ -1,9 +1,14 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from ahk_manager import (
+    AHK_ICON_NAME,
+    AHK_THEME_COLORS,
     Expansion,
     ExpansionStore,
     TemplatePlaceholder,
+    generate_ahk,
     parse_replacement_template,
     render_ahk,
 )
@@ -88,7 +93,11 @@ class PlaceholderGenerationTests(unittest.TestCase):
             '"title", "Client Name", "kind", "input", "default", "")',
             output,
         )
-        self.assertIn('__tem_vals := TEM_Form("dear", __tem_fields, __tem_parts)', output)
+        self.assertIn(
+            '__tem_vals := TEM_Form("Text Expansion Manager - dear", '
+            "__tem_fields, __tem_parts)",
+            output,
+        )
         self.assertIn('client_name := __tem_vals["client_name"]', output)
         self.assertIn("__tem_result .= client_name", output)
         self.assertNotIn("InputBox(", output)
@@ -192,9 +201,10 @@ class PlaceholderGenerationTests(unittest.TestCase):
 
         output = render_ahk(store)
 
-        self.assertIn("TEM_Select(prompt, title, options)", output)
+        self.assertIn('TEM_Select(prompt, title, options, winTitle := "")', output)
         self.assertIn(
-            '__tem_select_status := TEM_Select("Choose status", "Status", ["Pending", "Approved", "Rejected"])',
+            '__tem_select_status := TEM_Select("Choose status", "Status", '
+            '["Pending", "Approved", "Rejected"], "Text Expansion Manager - status")',
             output,
         )
         self.assertIn("status := __tem_select_status.value", output)
@@ -429,6 +439,80 @@ class PlaceholderGenerationTests(unittest.TestCase):
 
         self.assertIn("SendText(__tem_result)", output)
         self.assertNotIn("TEM_Paste", output)
+
+
+class PromptChromeTests(unittest.TestCase):
+    """Branding and theming of the generated prompt windows."""
+
+    def _prompt_store(self) -> ExpansionStore:
+        return ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion("Work", "dear", "Dear {AHK_INPUT:name|Enter name|Name|},")
+            ],
+        )
+
+    def test_prompt_window_is_titled_with_the_app_and_trigger(self) -> None:
+        output = render_ahk(self._prompt_store())
+
+        self.assertIn('TEM_Form("Text Expansion Manager - dear"', output)
+
+    def test_script_points_the_tray_icon_at_the_copied_app_icon(self) -> None:
+        output = render_ahk(self._prompt_store())
+
+        self.assertIn(f'if FileExist(A_ScriptDir "\\{AHK_ICON_NAME}")', output)
+        self.assertIn(f'TraySetIcon(A_ScriptDir "\\{AHK_ICON_NAME}")', output)
+
+    def test_light_theme_uses_the_light_palette(self) -> None:
+        output = render_ahk(self._prompt_store(), "light")
+        light = AHK_THEME_COLORS["light"]
+
+        self.assertIn(f'formGui.BackColor := "{light["bg"]}"', output)
+        self.assertIn(f'formGui.SetFont("s9 c{light["text"]}", "Segoe UI")', output)
+        self.assertIn("TEM_DarkTitleBar(hwnd, 0)", output)
+
+    def test_dark_theme_uses_the_dark_palette_and_dark_title_bar(self) -> None:
+        output = render_ahk(self._prompt_store(), "dark")
+        dark = AHK_THEME_COLORS["dark"]
+
+        self.assertIn(f'formGui.BackColor := "{dark["bg"]}"', output)
+        self.assertIn(f'formGui.SetFont("s9 c{dark["text"]}", "Segoe UI")', output)
+        self.assertIn(f"Background{dark['field']}", output)
+        self.assertIn("TEM_DarkTitleBar(hwnd, 1)", output)
+
+    def test_unknown_theme_falls_back_to_light(self) -> None:
+        self.assertEqual(
+            render_ahk(self._prompt_store(), "solarized"),
+            render_ahk(self._prompt_store(), "light"),
+        )
+
+    def test_generate_copies_the_icon_next_to_the_script(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "app.ico"
+            source.write_bytes(b"icon-bytes")
+            ahk_path = Path(temp_dir) / "out" / "gen.ahk"
+
+            generate_ahk(
+                self._prompt_store(), ahk_path, backup=False, icon_source=source
+            )
+
+            copied = ahk_path.parent / AHK_ICON_NAME
+            self.assertTrue(copied.is_file())
+            self.assertEqual(copied.read_bytes(), b"icon-bytes")
+
+    def test_generate_survives_a_missing_icon_source(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "gen.ahk"
+
+            generate_ahk(
+                self._prompt_store(),
+                ahk_path,
+                backup=False,
+                icon_source=Path(temp_dir) / "absent.ico",
+            )
+
+            self.assertTrue(ahk_path.is_file())
+            self.assertFalse((ahk_path.parent / AHK_ICON_NAME).exists())
 
 
 if __name__ == "__main__":

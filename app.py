@@ -2111,7 +2111,12 @@ class ExpansionApp(QMainWindow):
             self.save_settings()
             self.store.save(JSON_PATH)
             backup_path = generate_ahk(
-                self.store, ahk_path, backup=True, backup_dir=self.current_backup_dir()
+                self.store,
+                ahk_path,
+                backup=True,
+                backup_dir=self.current_backup_dir(),
+                theme=self.theme,
+                icon_source=ICON_PATH,
             )
         except (OSError, ValueError) as exc:
             show_error(self, "Generate & Run AHK", str(exc))
