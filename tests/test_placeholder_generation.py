@@ -567,6 +567,56 @@ class PromptChromeTests(unittest.TestCase):
         self.assertIn(f"Background{dark['field']}", output)
         self.assertIn("TEM_DarkTitleBar(hwnd, 1)", output)
 
+    def _select_store(self) -> ExpansionStore:
+        return ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion("Work", "pick", "{AHK_SELECT:kind|Kind|Kind|Invoice||Receipt}")
+            ],
+        )
+
+    def test_dark_theme_restyles_the_system_drawn_controls(self) -> None:
+        # Buttons, dropdowns and scrollbars are drawn by Windows and ignore the
+        # Gui's colours, so they need the dark visual styles applied by hand.
+        output = render_ahk(self._prompt_store(), "dark")
+
+        self.assertIn('DllCall("uxtheme\\SetWindowTheme"', output)
+        self.assertIn('TEM_ThemeControl(okButton.Hwnd, "DarkMode_Explorer")', output)
+        self.assertIn('TEM_ThemeControl(cancelButton.Hwnd, "DarkMode_Explorer")', output)
+        self.assertIn('TEM_ThemeControl(preview.Hwnd, "DarkMode_Explorer")', output)
+
+    def test_light_theme_leaves_the_default_visual_styles(self) -> None:
+        # Applying a DarkMode style in the light theme would invert the
+        # controls. The call sites still name one -- they are identical in both
+        # themes -- but the helper they call is inert here.
+        output = render_ahk(self._prompt_store(), "light")
+
+        self.assertIn("TEM_ThemeControl(", output)
+        self.assertNotIn("SetWindowTheme", output)
+
+    def test_a_dropdown_uses_the_combo_box_dark_style(self) -> None:
+        # A combo box needs DarkMode_CFD; DarkMode_Explorer leaves it light.
+        output = render_ahk(self._select_store(), "dark")
+
+        self.assertIn('TEM_ThemeControl(dropdown.Hwnd, "DarkMode_CFD")', output)
+
+    def test_form_dropdown_fields_use_the_combo_box_dark_style(self) -> None:
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion(
+                    "Work",
+                    "both",
+                    "{AHK_INPUT:name|Name|Name|} {AHK_SELECT:kind|Kind|Kind|A||B}",
+                )
+            ],
+        )
+
+        output = render_ahk(store, "dark")
+
+        self.assertIn('TEM_ThemeControl(ctrl.Hwnd, "DarkMode_CFD")', output)
+        self.assertIn('TEM_ThemeControl(ctrl.Hwnd, "DarkMode_Explorer")', output)
+
     def test_unknown_theme_falls_back_to_light(self) -> None:
         self.assertEqual(
             render_ahk(self._prompt_store(), "solarized"),

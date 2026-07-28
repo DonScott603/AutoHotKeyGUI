@@ -1706,9 +1706,12 @@ def _select_helper_lines(colors: dict[str, str]) -> list[str]:
         f"    selectGui.SetFont(\"s9 c{colors['text']}\", \"Segoe UI\")",
         "    selectGui.AddText(\"w280\", prompt)",
         "    dropdown := selectGui.AddDropDownList(\"w280 Choose1\", options)",
+        "    TEM_ThemeControl(dropdown.Hwnd, \"DarkMode_CFD\")",
         "    result := {ok: false, value: \"\"}",
         "    okButton := selectGui.AddButton(\"Default w80\", \"OK\")",
         "    cancelButton := selectGui.AddButton(\"x+8 w80\", \"Cancel\")",
+        "    TEM_ThemeControl(okButton.Hwnd, \"DarkMode_Explorer\")",
+        "    TEM_ThemeControl(cancelButton.Hwnd, \"DarkMode_Explorer\")",
         "    okButton.OnEvent(\"Click\", (*) => (result.ok := true, result.value := dropdown.Text, selectGui.Destroy()))",
         "    cancelButton.OnEvent(\"Click\", (*) => selectGui.Destroy())",
         "    selectGui.OnEvent(\"Close\", (*) => selectGui.Destroy())",
@@ -1728,10 +1731,23 @@ def _chrome_helper_lines(theme: str) -> list[str]:
     AutoHotkey one. Neither should cost the user their expansion.
     """
     dark_flag = "1" if theme == "dark" else "0"
+    # Buttons, dropdowns and scrollbars are drawn by Windows, which ignores the
+    # Gui's colours entirely, so the dark variants of their visual styles are
+    # the only way to bring them along. Light needs nothing: the defaults
+    # already match, and applying a DarkMode style there would invert them.
+    theme_control_body = (
+        ["    try DllCall(\"uxtheme\\SetWindowTheme\", \"ptr\", hwnd, \"str\", sub, \"ptr\", 0)"]
+        if theme == "dark"
+        else ["    ; Light theme keeps the default visual styles, which match."]
+    )
     return [
         "TEM_ApplyChrome(hwnd) {",
         f"    TEM_DarkTitleBar(hwnd, {dark_flag})",
         "    TEM_SetWindowIcon(hwnd)",
+        "}",
+        "",
+        "TEM_ThemeControl(hwnd, sub) {",
+        *theme_control_body,
         "}",
         "",
         "TEM_DarkTitleBar(hwnd, enable) {",
@@ -1829,6 +1845,7 @@ def _form_helper_lines(colors: dict[str, str]) -> list[str]:
         f"    formGui.SetFont(\"s9 c{colors['text']}\", \"Segoe UI\")",
         "    formGui.AddText(\"xm w460\", \"Preview\")",
         f"    preview := formGui.AddEdit(\"xm w460 r4 Multi ReadOnly Background{colors['field']}\")",
+        "    TEM_ThemeControl(preview.Hwnd, \"DarkMode_Explorer\")",
         "    controls := Map()",
         "    state := Map(\"ok\", false, \"values\", \"\")",
         "    updatePreview() {",
@@ -1843,15 +1860,20 @@ def _form_helper_lines(colors: dict[str, str]) -> list[str]:
         "    }",
         "    for field in fields {",
         "        formGui.AddText(\"xm w140 Right\", field[\"label\"])",
-        "        if (field[\"kind\"] = \"select\")",
+        "        if (field[\"kind\"] = \"select\") {",
         "            ctrl := formGui.AddDropDownList(\"x+8 yp-4 w312 Choose1\", field[\"options\"])",
-        "        else",
+        "            TEM_ThemeControl(ctrl.Hwnd, \"DarkMode_CFD\")",
+        "        } else {",
         f"            ctrl := formGui.AddEdit(\"x+8 yp-4 w312 Background{colors['field']}\", field[\"default\"])",
+        "            TEM_ThemeControl(ctrl.Hwnd, \"DarkMode_Explorer\")",
+        "        }",
         "        ctrl.OnEvent(\"Change\", (*) => updatePreview())",
         "        controls[field[\"name\"]] := ctrl",
         "    }",
         "    okButton := formGui.AddButton(\"xm+272 y+16 w90 Default\", \"Insert\")",
         "    cancelButton := formGui.AddButton(\"x+8 w90\", \"Cancel\")",
+        "    TEM_ThemeControl(okButton.Hwnd, \"DarkMode_Explorer\")",
+        "    TEM_ThemeControl(cancelButton.Hwnd, \"DarkMode_Explorer\")",
         "    okButton.OnEvent(\"Click\", (*) => (state[\"ok\"] := true, state[\"values\"] := TEM_FormValues(fields, controls), formGui.Destroy()))",
         "    cancelButton.OnEvent(\"Click\", (*) => formGui.Destroy())",
         "    formGui.OnEvent(\"Close\", (*) => formGui.Destroy())",
