@@ -582,7 +582,8 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
                 i += 1
             i += 1
             continue
-        # End-char handling (always a fixed 5-line trailer).
+        # End-char handling: a fixed 5-line trailer, absent when the expansion
+        # ends on a key press.
         if line.startswith("if (A_EndChar"):
             i += 5
             continue
@@ -1189,7 +1190,8 @@ def render_expansion(
             needs_image_helper = True
 
     flush_result()
-    lines.extend(_end_char_lines())
+    if not _ends_with_key(segments):
+        lines.extend(_end_char_lines())
     lines.append("}")
     if expansion.notes:
         lines.append(f"; Notes: {expansion.notes}")
@@ -1899,10 +1901,29 @@ def _image_helper_lines() -> list[str]:
     ]
 
 
+def _ends_with_key(segments: list[Any]) -> bool:
+    """Whether the expansion finishes on a key press.
+
+    Trailing empty literals are ignored: they contribute nothing to the output,
+    so a key before one still ends the expansion.
+    """
+    for segment in reversed(segments):
+        if isinstance(segment, str):
+            if segment:
+                return False
+            continue
+        return segment.kind == "AHK_KEY"
+    return False
+
+
 def _end_char_lines() -> list[str]:
     # Dynamic hotstrings run code instead of auto-replacing, so AutoHotkey does
     # not reproduce the ending character (space/Enter/Tab) that triggered them.
     # Re-send A_EndChar so it is preserved, matching plain-text hotstrings.
+    #
+    # Omitted for an expansion that ends on a key press: the caret has moved on
+    # by then -- a trailing Tab lands it in the next field -- so replaying the
+    # character would type it somewhere the user did not expand into.
     return [
         '    if (A_EndChar = "`r" || A_EndChar = "`n") {',
         '        Send("{Enter}")',

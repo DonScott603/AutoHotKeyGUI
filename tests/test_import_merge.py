@@ -239,6 +239,26 @@ class ImportMergeTests(unittest.TestCase):
             "{AHK_SELECT:state|Pick ; one|State|Open ; now||Closed}",
         )
 
+    def test_key_ending_expansion_round_trips_without_the_end_char_trailer(self) -> None:
+        # Reconstruction skips the ending-character trailer when it finds one;
+        # an expansion ending in a key no longer emits it at all.
+        store = ExpansionStore(
+            sections=["Keys"],
+            expansions=[Expansion("Keys", ";next", "Value{AHK_KEY:Tab}")],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "gen.ahk"
+            generate_ahk(store, ahk_path, backup=False)
+            text = ahk_path.read_text(encoding="utf-8")
+            without_markers = "\n".join(
+                line for line in text.splitlines() if not line.strip().startswith("; @tem:")
+            )
+            ahk_path.write_text(without_markers, encoding="utf-8")
+            imported = import_ahk(ahk_path)
+
+        self.assertEqual(imported.expansions[0].replacement, "Value{AHK_KEY:Tab}")
+
     def test_legacy_three_argument_select_still_imports(self) -> None:
         # Scripts generated before the window title was added have no fourth
         # argument, and must keep importing with their options intact.

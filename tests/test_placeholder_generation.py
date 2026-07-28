@@ -270,6 +270,39 @@ class PlaceholderGenerationTests(unittest.TestCase):
         self.assertIn('Send("{Enter}")', output)
         self.assertIn("SendText(A_EndChar)", output)
 
+    def test_expansion_ending_in_a_key_drops_the_ending_character(self) -> None:
+        # The Tab has moved the caret to the next field by the time the ending
+        # character would be replayed, so it would be typed there instead.
+        store = ExpansionStore(
+            sections=["Keys"],
+            expansions=[Expansion("Keys", "next", "Value{AHK_KEY:Tab}")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn('SendEvent("{Tab}")', output)
+        self.assertNotIn("A_EndChar", output)
+
+    def test_a_key_before_more_text_keeps_the_ending_character(self) -> None:
+        store = ExpansionStore(
+            sections=["Keys"],
+            expansions=[Expansion("Keys", "tabbed", "Left{AHK_KEY:Tab}Right")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn("SendText(A_EndChar)", output)
+
+    def test_a_trailing_empty_literal_still_counts_as_ending_in_a_key(self) -> None:
+        store = ExpansionStore(
+            sections=["Keys"],
+            expansions=[Expansion("Keys", "next", "{AHK_KEY:Tab}")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertNotIn("A_EndChar", output)
+
     def test_static_hotstring_omits_ending_character_logic(self) -> None:
         store = ExpansionStore(
             sections=["Common"],
