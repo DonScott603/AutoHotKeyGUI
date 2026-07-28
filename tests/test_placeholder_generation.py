@@ -600,7 +600,9 @@ class PromptChromeTests(unittest.TestCase):
 
         self.assertIn('TEM_ThemeControl(dropdown.Hwnd, "DarkMode_CFD")', output)
 
-    def test_form_dropdown_fields_use_the_combo_box_dark_style(self) -> None:
+    def test_form_fields_use_the_combo_box_dark_style(self) -> None:
+        # Both field kinds take DarkMode_CFD: the dropdown for its face, the
+        # edit because DarkMode_Explorer leaves an edit's frame light.
         store = ExpansionStore(
             sections=["Work"],
             expansions=[
@@ -614,8 +616,20 @@ class PromptChromeTests(unittest.TestCase):
 
         output = render_ahk(store, "dark")
 
-        self.assertIn('TEM_ThemeControl(ctrl.Hwnd, "DarkMode_CFD")', output)
-        self.assertIn('TEM_ThemeControl(ctrl.Hwnd, "DarkMode_Explorer")', output)
+        self.assertEqual(output.count('TEM_ThemeControl(ctrl.Hwnd, "DarkMode_CFD")'), 2)
+
+    def test_dark_theme_drops_the_light_frame_around_fields(self) -> None:
+        # WS_EX_CLIENTEDGE is drawn light whatever style the control carries,
+        # so a dark field was ringed in white until it was removed.
+        output = render_ahk(self._prompt_store(), "dark")
+
+        self.assertIn("Multi ReadOnly -E0x200 Background", output)
+        self.assertIn('AddEdit("x+8 yp-4 w312 -E0x200 Background', output)
+
+    def test_light_theme_keeps_the_frame_around_fields(self) -> None:
+        output = render_ahk(self._prompt_store(), "light")
+
+        self.assertNotIn("-E0x200", output)
 
     def test_unknown_theme_falls_back_to_light(self) -> None:
         self.assertEqual(

@@ -937,6 +937,12 @@ def render_ahk(store: ExpansionStore, theme: str = DEFAULT_THEME) -> str:
         )
 
     colors = ahk_theme_colors(theme)
+    # WS_EX_CLIENTEDGE, the sunken frame around an Edit, is drawn in light
+    # colours whatever visual style the control carries -- neither
+    # DarkMode_Explorer nor DarkMode_CFD reaches it -- so a dark field was
+    # ringed in white. Dropping it leaves a flat field that reads against the
+    # window by its fill. Light keeps the frame: it looks right there.
+    edit_border = "-E0x200 " if theme == "dark" else ""
     # Both prompts position themselves and take their chrome from the same
     # helpers, so the two dialogs cannot drift apart visually.
     if needs_form_helper or needs_select_helper:
@@ -945,7 +951,7 @@ def render_ahk(store: ExpansionStore, theme: str = DEFAULT_THEME) -> str:
         lines.extend(_chrome_helper_lines(theme))
         lines.append("")
     if needs_form_helper:
-        lines.extend(_form_helper_lines(colors))
+        lines.extend(_form_helper_lines(colors, edit_border))
         lines.append("")
     if needs_select_helper:
         lines.extend(_select_helper_lines(colors))
@@ -1829,7 +1835,7 @@ def _position_helper_lines() -> list[str]:
     ]
 
 
-def _form_helper_lines(colors: dict[str, str]) -> list[str]:
+def _form_helper_lines(colors: dict[str, str], edit_border: str = "") -> list[str]:
     """One dialog gathering every prompt, above a preview of the resolved text.
 
     updatePreview reads the live controls on each keystroke rather than closing
@@ -1844,7 +1850,10 @@ def _form_helper_lines(colors: dict[str, str]) -> list[str]:
         "    TEM_ApplyChrome(formGui.Hwnd)",
         f"    formGui.SetFont(\"s9 c{colors['text']}\", \"Segoe UI\")",
         "    formGui.AddText(\"xm w460\", \"Preview\")",
-        f"    preview := formGui.AddEdit(\"xm w460 r4 Multi ReadOnly Background{colors['field']}\")",
+        f"    preview := formGui.AddEdit(\"xm w460 r4 Multi ReadOnly {edit_border}Background{colors['field']}\")",
+        # DarkMode_Explorer rather than DarkMode_CFD: with the frame gone the
+        # only thing left for the style to reach is the scrollbar, which CFD
+        # leaves light.
         "    TEM_ThemeControl(preview.Hwnd, \"DarkMode_Explorer\")",
         "    controls := Map()",
         "    state := Map(\"ok\", false, \"values\", \"\")",
@@ -1864,8 +1873,8 @@ def _form_helper_lines(colors: dict[str, str]) -> list[str]:
         "            ctrl := formGui.AddDropDownList(\"x+8 yp-4 w312 Choose1\", field[\"options\"])",
         "            TEM_ThemeControl(ctrl.Hwnd, \"DarkMode_CFD\")",
         "        } else {",
-        f"            ctrl := formGui.AddEdit(\"x+8 yp-4 w312 Background{colors['field']}\", field[\"default\"])",
-        "            TEM_ThemeControl(ctrl.Hwnd, \"DarkMode_Explorer\")",
+        f"            ctrl := formGui.AddEdit(\"x+8 yp-4 w312 {edit_border}Background{colors['field']}\", field[\"default\"])",
+        "            TEM_ThemeControl(ctrl.Hwnd, \"DarkMode_CFD\")",
         "        }",
         "        ctrl.OnEvent(\"Change\", (*) => updatePreview())",
         "        controls[field[\"name\"]] := ctrl",
