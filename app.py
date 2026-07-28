@@ -4,10 +4,19 @@ import re
 import shutil
 import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QGuiApplication, QIcon
+from PySide6.QtCore import QRect, QSize, Qt
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontDatabase,
+    QGuiApplication,
+    QIcon,
+    QPainter,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -254,6 +263,79 @@ _THEME_COLORS = {
         "selection": "#1e3a5f",
     },
 }
+
+
+_NAV_ICON_SIZE = 20
+
+# Windows ships a monochrome icon font -- Fluent on 11, MDL2 on 10 -- whose
+# glyphs take the painter's pen. The plain Unicode symbols do not: a keyboard
+# and a gear resolve to the colour emoji font, which draws a bitmap that keeps
+# its own colour in every theme and on the selected row. Those symbols stay as
+# the fallback for a machine without either font.
+_NAV_ICON_FONTS = ("Segoe Fluent Icons", "Segoe MDL2 Assets")
+
+# (icon-font code point, fallback symbol, label). Glyph and label are kept
+# apart so the glyph can be drawn in a column of its own; see nav_icon.
+_NAV_ITEMS: tuple[tuple[str, str, str], ...] = (
+    ("", "⌨", "Expansions"),
+    ("", "ƒ", "Variables"),
+    ("", "▤", "Templates"),
+    ("", "⚙", "Settings"),
+    ("", "?", "Help"),
+)
+
+
+@lru_cache(maxsize=1)
+def _icon_font_family() -> str | None:
+    """The first installed icon font, or None to fall back to plain symbols."""
+    families = set(QFontDatabase.families())
+    for name in _NAV_ICON_FONTS:
+        if name in families:
+            return name
+    return None
+
+
+def nav_icon(code_point: str, fallback: str, theme: str) -> QIcon:
+    """Draw a sidebar glyph into an icon of fixed size.
+
+    The symbols are very different widths -- a keyboard and a gear run to about
+    twice a hooked f or a question mark -- so with them inline in the label
+    text, padding could not line the labels up and every row started at its own
+    x. Given to Qt as icons they get one fixed-width column and the text after
+    them aligns. Both icon modes are drawn because the view asks for Selected on
+    the current row, where the text colour changes as well.
+    """
+    colors = _THEME_COLORS[theme]
+    family = _icon_font_family()
+    glyph = code_point if family else fallback
+    # Rendered above 1x so the glyph stays sharp where Windows is scaling.
+    scale = 2
+    icon = QIcon()
+    for mode, color in (
+        (QIcon.Mode.Normal, colors["text"]),
+        (QIcon.Mode.Selected, colors["sidebar_sel_text"]),
+    ):
+        pixmap = QPixmap(_NAV_ICON_SIZE * scale, _NAV_ICON_SIZE * scale)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        pixmap.setDevicePixelRatio(scale)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        font = painter.font()
+        if family:
+            font.setFamily(family)
+            font.setPointSizeF(12.0)
+        else:
+            font.setPointSizeF(11.0)
+        painter.setFont(font)
+        painter.setPen(QColor(color))
+        painter.drawText(
+            QRect(0, 0, _NAV_ICON_SIZE, _NAV_ICON_SIZE),
+            Qt.AlignmentFlag.AlignCenter,
+            glyph,
+        )
+        painter.end()
+        icon.addPixmap(pixmap, mode)
+    return icon
 
 
 def build_stylesheet(theme: str) -> str:
@@ -794,14 +876,11 @@ class ExpansionApp(QMainWindow):
 
         self.nav = QListWidget()
         self.nav.setObjectName("Sidebar")
-        for label in (
-            "⌨  Expansions",
-            "ƒ  Variables",
-            "▤  Templates",
-            "⚙  Settings",
-            "?  Help",
-        ):
-            QListWidgetItem(label, self.nav)
+        self.nav.setIconSize(QSize(_NAV_ICON_SIZE, _NAV_ICON_SIZE))
+        for code_point, fallback, label in _NAV_ITEMS:
+            QListWidgetItem(
+                nav_icon(code_point, fallback, self.theme), label, self.nav
+            )
         self.nav.currentRowChanged.connect(self.stack_set_index)
         layout.addWidget(self.nav, 1)
 
@@ -1270,7 +1349,15 @@ class ExpansionApp(QMainWindow):
         # The Settings page mirrors the sidebar toggle, so both must relabel.
         if hasattr(self, "settings_theme_button"):
             self.settings_theme_button.setText(label)
+        self._refresh_nav_icons()
         self._apply_titlebar_theme()
+
+    def _refresh_nav_icons(self) -> None:
+        """Redraw the sidebar glyphs, whose colour is baked into the pixmap."""
+        for row, (code_point, fallback, _label) in enumerate(_NAV_ITEMS):
+            item = self.nav.item(row)
+            if item is not None:
+                item.setIcon(nav_icon(code_point, fallback, self.theme))
 
     def _apply_titlebar_theme(self) -> None:
         """Match the native Windows title bar to the current theme (Win 10/11)."""

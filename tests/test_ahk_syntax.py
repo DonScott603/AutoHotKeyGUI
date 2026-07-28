@@ -36,14 +36,17 @@ AHK = _find_autohotkey()
 
 @unittest.skipUnless(AHK, "AutoHotkey v2 is not installed")
 class AhkSyntaxTests(unittest.TestCase):
-    def _validate(self, script: Path) -> int:
+    def _validate(self, script: Path) -> subprocess.CompletedProcess[str]:
         assert AHK is not None
+        # /ErrorStdOut is not optional here: without it a script that fails to
+        # parse raises a modal error dialog and the run blocks until someone
+        # dismisses it, which hangs an unattended suite rather than failing it.
         return subprocess.run(
-            [str(AHK), "/validate", str(script)],
+            [str(AHK), "/ErrorStdOut", "/validate", str(script)],
             capture_output=True,
             text=True,
             timeout=60,
-        ).returncode
+        )
 
     def test_validator_rejects_a_broken_script(self) -> None:
         # Guards the tests below: a validator that passed everything would make
@@ -52,7 +55,7 @@ class AhkSyntaxTests(unittest.TestCase):
             broken = Path(temp_dir) / "broken.ahk"
             broken.write_text("#Requires AutoHotkey v2.0\nMsgBox(\n", encoding="utf-8")
 
-            self.assertNotEqual(self._validate(broken), 0)
+            self.assertNotEqual(self._validate(broken).returncode, 0)
 
     def _awkward_store(self) -> ExpansionStore:
         return ExpansionStore(
@@ -87,7 +90,10 @@ class AhkSyntaxTests(unittest.TestCase):
                 script = Path(temp_dir) / f"{theme}.ahk"
                 generate_ahk(store, script, backup=False, theme=theme)
 
-                self.assertEqual(self._validate(script), 0, f"{theme} script failed to parse")
+                result = self._validate(script)
+                self.assertEqual(
+                    result.returncode, 0, f"{theme} script failed to parse:\n{result.stderr}"
+                )
 
     def test_static_only_script_parses(self) -> None:
         store = ExpansionStore(
@@ -98,7 +104,8 @@ class AhkSyntaxTests(unittest.TestCase):
             script = Path(temp_dir) / "static.ahk"
             generate_ahk(store, script, backup=False)
 
-            self.assertEqual(self._validate(script), 0)
+            result = self._validate(script)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":
