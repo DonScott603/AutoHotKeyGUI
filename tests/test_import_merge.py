@@ -197,7 +197,7 @@ class ImportMergeTests(unittest.TestCase):
             ahk_path = Path(temp_dir) / "gen.ahk"
             generate_ahk(store, ahk_path, backup=False)
             text = ahk_path.read_text(encoding="utf-8")
-            self.assertIn('"Text Expansion Manager - ;st"', text)
+            self.assertIn('"Text Expansion Manager - `;st"', text)
             without_markers = "\n".join(
                 line for line in text.splitlines() if not line.strip().startswith("; @tem:")
             )
@@ -207,6 +207,36 @@ class ImportMergeTests(unittest.TestCase):
         self.assertEqual(
             imported.expansions[0].replacement,
             "Status: {AHK_SELECT:state|Pick one|State|Open||Closed}",
+        )
+
+    def test_semicolons_survive_an_unmarked_round_trip(self) -> None:
+        # Generation escapes every semicolon as `; so it cannot open a comment.
+        # Reconstruction from the code block has to reverse that.
+        store = ExpansionStore(
+            sections=["Work", "Status"],
+            expansions=[
+                Expansion("Work", ";note", "See ; footnote {AHK_INPUT:n|Num ; here|Num|}"),
+                Expansion("Status", ";st", "{AHK_SELECT:state|Pick ; one|State|Open ; now||Closed}"),
+            ],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "gen.ahk"
+            generate_ahk(store, ahk_path, backup=False)
+            text = ahk_path.read_text(encoding="utf-8")
+            without_markers = "\n".join(
+                line for line in text.splitlines() if not line.strip().startswith("; @tem:")
+            )
+            ahk_path.write_text(without_markers, encoding="utf-8")
+            imported = import_ahk(ahk_path)
+
+        by_trigger = {item.trigger: item.replacement for item in imported.expansions}
+        self.assertEqual(
+            by_trigger[";note"], "See ; footnote {AHK_INPUT:n|Num ; here|Num|}"
+        )
+        self.assertEqual(
+            by_trigger[";st"],
+            "{AHK_SELECT:state|Pick ; one|State|Open ; now||Closed}",
         )
 
     def test_legacy_three_argument_select_still_imports(self) -> None:

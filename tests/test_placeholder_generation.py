@@ -441,6 +441,60 @@ class PlaceholderGenerationTests(unittest.TestCase):
         self.assertNotIn("TEM_Paste", output)
 
 
+class AhkStringEscapingTests(unittest.TestCase):
+    """AHK opens a comment at a semicolon that follows whitespace, and does so
+    inside a quoted string too, truncating the literal and failing to parse."""
+
+    def test_semicolon_prefixed_trigger_is_escaped_in_the_window_title(self) -> None:
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";achs", "Hi {AHK_INPUT:name|Name|Name|}")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn('TEM_Form("Text Expansion Manager - `;achs"', output)
+        self.assertNotIn('Manager - ;achs"', output)
+
+    def test_semicolons_in_prompts_and_options_are_escaped(self) -> None:
+        store = ExpansionStore(
+            sections=["Status"],
+            expansions=[
+                Expansion(
+                    "Status",
+                    ";st",
+                    "{AHK_SELECT:state|Pick ; one|State|Open ; now||Closed}",
+                )
+            ],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn('"Pick `; one"', output)
+        self.assertIn('"Open `; now"', output)
+
+    def test_semicolon_in_a_static_replacement_is_escaped(self) -> None:
+        # A static expansion is emitted as bare hotstring text, not a quoted
+        # string, and an unescaped semicolon there truncates it silently.
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";n", "See ; footnote")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn(":;n::See `; footnote", output)
+        self.assertNotIn(":;n::See ; footnote", output)
+
+    def test_backtick_in_a_static_replacement_is_escaped(self) -> None:
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";b", "a `n b")],
+        )
+
+        self.assertIn(":;b::a ``n b", render_ahk(store))
+
+
 class PromptChromeTests(unittest.TestCase):
     """Branding and theming of the generated prompt windows."""
 

@@ -434,7 +434,10 @@ def import_ahk(path: Path) -> ExpansionStore:
                     Expansion(
                         section=current_section,
                         trigger=trigger,
-                        replacement=hotstring_match.group("replacement"),
+                        # AHK reads escapes in the replacement text, so the
+                        # stored template is the unescaped form -- both for our
+                        # own output and for a hand-written script.
+                        replacement=_unescape_ahk(hotstring_match.group("replacement")),
                         enabled=enabled,
                     )
                 )
@@ -1673,12 +1676,18 @@ def _maybe_disable_lines(lines: list[str], enabled: bool) -> list[str]:
 
 
 def _ahk_string(value: str) -> str:
+    # A semicolon preceded by whitespace opens a comment even inside a quoted
+    # string, which truncates the literal and fails to parse. Triggers are
+    # conventionally written ";abc", so escape every semicolon: `; is a literal
+    # semicolon to AHK, and _unescape_ahk already reverses an unknown escape to
+    # the character itself.
     escaped = (
         value.replace("`", "``")
         .replace("\r\n", "`r`n")
         .replace("\n", "`n")
         .replace("\r", "`r")
         .replace('"', '`"')
+        .replace(";", "`;")
     )
     return f'"{escaped}"'
 
@@ -1904,7 +1913,13 @@ def _end_char_lines() -> list[str]:
 
 
 def _single_line_replacement(text: str) -> str:
-    return text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    collapsed = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    # A static replacement runs to the end of the line, where AHK still reads a
+    # backtick as its escape character and opens a comment at a semicolon that
+    # follows whitespace -- which silently drops the rest of the expansion
+    # rather than failing, so it has to be escaped here. import_ahk reverses
+    # this with _unescape_ahk.
+    return collapsed.replace("`", "``").replace(";", "`;")
 
 
 # Word's "AutoFormat As You Type" rewrites a hyphen followed by a space ("- ",
