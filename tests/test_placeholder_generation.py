@@ -1,6 +1,12 @@
 import unittest
 
-from ahk_manager import Expansion, ExpansionStore, parse_replacement_template, render_ahk
+from ahk_manager import (
+    Expansion,
+    ExpansionStore,
+    TemplatePlaceholder,
+    parse_replacement_template,
+    render_ahk,
+)
 
 
 class PlaceholderGenerationTests(unittest.TestCase):
@@ -205,8 +211,11 @@ class PlaceholderGenerationTests(unittest.TestCase):
     def test_tab_placeholder_parses(self) -> None:
         segments = parse_replacement_template("A{AHK_KEY:Tab}B")
 
-        self.assertEqual(segments[1].kind, "AHK_KEY")
-        self.assertEqual(segments[1].value, "Tab")
+        # Segments are literals or placeholders; assert which before reading it.
+        placeholder = segments[1]
+        assert isinstance(placeholder, TemplatePlaceholder)
+        self.assertEqual(placeholder.kind, "AHK_KEY")
+        self.assertEqual(placeholder.value, "Tab")
 
     def test_tab_placeholder_generates_dynamic_hotstring(self) -> None:
         store = ExpansionStore(
@@ -289,8 +298,10 @@ class PlaceholderGenerationTests(unittest.TestCase):
     def test_image_placeholder_parses(self) -> None:
         segments = parse_replacement_template(r"{AHK_IMAGE:C:\Users\Scott\Pictures\logo.png}")
 
-        self.assertEqual(segments[0].kind, "AHK_IMAGE")
-        self.assertEqual(segments[0].value, r"C:\Users\Scott\Pictures\logo.png")
+        placeholder = segments[0]
+        assert isinstance(placeholder, TemplatePlaceholder)
+        self.assertEqual(placeholder.kind, "AHK_IMAGE")
+        self.assertEqual(placeholder.value, r"C:\Users\Scott\Pictures\logo.png")
 
     def test_image_placeholder_generates_clipboard_paste_logic(self) -> None:
         store = ExpansionStore(
