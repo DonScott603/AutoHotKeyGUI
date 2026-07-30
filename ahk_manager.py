@@ -5,7 +5,7 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 
 DEFAULT_JSON = "expansions.json"
@@ -1332,12 +1332,28 @@ def resolve_preview_segments(
     return resolved
 
 
+# Keys double as the labels in the rendered summary, so they carry spaces and a
+# slash -- hence the functional TypedDict syntax rather than the class form.
+PlaceholderSummary = TypedDict(
+    "PlaceholderSummary",
+    {
+        "Variables": list[str],
+        "Date/Time": int,
+        "Input boxes": int,
+        "List selections": int,
+        "Keystrokes": list[str],
+        "Images": list[str],
+        "Nested templates": list[str],
+    },
+)
+
+
 def collect_placeholder_summary(
     segments: list[str | TemplatePlaceholder],
     store: ExpansionStore | None = None,
     stack: tuple[str, ...] = (),
 ) -> str:
-    found = {
+    found: PlaceholderSummary = {
         "Variables": [],
         "Date/Time": 0,
         "Input boxes": 0,
@@ -1367,7 +1383,7 @@ def collect_placeholder_summary(
 
 def _collect_placeholder_summary(
     segments: list[str | TemplatePlaceholder],
-    found: dict[str, Any],
+    found: PlaceholderSummary,
     store: ExpansionStore | None,
     stack: tuple[str, ...],
 ) -> None:

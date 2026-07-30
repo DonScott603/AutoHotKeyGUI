@@ -7,12 +7,15 @@ for smooth (anti-aliased) edges, then written as a multi-size .ico.
 Run:  python tools/make_icon.py
 """
 
+from collections.abc import Sequence
 from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-ACCENT = (37, 99, 235, 255)   # #2563eb, the app's accent blue
-WHITE = (255, 255, 255, 255)
+RGBA = tuple[int, int, int, int]
+
+ACCENT: RGBA = (37, 99, 235, 255)   # #2563eb, the app's accent blue
+WHITE: RGBA = (255, 255, 255, 255)
 
 SCALE = 4          # supersample factor for anti-aliasing
 BASE = 256
@@ -22,7 +25,12 @@ ICO_SIZES = [(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)]
 OUT_DIR = Path(__file__).resolve().parent.parent
 
 
-def _round_line(draw: ImageDraw.ImageDraw, points, width, fill) -> None:
+def _round_line(
+    draw: ImageDraw.ImageDraw,
+    points: Sequence[tuple[int, int]],
+    width: int,
+    fill: RGBA,
+) -> None:
     draw.line(points, fill=fill, width=width, joint="curve")
     r = width // 2
     for x, y in points:

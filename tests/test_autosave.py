@@ -3,11 +3,12 @@ import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 
 # Run Qt without a real display so the GUI tests work headlessly (e.g. in CI).
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
 import app as app_module
 from ahk_manager import Expansion, ExpansionStore, TemplateDef, VariableDef
@@ -62,7 +63,7 @@ class AutoSaveTests(unittest.TestCase):
         ) = self._saved_paths
         self._temp.cleanup()
 
-    def saved(self) -> dict:
+    def saved(self) -> dict[str, Any]:
         return json.loads(self.json_path.read_text(encoding="utf-8"))
 
     def test_applying_an_expansion_writes_it_to_disk(self) -> None:
@@ -156,11 +157,15 @@ class AutoSaveTests(unittest.TestCase):
         def explode(_path: Path, _backup_dir: Path | None = None) -> Path | None:
             raise OSError("backup target unavailable")
 
+        warnings: list[str] = []
+
+        def record_warning(_parent: QWidget | None, _title: str, message: str) -> None:
+            warnings.append(message)
+
         original_backup = app_module.backup_file
         original_warn = app_module.show_warning
-        warnings: list[str] = []
         app_module.backup_file = explode
-        app_module.show_warning = lambda *args, **kwargs: warnings.append(args[-1])
+        app_module.show_warning = record_warning
         try:
             self.app.store.add_section("Added")
             self.app.persist()

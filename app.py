@@ -530,19 +530,19 @@ def save_theme_pref(theme: str) -> None:
 # Small message-box helpers
 # ---------------------------------------------------------------------------
 
-def show_error(parent, title: str, message: str) -> None:
+def show_error(parent: QWidget | None, title: str, message: str) -> None:
     QMessageBox.critical(parent, title, message)
 
 
-def show_info(parent, title: str, message: str) -> None:
+def show_info(parent: QWidget | None, title: str, message: str) -> None:
     QMessageBox.information(parent, title, message)
 
 
-def show_warning(parent, title: str, message: str) -> None:
+def show_warning(parent: QWidget | None, title: str, message: str) -> None:
     QMessageBox.warning(parent, title, message)
 
 
-def confirm(parent, title: str, message: str) -> bool:
+def confirm(parent: QWidget | None, title: str, message: str) -> bool:
     reply = QMessageBox.question(
         parent,
         title,
