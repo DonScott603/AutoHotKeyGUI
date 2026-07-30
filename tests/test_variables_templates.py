@@ -74,8 +74,12 @@ class VariableTemplateTests(unittest.TestCase):
 
         output = render_ahk(store)
 
-        self.assertIn("TEM_Select(prompt, title, options)", output)
-        self.assertIn('__tem_select_status := TEM_Select("Choose status", "Status", ["Pending", "Approved"])', output)
+        self.assertIn('TEM_Select(prompt, title, options, winTitle := "")', output)
+        self.assertIn(
+            '__tem_select_status := TEM_Select("Choose status", "Status", '
+            '["Pending", "Approved"], "Text Expansion Manager - st")',
+            output,
+        )
 
     def test_date_time_variable_resolves_to_format_time_expression(self) -> None:
         store = ExpansionStore(

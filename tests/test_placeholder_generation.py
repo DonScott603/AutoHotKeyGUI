@@ -1,9 +1,14 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from ahk_manager import (
+    AHK_ICON_NAME,
+    AHK_THEME_COLORS,
     Expansion,
     ExpansionStore,
     TemplatePlaceholder,
+    generate_ahk,
     parse_replacement_template,
     render_ahk,
 )
@@ -88,7 +93,11 @@ class PlaceholderGenerationTests(unittest.TestCase):
             '"title", "Client Name", "kind", "input", "default", "")',
             output,
         )
-        self.assertIn('__tem_vals := TEM_Form("dear", __tem_fields, __tem_parts)', output)
+        self.assertIn(
+            '__tem_vals := TEM_Form("Text Expansion Manager - dear", '
+            "__tem_fields, __tem_parts)",
+            output,
+        )
         self.assertIn('client_name := __tem_vals["client_name"]', output)
         self.assertIn("__tem_result .= client_name", output)
         self.assertNotIn("InputBox(", output)
@@ -192,9 +201,10 @@ class PlaceholderGenerationTests(unittest.TestCase):
 
         output = render_ahk(store)
 
-        self.assertIn("TEM_Select(prompt, title, options)", output)
+        self.assertIn('TEM_Select(prompt, title, options, winTitle := "")', output)
         self.assertIn(
-            '__tem_select_status := TEM_Select("Choose status", "Status", ["Pending", "Approved", "Rejected"])',
+            '__tem_select_status := TEM_Select("Choose status", "Status", '
+            '["Pending", "Approved", "Rejected"], "Text Expansion Manager - status")',
             output,
         )
         self.assertIn("status := __tem_select_status.value", output)
@@ -259,6 +269,39 @@ class PlaceholderGenerationTests(unittest.TestCase):
         self.assertIn('if (A_EndChar = "`r" || A_EndChar = "`n") {', output)
         self.assertIn('Send("{Enter}")', output)
         self.assertIn("SendText(A_EndChar)", output)
+
+    def test_expansion_ending_in_a_key_drops_the_ending_character(self) -> None:
+        # The Tab has moved the caret to the next field by the time the ending
+        # character would be replayed, so it would be typed there instead.
+        store = ExpansionStore(
+            sections=["Keys"],
+            expansions=[Expansion("Keys", "next", "Value{AHK_KEY:Tab}")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn('SendEvent("{Tab}")', output)
+        self.assertNotIn("A_EndChar", output)
+
+    def test_a_key_before_more_text_keeps_the_ending_character(self) -> None:
+        store = ExpansionStore(
+            sections=["Keys"],
+            expansions=[Expansion("Keys", "tabbed", "Left{AHK_KEY:Tab}Right")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn("SendText(A_EndChar)", output)
+
+    def test_a_trailing_empty_literal_still_counts_as_ending_in_a_key(self) -> None:
+        store = ExpansionStore(
+            sections=["Keys"],
+            expansions=[Expansion("Keys", "next", "{AHK_KEY:Tab}")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertNotIn("A_EndChar", output)
 
     def test_static_hotstring_omits_ending_character_logic(self) -> None:
         store = ExpansionStore(
@@ -429,6 +472,198 @@ class PlaceholderGenerationTests(unittest.TestCase):
 
         self.assertIn("SendText(__tem_result)", output)
         self.assertNotIn("TEM_Paste", output)
+
+
+class AhkStringEscapingTests(unittest.TestCase):
+    """AHK opens a comment at a semicolon that follows whitespace, and does so
+    inside a quoted string too, truncating the literal and failing to parse."""
+
+    def test_semicolon_prefixed_trigger_is_escaped_in_the_window_title(self) -> None:
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";achs", "Hi {AHK_INPUT:name|Name|Name|}")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn('TEM_Form("Text Expansion Manager - `;achs"', output)
+        self.assertNotIn('Manager - ;achs"', output)
+
+    def test_semicolons_in_prompts_and_options_are_escaped(self) -> None:
+        store = ExpansionStore(
+            sections=["Status"],
+            expansions=[
+                Expansion(
+                    "Status",
+                    ";st",
+                    "{AHK_SELECT:state|Pick ; one|State|Open ; now||Closed}",
+                )
+            ],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn('"Pick `; one"', output)
+        self.assertIn('"Open `; now"', output)
+
+    def test_semicolon_in_a_static_replacement_is_escaped(self) -> None:
+        # A static expansion is emitted as bare hotstring text, not a quoted
+        # string, and an unescaped semicolon there truncates it silently.
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";n", "See ; footnote")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn(":;n::See `; footnote", output)
+        self.assertNotIn(":;n::See ; footnote", output)
+
+    def test_backtick_in_a_static_replacement_is_escaped(self) -> None:
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";b", "a `n b")],
+        )
+
+        self.assertIn(":;b::a ``n b", render_ahk(store))
+
+
+class PromptChromeTests(unittest.TestCase):
+    """Branding and theming of the generated prompt windows."""
+
+    def _prompt_store(self) -> ExpansionStore:
+        return ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion("Work", "dear", "Dear {AHK_INPUT:name|Enter name|Name|},")
+            ],
+        )
+
+    def test_prompt_window_is_titled_with_the_app_and_trigger(self) -> None:
+        output = render_ahk(self._prompt_store())
+
+        self.assertIn('TEM_Form("Text Expansion Manager - dear"', output)
+
+    def test_script_points_the_tray_icon_at_the_copied_app_icon(self) -> None:
+        output = render_ahk(self._prompt_store())
+
+        self.assertIn(f'if FileExist(A_ScriptDir "\\{AHK_ICON_NAME}")', output)
+        self.assertIn(f'TraySetIcon(A_ScriptDir "\\{AHK_ICON_NAME}")', output)
+
+    def test_light_theme_uses_the_light_palette(self) -> None:
+        output = render_ahk(self._prompt_store(), "light")
+        light = AHK_THEME_COLORS["light"]
+
+        self.assertIn(f'formGui.BackColor := "{light["bg"]}"', output)
+        self.assertIn(f'formGui.SetFont("s9 c{light["text"]}", "Segoe UI")', output)
+        self.assertIn("TEM_DarkTitleBar(hwnd, 0)", output)
+
+    def test_dark_theme_uses_the_dark_palette_and_dark_title_bar(self) -> None:
+        output = render_ahk(self._prompt_store(), "dark")
+        dark = AHK_THEME_COLORS["dark"]
+
+        self.assertIn(f'formGui.BackColor := "{dark["bg"]}"', output)
+        self.assertIn(f'formGui.SetFont("s9 c{dark["text"]}", "Segoe UI")', output)
+        self.assertIn(f"Background{dark['field']}", output)
+        self.assertIn("TEM_DarkTitleBar(hwnd, 1)", output)
+
+    def _select_store(self) -> ExpansionStore:
+        return ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion("Work", "pick", "{AHK_SELECT:kind|Kind|Kind|Invoice||Receipt}")
+            ],
+        )
+
+    def test_dark_theme_restyles_the_system_drawn_controls(self) -> None:
+        # Buttons, dropdowns and scrollbars are drawn by Windows and ignore the
+        # Gui's colours, so they need the dark visual styles applied by hand.
+        output = render_ahk(self._prompt_store(), "dark")
+
+        self.assertIn('DllCall("uxtheme\\SetWindowTheme"', output)
+        self.assertIn('TEM_ThemeControl(okButton.Hwnd, "DarkMode_Explorer")', output)
+        self.assertIn('TEM_ThemeControl(cancelButton.Hwnd, "DarkMode_Explorer")', output)
+        self.assertIn('TEM_ThemeControl(preview.Hwnd, "DarkMode_Explorer")', output)
+
+    def test_light_theme_leaves_the_default_visual_styles(self) -> None:
+        # Applying a DarkMode style in the light theme would invert the
+        # controls. The call sites still name one -- they are identical in both
+        # themes -- but the helper they call is inert here.
+        output = render_ahk(self._prompt_store(), "light")
+
+        self.assertIn("TEM_ThemeControl(", output)
+        self.assertNotIn("SetWindowTheme", output)
+
+    def test_a_dropdown_uses_the_combo_box_dark_style(self) -> None:
+        # A combo box needs DarkMode_CFD; DarkMode_Explorer leaves it light.
+        output = render_ahk(self._select_store(), "dark")
+
+        self.assertIn('TEM_ThemeControl(dropdown.Hwnd, "DarkMode_CFD")', output)
+
+    def test_form_fields_use_the_combo_box_dark_style(self) -> None:
+        # Both field kinds take DarkMode_CFD: the dropdown for its face, the
+        # edit because DarkMode_Explorer leaves an edit's frame light.
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion(
+                    "Work",
+                    "both",
+                    "{AHK_INPUT:name|Name|Name|} {AHK_SELECT:kind|Kind|Kind|A||B}",
+                )
+            ],
+        )
+
+        output = render_ahk(store, "dark")
+
+        self.assertEqual(output.count('TEM_ThemeControl(ctrl.Hwnd, "DarkMode_CFD")'), 2)
+
+    def test_dark_theme_drops_the_light_frame_around_fields(self) -> None:
+        # WS_EX_CLIENTEDGE is drawn light whatever style the control carries,
+        # so a dark field was ringed in white until it was removed.
+        output = render_ahk(self._prompt_store(), "dark")
+
+        self.assertIn("Multi ReadOnly -E0x200 Background", output)
+        self.assertIn('AddEdit("x+8 yp-4 w312 -E0x200 Background', output)
+
+    def test_light_theme_keeps_the_frame_around_fields(self) -> None:
+        output = render_ahk(self._prompt_store(), "light")
+
+        self.assertNotIn("-E0x200", output)
+
+    def test_unknown_theme_falls_back_to_light(self) -> None:
+        self.assertEqual(
+            render_ahk(self._prompt_store(), "solarized"),
+            render_ahk(self._prompt_store(), "light"),
+        )
+
+    def test_generate_copies_the_icon_next_to_the_script(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "app.ico"
+            source.write_bytes(b"icon-bytes")
+            ahk_path = Path(temp_dir) / "out" / "gen.ahk"
+
+            generate_ahk(
+                self._prompt_store(), ahk_path, backup=False, icon_source=source
+            )
+
+            copied = ahk_path.parent / AHK_ICON_NAME
+            self.assertTrue(copied.is_file())
+            self.assertEqual(copied.read_bytes(), b"icon-bytes")
+
+    def test_generate_survives_a_missing_icon_source(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "gen.ahk"
+
+            generate_ahk(
+                self._prompt_store(),
+                ahk_path,
+                backup=False,
+                icon_source=Path(temp_dir) / "absent.ico",
+            )
+
+            self.assertTrue(ahk_path.is_file())
+            self.assertFalse((ahk_path.parent / AHK_ICON_NAME).exists())
 
 
 if __name__ == "__main__":

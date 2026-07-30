@@ -5,13 +5,39 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 
 DEFAULT_JSON = "expansions.json"
 DEFAULT_AHK = "text_expansions.ahk"
 DEFAULT_SETTINGS = "settings.json"
 BACKUP_RETENTION_LIMIT = 10
+
+# Prompt windows are branded with the app rather than the bare trigger, so a
+# popup that appears mid-typing is identifiable in the taskbar and Alt-Tab.
+APP_TITLE = "Text Expansion Manager"
+
+# Copied next to the generated script at generate time: the script is run by
+# AutoHotkey.exe on its own, so it cannot reach an icon bundled inside our exe.
+AHK_ICON_NAME = "TextExpansionManager.ico"
+
+# The subset of the app palette the prompts can actually use. Mirrors the
+# matching keys in app.py's _THEME_COLORS; AHK wants bare RRGGBB, no leading #.
+AHK_THEME_COLORS = {
+    "light": {"bg": "f4f5f7", "field": "ffffff", "text": "1f2937"},
+    "dark": {"bg": "1e1f22", "field": "2b2d31", "text": "e5e7eb"},
+}
+DEFAULT_THEME = "light"
+
+
+def ahk_theme_colors(theme: str) -> dict[str, str]:
+    """Palette for a theme name, falling back to light for anything unknown."""
+    return AHK_THEME_COLORS.get(theme, AHK_THEME_COLORS[DEFAULT_THEME])
+
+
+def _prompt_title(trigger: str) -> str:
+    """Window title for the prompt raised by a trigger."""
+    return f"{APP_TITLE} - {trigger}"
 
 
 @dataclass
@@ -408,7 +434,10 @@ def import_ahk(path: Path) -> ExpansionStore:
                     Expansion(
                         section=current_section,
                         trigger=trigger,
-                        replacement=hotstring_match.group("replacement"),
+                        # AHK reads escapes in the replacement text, so the
+                        # stored template is the unescaped form -- both for our
+                        # own output and for a hand-written script.
+                        replacement=_unescape_ahk(hotstring_match.group("replacement")),
                         enabled=enabled,
                     )
                 )
@@ -427,6 +456,9 @@ def import_ahk(path: Path) -> ExpansionStore:
 _BLOCK_OPEN_RE = re.compile(r"^;?\s?\{\s*$")
 _BLOCK_CLOSE_RE = re.compile(r"^;?\s?\}\s*$")
 _AHK_QUOTED_RE = re.compile(r'"((?:`.|[^"`])*)"')
+# A TEM_Select call carrying the branded window title after its options array.
+# Scripts generated before the title was added simply do not match.
+_SELECT_WINDOW_TITLE_RE = re.compile(r'\],\s*"(?:`.|[^"`])*"\s*\)\s*$')
 
 # Field entries inside a generated __tem_fields array. The key order is the one
 # _form_fields_literal emits; the quoted-string subpattern is escape-aware so a
@@ -550,7 +582,8 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
                 i += 1
             i += 1
             continue
-        # End-char handling (always a fixed 5-line trailer).
+        # End-char handling: a fixed 5-line trailer, absent when the expansion
+        # ends on a key press.
         if line.startswith("if (A_EndChar"):
             i += 5
             continue
@@ -592,6 +625,10 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
         selection = re.match(r"__tem_select_(\w+) := TEM_Select\(", line)
         if selection:
             quoted = _AHK_QUOTED_RE.findall(line)
+            # The window title trails the options array and is derived from the
+            # trigger, so it is dropped rather than read back as an option.
+            if _SELECT_WINDOW_TITLE_RE.search(line):
+                quoted = quoted[:-1]
             if len(quoted) < 2:
                 return None
             var = selection.group(1)
@@ -823,23 +860,48 @@ def generate_ahk(
     path: Path,
     backup: bool = True,
     backup_dir: Path | None = None,
+    theme: str = DEFAULT_THEME,
+    icon_source: Path | None = None,
 ) -> Path | None:
     validate_store_placeholders(store)
     path.parent.mkdir(parents=True, exist_ok=True)
     backup_path = backup_file(path, backup_dir) if backup else None
     # Atomic too: a truncated .ahk would break every hotstring at once, and the
     # running script is reloaded from it immediately after this returns.
-    _atomic_write_text(path, render_ahk(store))
+    _atomic_write_text(path, render_ahk(store, theme))
+    _install_prompt_icon(path, icon_source)
     return backup_path
 
 
-def render_ahk(store: ExpansionStore) -> str:
+def _install_prompt_icon(script_path: Path, icon_source: Path | None) -> None:
+    """Place the app icon beside the generated script for the prompts to load.
+
+    Best effort: the script guards on the file existing, so a failed copy costs
+    the branding but never the expansions.
+    """
+    if icon_source is None:
+        return
+    try:
+        if not icon_source.is_file():
+            return
+        target = script_path.parent / AHK_ICON_NAME
+        if target.exists() and target.stat().st_mtime >= icon_source.stat().st_mtime:
+            return
+        shutil.copyfile(icon_source, target)
+    except OSError:
+        return
+
+
+def render_ahk(store: ExpansionStore, theme: str = DEFAULT_THEME) -> str:
     validate_store_placeholders(store)
     lines = [
         "#Requires AutoHotkey v2.0",
         "#SingleInstance Force",
         "; Generated by AutoHotkey Text Expansion Manager.",
         "; Edit expansions.json through the GUI, then regenerate this file.",
+        "",
+        f'if FileExist(A_ScriptDir "\\{AHK_ICON_NAME}")',
+        f'    TraySetIcon(A_ScriptDir "\\{AHK_ICON_NAME}")',
         "",
     ]
     if store.variables or store.templates:
@@ -874,15 +936,25 @@ def render_ahk(store: ExpansionStore) -> str:
             item.needs_form_helper for item in rendered_expansions
         )
 
-    # Both prompts position themselves through the same helper.
+    colors = ahk_theme_colors(theme)
+    # WS_EX_CLIENTEDGE, the sunken frame around an Edit, is drawn in light
+    # colours whatever visual style the control carries -- neither
+    # DarkMode_Explorer nor DarkMode_CFD reaches it -- so a dark field was
+    # ringed in white. Dropping it leaves a flat field that reads against the
+    # window by its fill. Light keeps the frame: it looks right there.
+    edit_border = "-E0x200 " if theme == "dark" else ""
+    # Both prompts position themselves and take their chrome from the same
+    # helpers, so the two dialogs cannot drift apart visually.
     if needs_form_helper or needs_select_helper:
         lines.extend(_position_helper_lines())
         lines.append("")
+        lines.extend(_chrome_helper_lines(theme))
+        lines.append("")
     if needs_form_helper:
-        lines.extend(_form_helper_lines())
+        lines.extend(_form_helper_lines(colors, edit_border))
         lines.append("")
     if needs_select_helper:
-        lines.extend(_select_helper_lines())
+        lines.extend(_select_helper_lines(colors))
         lines.append("")
     if needs_image_helper:
         lines.extend(_image_helper_lines())
@@ -1064,7 +1136,7 @@ def render_expansion(
         lines.append(f"    __tem_fields := {_form_fields_literal(fields)}")
         lines.append(f"    __tem_parts := {_form_parts_literal(segments)}")
         lines.append(
-            f"    __tem_vals := TEM_Form({_ahk_string(expansion.trigger)}, __tem_fields, __tem_parts)"
+            f"    __tem_vals := TEM_Form({_ahk_string(_prompt_title(expansion.trigger))}, __tem_fields, __tem_parts)"
         )
         lines.append("    if (!IsObject(__tem_vals))")
         lines.append("        return")
@@ -1101,7 +1173,11 @@ def render_expansion(
             variable, prompt, title, *options = segment.args
             if not use_form:
                 option_list = ", ".join(_ahk_string(option) for option in options)
-                lines.append(f"    __tem_select_{variable} := TEM_Select({_ahk_string(prompt)}, {_ahk_string(title)}, [{option_list}])")
+                window_title = _ahk_string(_prompt_title(expansion.trigger))
+                lines.append(
+                    f"    __tem_select_{variable} := TEM_Select({_ahk_string(prompt)}, "
+                    f"{_ahk_string(title)}, [{option_list}], {window_title})"
+                )
                 lines.append(f"    if (!__tem_select_{variable}.ok)")
                 lines.append("        return")
                 lines.append(f"    {variable} := __tem_select_{variable}.value")
@@ -1120,7 +1196,8 @@ def render_expansion(
             needs_image_helper = True
 
     flush_result()
-    lines.extend(_end_char_lines())
+    if not _ends_with_key(segments):
+        lines.extend(_end_char_lines())
     lines.append("}")
     if expansion.notes:
         lines.append(f"; Notes: {expansion.notes}")
@@ -1255,12 +1332,28 @@ def resolve_preview_segments(
     return resolved
 
 
+# Keys double as the labels in the rendered summary, so they carry spaces and a
+# slash -- hence the functional TypedDict syntax rather than the class form.
+PlaceholderSummary = TypedDict(
+    "PlaceholderSummary",
+    {
+        "Variables": list[str],
+        "Date/Time": int,
+        "Input boxes": int,
+        "List selections": int,
+        "Keystrokes": list[str],
+        "Images": list[str],
+        "Nested templates": list[str],
+    },
+)
+
+
 def collect_placeholder_summary(
     segments: list[str | TemplatePlaceholder],
     store: ExpansionStore | None = None,
     stack: tuple[str, ...] = (),
 ) -> str:
-    found = {
+    found: PlaceholderSummary = {
         "Variables": [],
         "Date/Time": 0,
         "Input boxes": 0,
@@ -1290,7 +1383,7 @@ def collect_placeholder_summary(
 
 def _collect_placeholder_summary(
     segments: list[str | TemplatePlaceholder],
-    found: dict[str, Any],
+    found: PlaceholderSummary,
     store: ExpansionStore | None,
     stack: tuple[str, ...],
 ) -> None:
@@ -1607,26 +1700,40 @@ def _maybe_disable_lines(lines: list[str], enabled: bool) -> list[str]:
 
 
 def _ahk_string(value: str) -> str:
+    # A semicolon preceded by whitespace opens a comment even inside a quoted
+    # string, which truncates the literal and fails to parse. Triggers are
+    # conventionally written ";abc", so escape every semicolon: `; is a literal
+    # semicolon to AHK, and _unescape_ahk already reverses an unknown escape to
+    # the character itself.
     escaped = (
         value.replace("`", "``")
         .replace("\r\n", "`r`n")
         .replace("\n", "`n")
         .replace("\r", "`r")
         .replace('"', '`"')
+        .replace(";", "`;")
     )
     return f'"{escaped}"'
 
 
-def _select_helper_lines() -> list[str]:
+def _select_helper_lines(colors: dict[str, str]) -> list[str]:
+    # winTitle is optional so a hand-edited script written against the older
+    # three-argument form still runs, falling back to the placeholder's title.
     return [
-        "TEM_Select(prompt, title, options) {",
+        "TEM_Select(prompt, title, options, winTitle := \"\") {",
         "    point := TEM_TargetPoint()",
-        "    selectGui := Gui(\"+AlwaysOnTop\", title)",
+        "    selectGui := Gui(\"+AlwaysOnTop\", winTitle != \"\" ? winTitle : title)",
+        f"    selectGui.BackColor := \"{colors['bg']}\"",
+        "    TEM_ApplyChrome(selectGui.Hwnd)",
+        f"    selectGui.SetFont(\"s9 c{colors['text']}\", \"Segoe UI\")",
         "    selectGui.AddText(\"w280\", prompt)",
         "    dropdown := selectGui.AddDropDownList(\"w280 Choose1\", options)",
+        "    TEM_ThemeControl(dropdown.Hwnd, \"DarkMode_CFD\")",
         "    result := {ok: false, value: \"\"}",
         "    okButton := selectGui.AddButton(\"Default w80\", \"OK\")",
         "    cancelButton := selectGui.AddButton(\"x+8 w80\", \"Cancel\")",
+        "    TEM_ThemeControl(okButton.Hwnd, \"DarkMode_Explorer\")",
+        "    TEM_ThemeControl(cancelButton.Hwnd, \"DarkMode_Explorer\")",
         "    okButton.OnEvent(\"Click\", (*) => (result.ok := true, result.value := dropdown.Text, selectGui.Destroy()))",
         "    cancelButton.OnEvent(\"Click\", (*) => selectGui.Destroy())",
         "    selectGui.OnEvent(\"Close\", (*) => selectGui.Destroy())",
@@ -1634,6 +1741,56 @@ def _select_helper_lines() -> list[str]:
         "    guiHwnd := selectGui.Hwnd",
         "    WinWaitClose(\"ahk_id \" guiHwnd)",
         "    return result",
+        "}",
+    ]
+
+
+def _chrome_helper_lines(theme: str) -> list[str]:
+    """Give a prompt window the app icon and, in dark mode, a dark title bar.
+
+    Both are best effort by design: a Windows build without the immersive dark
+    mode attribute ignores the call, and a missing icon file leaves the default
+    AutoHotkey one. Neither should cost the user their expansion.
+    """
+    dark_flag = "1" if theme == "dark" else "0"
+    # Buttons, dropdowns and scrollbars are drawn by Windows, which ignores the
+    # Gui's colours entirely, so the dark variants of their visual styles are
+    # the only way to bring them along. Light needs nothing: the defaults
+    # already match, and applying a DarkMode style there would invert them.
+    theme_control_body = (
+        ["    try DllCall(\"uxtheme\\SetWindowTheme\", \"ptr\", hwnd, \"str\", sub, \"ptr\", 0)"]
+        if theme == "dark"
+        else ["    ; Light theme keeps the default visual styles, which match."]
+    )
+    return [
+        "TEM_ApplyChrome(hwnd) {",
+        f"    TEM_DarkTitleBar(hwnd, {dark_flag})",
+        "    TEM_SetWindowIcon(hwnd)",
+        "}",
+        "",
+        "TEM_ThemeControl(hwnd, sub) {",
+        *theme_control_body,
+        "}",
+        "",
+        "TEM_DarkTitleBar(hwnd, enable) {",
+        "    ; DWMWA_USE_IMMERSIVE_DARK_MODE (20). Older builds fail harmlessly.",
+        "    try DllCall(\"dwmapi\\DwmSetWindowAttribute\", \"ptr\", hwnd, \"int\", 20, \"int*\", enable, \"int\", 4)",
+        "}",
+        "",
+        "TEM_SetWindowIcon(hwnd) {",
+        f"    iconPath := A_ScriptDir \"\\{AHK_ICON_NAME}\"",
+        "    if !FileExist(iconPath)",
+        "        return",
+        "    ; IMAGE_ICON with LR_LOADFROMFILE, then set both sizes so the title",
+        "    ; bar and Alt-Tab agree.",
+        "    hIcon := DllCall(\"LoadImage\", \"ptr\", 0, \"str\", iconPath, \"uint\", 1, \"int\", 0, \"int\", 0, \"uint\", 0x10, \"ptr\")",
+        "    if !hIcon",
+        "        return",
+        "    ; Sent through DllCall rather than SendMessage: the window is still",
+        "    ; hidden at this point, so an ahk_id criterion would not match it",
+        "    ; unless DetectHiddenWindows were on.",
+        "    DllCall(\"SendMessage\", \"ptr\", hwnd, \"uint\", 0x0080, \"ptr\", 0, \"ptr\", hIcon)",
+        "    DllCall(\"SendMessage\", \"ptr\", hwnd, \"uint\", 0x0080, \"ptr\", 1, \"ptr\", hIcon)",
         "}",
     ]
 
@@ -1694,7 +1851,7 @@ def _position_helper_lines() -> list[str]:
     ]
 
 
-def _form_helper_lines() -> list[str]:
+def _form_helper_lines(colors: dict[str, str], edit_border: str = "") -> list[str]:
     """One dialog gathering every prompt, above a preview of the resolved text.
 
     updatePreview reads the live controls on each keystroke rather than closing
@@ -1705,9 +1862,15 @@ def _form_helper_lines() -> list[str]:
         "TEM_Form(title, fields, parts) {",
         "    point := TEM_TargetPoint()",
         "    formGui := Gui(\"+AlwaysOnTop +OwnDialogs\", title)",
-        "    formGui.SetFont(\"s9\")",
+        f"    formGui.BackColor := \"{colors['bg']}\"",
+        "    TEM_ApplyChrome(formGui.Hwnd)",
+        f"    formGui.SetFont(\"s9 c{colors['text']}\", \"Segoe UI\")",
         "    formGui.AddText(\"xm w460\", \"Preview\")",
-        "    preview := formGui.AddEdit(\"xm w460 r4 Multi ReadOnly\")",
+        f"    preview := formGui.AddEdit(\"xm w460 r4 Multi ReadOnly {edit_border}Background{colors['field']}\")",
+        # DarkMode_Explorer rather than DarkMode_CFD: with the frame gone the
+        # only thing left for the style to reach is the scrollbar, which CFD
+        # leaves light.
+        "    TEM_ThemeControl(preview.Hwnd, \"DarkMode_Explorer\")",
         "    controls := Map()",
         "    state := Map(\"ok\", false, \"values\", \"\")",
         "    updatePreview() {",
@@ -1722,15 +1885,20 @@ def _form_helper_lines() -> list[str]:
         "    }",
         "    for field in fields {",
         "        formGui.AddText(\"xm w140 Right\", field[\"label\"])",
-        "        if (field[\"kind\"] = \"select\")",
+        "        if (field[\"kind\"] = \"select\") {",
         "            ctrl := formGui.AddDropDownList(\"x+8 yp-4 w312 Choose1\", field[\"options\"])",
-        "        else",
-        "            ctrl := formGui.AddEdit(\"x+8 yp-4 w312\", field[\"default\"])",
+        "            TEM_ThemeControl(ctrl.Hwnd, \"DarkMode_CFD\")",
+        "        } else {",
+        f"            ctrl := formGui.AddEdit(\"x+8 yp-4 w312 {edit_border}Background{colors['field']}\", field[\"default\"])",
+        "            TEM_ThemeControl(ctrl.Hwnd, \"DarkMode_CFD\")",
+        "        }",
         "        ctrl.OnEvent(\"Change\", (*) => updatePreview())",
         "        controls[field[\"name\"]] := ctrl",
         "    }",
         "    okButton := formGui.AddButton(\"xm+272 y+16 w90 Default\", \"Insert\")",
         "    cancelButton := formGui.AddButton(\"x+8 w90\", \"Cancel\")",
+        "    TEM_ThemeControl(okButton.Hwnd, \"DarkMode_Explorer\")",
+        "    TEM_ThemeControl(cancelButton.Hwnd, \"DarkMode_Explorer\")",
         "    okButton.OnEvent(\"Click\", (*) => (state[\"ok\"] := true, state[\"values\"] := TEM_FormValues(fields, controls), formGui.Destroy()))",
         "    cancelButton.OnEvent(\"Click\", (*) => formGui.Destroy())",
         "    formGui.OnEvent(\"Close\", (*) => formGui.Destroy())",
@@ -1780,10 +1948,29 @@ def _image_helper_lines() -> list[str]:
     ]
 
 
+def _ends_with_key(segments: list[Any]) -> bool:
+    """Whether the expansion finishes on a key press.
+
+    Trailing empty literals are ignored: they contribute nothing to the output,
+    so a key before one still ends the expansion.
+    """
+    for segment in reversed(segments):
+        if isinstance(segment, str):
+            if segment:
+                return False
+            continue
+        return segment.kind == "AHK_KEY"
+    return False
+
+
 def _end_char_lines() -> list[str]:
     # Dynamic hotstrings run code instead of auto-replacing, so AutoHotkey does
     # not reproduce the ending character (space/Enter/Tab) that triggered them.
     # Re-send A_EndChar so it is preserved, matching plain-text hotstrings.
+    #
+    # Omitted for an expansion that ends on a key press: the caret has moved on
+    # by then -- a trailing Tab lands it in the next field -- so replaying the
+    # character would type it somewhere the user did not expand into.
     return [
         '    if (A_EndChar = "`r" || A_EndChar = "`n") {',
         '        Send("{Enter}")',
@@ -1794,7 +1981,13 @@ def _end_char_lines() -> list[str]:
 
 
 def _single_line_replacement(text: str) -> str:
-    return text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    collapsed = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    # A static replacement runs to the end of the line, where AHK still reads a
+    # backtick as its escape character and opens a comment at a semicolon that
+    # follows whitespace -- which silently drops the rest of the expansion
+    # rather than failing, so it has to be escaped here. import_ahk reverses
+    # this with _unescape_ahk.
+    return collapsed.replace("`", "``").replace(";", "`;")
 
 
 # Word's "AutoFormat As You Type" rewrites a hyphen followed by a space ("- ",

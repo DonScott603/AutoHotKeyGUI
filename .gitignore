@@ -7,6 +7,8 @@ settings.json
 ui_prefs.json
 expansions.json
 text_expansions*.ahk
+# Copied next to the generated script at generate time; app.ico is the source.
+TextExpansionManager.ico
 build/
 dist/
 Issues/

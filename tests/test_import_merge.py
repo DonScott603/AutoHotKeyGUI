@@ -183,6 +183,118 @@ class ImportMergeTests(unittest.TestCase):
         self.assertEqual(by_trigger[";ld"], '{AHK_EXPR:FormatTime(A_Now, "yyyy-MM-dd")}')
         self.assertEqual(by_trigger[";ask"], "Hi {AHK_INPUT:name|Enter name|Name|}, ok")
 
+    def test_unmarked_select_block_round_trips_without_window_title(self) -> None:
+        # TEM_Select carries the branded window title after its options array.
+        # Reconstruction must drop it rather than read it back as an option.
+        store = ExpansionStore(
+            sections=["Status"],
+            expansions=[
+                Expansion("Status", ";st", "Status: {AHK_SELECT:state|Pick one|State|Open||Closed}"),
+            ],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "gen.ahk"
+            generate_ahk(store, ahk_path, backup=False)
+            text = ahk_path.read_text(encoding="utf-8")
+            self.assertIn('"Text Expansion Manager - `;st"', text)
+            without_markers = "\n".join(
+                line for line in text.splitlines() if not line.strip().startswith("; @tem:")
+            )
+            ahk_path.write_text(without_markers, encoding="utf-8")
+            imported = import_ahk(ahk_path)
+
+        self.assertEqual(
+            imported.expansions[0].replacement,
+            "Status: {AHK_SELECT:state|Pick one|State|Open||Closed}",
+        )
+
+    def test_semicolons_survive_an_unmarked_round_trip(self) -> None:
+        # Generation escapes every semicolon as `; so it cannot open a comment.
+        # Reconstruction from the code block has to reverse that.
+        store = ExpansionStore(
+            sections=["Work", "Status"],
+            expansions=[
+                Expansion("Work", ";note", "See ; footnote {AHK_INPUT:n|Num ; here|Num|}"),
+                Expansion("Status", ";st", "{AHK_SELECT:state|Pick ; one|State|Open ; now||Closed}"),
+            ],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "gen.ahk"
+            generate_ahk(store, ahk_path, backup=False)
+            text = ahk_path.read_text(encoding="utf-8")
+            without_markers = "\n".join(
+                line for line in text.splitlines() if not line.strip().startswith("; @tem:")
+            )
+            ahk_path.write_text(without_markers, encoding="utf-8")
+            imported = import_ahk(ahk_path)
+
+        by_trigger = {item.trigger: item.replacement for item in imported.expansions}
+        self.assertEqual(
+            by_trigger[";note"], "See ; footnote {AHK_INPUT:n|Num ; here|Num|}"
+        )
+        self.assertEqual(
+            by_trigger[";st"],
+            "{AHK_SELECT:state|Pick ; one|State|Open ; now||Closed}",
+        )
+
+    def test_key_ending_expansion_round_trips_without_the_end_char_trailer(self) -> None:
+        # Reconstruction skips the ending-character trailer when it finds one;
+        # an expansion ending in a key no longer emits it at all.
+        store = ExpansionStore(
+            sections=["Keys"],
+            expansions=[Expansion("Keys", ";next", "Value{AHK_KEY:Tab}")],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "gen.ahk"
+            generate_ahk(store, ahk_path, backup=False)
+            text = ahk_path.read_text(encoding="utf-8")
+            without_markers = "\n".join(
+                line for line in text.splitlines() if not line.strip().startswith("; @tem:")
+            )
+            ahk_path.write_text(without_markers, encoding="utf-8")
+            imported = import_ahk(ahk_path)
+
+        self.assertEqual(imported.expansions[0].replacement, "Value{AHK_KEY:Tab}")
+
+    def test_legacy_three_argument_select_still_imports(self) -> None:
+        # Scripts generated before the window title was added have no fourth
+        # argument, and must keep importing with their options intact.
+        legacy = "\n".join(
+            [
+                "#Requires AutoHotkey v2.0",
+                "",
+                "; === Status ===",
+                ":C:;st::",
+                "{",
+                '    __tem_result := ""',
+                '    __tem_result .= "Status: "',
+                '    __tem_select_state := TEM_Select("Pick one", "State", ["Open", "Closed"])',
+                "    if (!__tem_select_state.ok)",
+                "        return",
+                "    state := __tem_select_state.value",
+                "    __tem_result .= state",
+                '    if (__tem_result != "") {',
+                "        SendText(__tem_result)",
+                '        __tem_result := ""',
+                "    }",
+                "}",
+                "",
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "legacy.ahk"
+            ahk_path.write_text(legacy, encoding="utf-8")
+            imported = import_ahk(ahk_path)
+
+        self.assertEqual(
+            imported.expansions[0].replacement,
+            "Status: {AHK_SELECT:state|Pick one|State|Open||Closed}",
+        )
+
     def test_unmarked_form_block_round_trips_every_field(self) -> None:
         # The form gathers all prompts in one dialog, so an unmarked block must
         # be reversed from its fields array: a select's options must survive,

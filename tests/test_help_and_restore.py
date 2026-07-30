@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 # Run Qt without a real display so the GUI tests work headlessly (e.g. in CI).
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
 import app as app_module
 from ahk_manager import (
@@ -289,10 +289,21 @@ class HelpPageTests(unittest.TestCase):
         )
 
         def stub_get_item(
-            parent, title: str, label: str, items: list[str], *args, **kwargs
+            parent: QWidget | None,
+            title: str,
+            label: str,
+            items: list[str],
+            *args: object,
+            **kwargs: object,
         ) -> tuple[str, bool]:
             """Pick the newest backup, which is the one the dialog preselects."""
             return items[0], True
+
+        def always_confirm(_parent: QWidget | None, _title: str, _message: str) -> bool:
+            return True
+
+        def swallow_info(_parent: QWidget | None, _title: str, _message: str) -> None:
+            return None
 
         stub_dialog = type(
             "StubDialog", (), {"getItem": staticmethod(stub_get_item)}
@@ -303,8 +314,8 @@ class HelpPageTests(unittest.TestCase):
             app_module.show_info,
         )
         app_module.QInputDialog = stub_dialog
-        app_module.confirm = lambda *args, **kwargs: True
-        app_module.show_info = lambda *args, **kwargs: None
+        app_module.confirm = always_confirm
+        app_module.show_info = swallow_info
         try:
             self.app.restore_json_backup()
         finally:
