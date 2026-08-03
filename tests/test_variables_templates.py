@@ -13,8 +13,10 @@ from ahk_manager import (
     ExpansionStore,
     TemplateDef,
     VariableDef,
+    parse_replacement_template,
     render_ahk,
     validate_templates,
+    validate_variable,
     validate_variables,
 )
 from app import ExpansionApp
@@ -312,6 +314,59 @@ class VariableTemplateTests(unittest.TestCase):
                 TemplateDef("Follow Up", body="One"),
                 TemplateDef("Follow Up", body="Two"),
             ])
+
+    def test_the_generators_own_names_are_reserved(self) -> None:
+        # A prompted placeholder becomes a local in the generated script. An
+        # input named __tem_result assigned the answer to the accumulator and
+        # then appended the accumulator to itself -- and the script still
+        # loaded, so /validate could never catch it.
+        for name in ("__tem_result", "__tem_vals", "__tem_fields", "__tem_parts"):
+            with self.subTest(name):
+                with self.assertRaisesRegex(ValueError, "reserved"):
+                    validate_variable(VariableDef(name, "text_input"))
+
+    def test_the_reserved_check_ignores_case(self) -> None:
+        # AutoHotkey variable names are case-insensitive, so this is the same
+        # local as __tem_result.
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            validate_variable(VariableDef("__TEM_Result", "text_input"))
+
+    def test_builtin_variable_names_are_reserved(self) -> None:
+        # Worse than a collision: assigning a built-in is a load error, so the
+        # whole script stops rather than one expansion misbehaving.
+        for name in ("A_Now", "a_endchar", "A_ScriptDir"):
+            with self.subTest(name):
+                with self.assertRaisesRegex(ValueError, "reserved"):
+                    validate_variable(VariableDef(name, "text_input"))
+
+    def test_keyword_names_are_rejected(self) -> None:
+        for name in ("if", "Return", "loop", "true", "unset", "global"):
+            with self.subTest(name):
+                with self.assertRaisesRegex(ValueError, "keyword"):
+                    validate_variable(VariableDef(name, "text_input"))
+
+    def test_ordinary_names_are_still_accepted(self) -> None:
+        # The guard must not spread past what was actually shown to break --
+        # "this", "new" and "default" all load fine, and a name merely
+        # containing a reserved word is not a reserved word.
+        for name in ("client_name", "this", "new", "default", "amount", "a", "_temp",
+                     "iffy", "format_a_date", "tem_plate", "returned"):
+            with self.subTest(name):
+                validate_variable(VariableDef(name, "text_input"))
+
+    def test_a_reserved_name_is_rejected_in_an_inline_placeholder(self) -> None:
+        # The same check has to cover placeholders typed straight into the
+        # replacement box, not just saved variable definitions.
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            parse_replacement_template("{AHK_INPUT:__tem_result|Prompt|Title|}")
+
+    def test_a_reserved_name_is_rejected_in_a_select_placeholder(self) -> None:
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            parse_replacement_template("{AHK_SELECT:A_Now|Prompt|Title|one|two}")
+
+    def test_a_reserved_name_is_rejected_in_a_variable_reference(self) -> None:
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            parse_replacement_template("{VAR:__tem_vals}")
 
     def test_literal_only_expansion_still_generates_simple_hotstring(self) -> None:
         store = ExpansionStore(

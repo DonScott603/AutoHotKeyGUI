@@ -411,6 +411,29 @@ TEMPLATE_MARKER_RE = re.compile(r"^\s*;\s*@tem-template:\s*(?P<json>.*)$")
 PLACEHOLDER_RE = re.compile(r"\{(AHK_EXPR|AHK_INPUT|AHK_SELECT|AHK_KEY|AHK_IMAGE|VAR|TPL):([^{}]*)\}")
 PLACEHOLDER_START_RE = re.compile(r"\{(?:AHK_(?:EXPR|INPUT|SELECT|KEY|IMAGE)|VAR|TPL):")
 VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# A prompted placeholder becomes a local in the generated script, so a name the
+# script already uses collides with it. All three groups below are compared
+# case-insensitively, because AutoHotkey variable names are.
+#
+# The generator's own working values. These are the quiet ones: the script
+# still loads, and an input named __tem_result assigns the user's answer to the
+# accumulator and then appends the accumulator to itself.
+GENERATED_LOCAL_PREFIX = "__tem_"
+# AutoHotkey's built-in variables. Assigning one is a load error, so the whole
+# script stops working rather than one expansion misbehaving. The prefix is
+# reserved by AutoHotkey for exactly this reason.
+BUILTIN_VARIABLE_PREFIX = "a_"
+# Keywords that are a syntax error where the generator assigns to them.
+# Confirmed one by one against AutoHotkey v2 /validate rather than transcribed:
+# "this", "new" and "default" pass and are deliberately not listed.
+AHK_KEYWORDS = frozenset(
+    {
+        "and", "break", "case", "catch", "contains", "continue", "else",
+        "false", "finally", "for", "global", "goto", "if", "in", "is", "local",
+        "loop", "not", "or", "return", "static", "super", "switch", "throw",
+        "true", "try", "unset", "while",
+    }
+)
 SUPPORTED_KEYS = {"Tab"}
 HOTSTRING_OPTIONS = "C"
 # Static auto-replace hotstrings add "T" (Text mode) so the replacement is sent
@@ -1876,6 +1899,28 @@ def _validate_unmatched_placeholders(text: str, matched_starts: set[int]) -> Non
 def _validate_variable_name(value: str, placeholder_name: str) -> None:
     if not VARIABLE_RE.match(value):
         raise ValueError(f"{placeholder_name} variable must be a valid AutoHotkey identifier.")
+    # AutoHotkey variable names are case-insensitive, so __TEM_Result names the
+    # same local as __tem_result and has to be caught by the same check.
+    folded = value.lower()
+    # Phrased as "<caller> name" rather than "<caller> variable": the caller
+    # for a saved definition is "Variable", which would otherwise read
+    # "Variable variable".
+    if folded.startswith(GENERATED_LOCAL_PREFIX):
+        raise ValueError(
+            f'{placeholder_name} name "{value}" is reserved: the generated '
+            f'script uses "{GENERATED_LOCAL_PREFIX}" names for its own working '
+            "values."
+        )
+    if folded.startswith(BUILTIN_VARIABLE_PREFIX):
+        raise ValueError(
+            f'{placeholder_name} name "{value}" is reserved: AutoHotkey uses '
+            f'the "{BUILTIN_VARIABLE_PREFIX.upper()}" prefix for its built-in '
+            "variables, which cannot be assigned."
+        )
+    if folded in AHK_KEYWORDS:
+        raise ValueError(
+            f'{placeholder_name} name "{value}" is an AutoHotkey keyword.'
+        )
 
 
 def _source_marker(expansion: Expansion) -> str:
