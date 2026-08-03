@@ -5,7 +5,7 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 
 DEFAULT_JSON = "expansions.json"
@@ -479,13 +479,36 @@ _FORM_SELECT_FIELD_RE = re.compile(
 _FORM_FIELD_COUNT_RE = re.compile(r'Map\("name", ')
 
 
-def _parse_form_fields(line: str) -> dict[str, dict[str, Any]] | None:
+# A form field is one of two shapes discriminated by "kind": only inputs carry a
+# default and only selects carry options. Modelling them as a union rather than
+# one loose dict means reading the wrong key for the branch is a type error, and
+# narrowing on field["kind"] is what makes that check work.
+class FormInputField(TypedDict):
+    name: str
+    kind: Literal["input"]
+    label: str
+    title: str
+    default: str
+
+
+class FormSelectField(TypedDict):
+    name: str
+    kind: Literal["select"]
+    label: str
+    title: str
+    options: list[str]
+
+
+FormField = FormInputField | FormSelectField
+
+
+def _parse_form_fields(line: str) -> dict[str, FormField] | None:
     """Rebuild the field table from a generated ``__tem_fields`` line.
 
     Returns None if any entry fails to match, so a block that is not in the
     generated form is refused rather than silently reconstructed short a field.
     """
-    fields: dict[str, dict[str, Any]] = {}
+    fields: dict[str, FormField] = {}
     for match in _FORM_INPUT_FIELD_RE.finditer(line):
         name, label, title, default = (_unescape_ahk(g) for g in match.groups())
         fields[name] = {
@@ -511,7 +534,7 @@ def _parse_form_fields(line: str) -> dict[str, dict[str, Any]] | None:
     return fields
 
 
-def _form_field_placeholder(field: dict[str, Any]) -> str:
+def _form_field_placeholder(field: FormField) -> str:
     if field["kind"] == "select":
         options = "||".join(field["options"])
         return f"{{AHK_SELECT:{field['name']}|{field['label']}|{field['title']}|{options}}}"
@@ -568,7 +591,7 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
     # Populated when the block gathers its prompts through TEM_Form, in which
     # case the placeholders are rebuilt at the "__tem_result .= <var>" lines
     # rather than at the prompt call itself.
-    form_fields: dict[str, dict[str, Any]] = {}
+    form_fields: dict[str, FormField] = {}
     i = 0
     while i < len(body):
         line = body[i]
@@ -974,14 +997,14 @@ def render_ahk(store: ExpansionStore, theme: str = DEFAULT_THEME) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _form_fields(segments: list[Any]) -> list[dict[str, Any]]:
+def _form_fields(segments: list[str | TemplatePlaceholder]) -> list[FormField]:
     """Collect the prompted placeholders into one ordered list of form fields.
 
     A variable used more than once yields a single field -- the first occurrence
     defines its prompt, default and options -- so the form asks once and every
     occurrence receives the same answer.
     """
-    fields: list[dict[str, Any]] = []
+    fields: list[FormField] = []
     seen: set[str] = set()
     for segment in segments:
         if isinstance(segment, str) or segment.kind not in ("AHK_INPUT", "AHK_SELECT"):
@@ -1015,7 +1038,7 @@ def _form_fields(segments: list[Any]) -> list[dict[str, Any]]:
     return fields
 
 
-def _use_form(fields: list[dict[str, Any]]) -> bool:
+def _use_form(fields: list[FormField]) -> bool:
     """Whether to gather these fields in one form dialog.
 
     An expansion whose only prompt is a single dropdown keeps the lighter
@@ -1028,7 +1051,7 @@ def _use_form(fields: list[dict[str, Any]]) -> bool:
     return not (len(fields) == 1 and fields[0]["kind"] == "select")
 
 
-def _form_fields_literal(fields: list[dict[str, Any]]) -> str:
+def _form_fields_literal(fields: list[FormField]) -> str:
     """Emit the fields array TEM_Form builds its controls from.
 
     The title is emitted even though the dialog titles itself with the trigger
@@ -1038,7 +1061,7 @@ def _form_fields_literal(fields: list[dict[str, Any]]) -> str:
 
     Key order is fixed because the reconstruction regexes match on it.
     """
-    items = []
+    items: list[str] = []
     for field in fields:
         head = (
             f'Map("name", {_ahk_string(field["name"])}, '
@@ -1055,7 +1078,7 @@ def _form_fields_literal(fields: list[dict[str, Any]]) -> str:
     return "[" + ", ".join(items) + "]"
 
 
-def _form_parts_literal(segments: list[Any]) -> str:
+def _form_parts_literal(segments: list[str | TemplatePlaceholder]) -> str:
     """Emit the parts array TEM_Form assembles its live preview from.
 
     Literals become strings and prompted placeholders become {var} references
@@ -1064,7 +1087,7 @@ def _form_parts_literal(segments: list[Any]) -> str:
     than the expression. Key presses and images have no text form, so they show
     as a bracketed chip standing in for the action.
     """
-    items = []
+    items: list[str] = []
     for segment in segments:
         if isinstance(segment, str):
             if segment:
