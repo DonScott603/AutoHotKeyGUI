@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from pathlib import Path
@@ -142,6 +143,83 @@ class LoadValidationTests(unittest.TestCase):
         self.assertEqual(loaded.sections, ["Work"])
         self.assertEqual(loaded.expansions, [])
 
+    def _write(self, payload: dict[str, object]) -> None:
+        self.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_enabled_must_be_a_real_boolean(self) -> None:
+        # The worst of these: bool("false") is True and bool(None) is False, so
+        # either one silently flips an expansion and the next autosave writes
+        # the flipped value back as the truth.
+        for label, value in (("a string", "false"), ("null", None),
+                             ("a number", 1), ("an array", [])):
+            with self.subTest(label):
+                self._write({"expansions": [{"trigger": ";a", "enabled": value}]})
+
+                with self.assertRaises(ValueError):
+                    ExpansionStore.load(self.path)
+
+    def test_a_textual_field_must_be_a_string(self) -> None:
+        # str() accepts anything and produces a Python repr that looks like
+        # content: {"a": 1} becomes the six characters "{'a': 1}".
+        for field, value in (("trigger", {"a": 1}), ("replacement", ["x", "y"]),
+                             ("section", 4), ("notes", True)):
+            with self.subTest(field):
+                self._write({"expansions": [{field: value}]})
+
+                with self.assertRaises(ValueError):
+                    ExpansionStore.load(self.path)
+
+    def test_list_options_must_hold_only_strings(self) -> None:
+        self._write({
+            "variables": [
+                {"name": "v", "type": "list_selection", "list_options": ["a", {"k": 1}]}
+            ]
+        })
+
+        with self.assertRaises(ValueError) as caught:
+            ExpansionStore.load(self.path)
+
+        # The field is the right type and only one of its entries is not, so
+        # the message has to say which.
+        self.assertIn("entry 2", str(caught.exception))
+
+    def test_the_field_message_locates_the_field(self) -> None:
+        self._write({
+            "expansions": [{"trigger": ";a"}, {"trigger": ";b", "enabled": "no"}]
+        })
+
+        with self.assertRaises(ValueError) as caught:
+            ExpansionStore.load(self.path)
+
+        message = str(caught.exception)
+        self.assertIn("expansions.json", message)
+        self.assertIn('"expansions"', message)
+        self.assertIn("entry 2", message)
+        self.assertIn('"enabled"', message)
+        self.assertIn("str", message)
+
+    def test_null_is_still_accepted_for_a_textual_field(self) -> None:
+        # from_dict has always read null as "not set", and a file written that
+        # way is not corrupt.
+        self._write({"expansions": [{"trigger": ";a", "replacement": "x", "notes": None}]})
+
+        self.assertEqual(ExpansionStore.load(self.path).expansions[0].notes, "")
+
+    def test_the_newline_separated_option_form_still_loads(self) -> None:
+        self._write({
+            "variables": [
+                {"name": "v", "type": "list_selection", "list_options": "a\nb"}
+            ]
+        })
+
+        self.assertEqual(ExpansionStore.load(self.path).variables[0].list_options, ["a", "b"])
+
+    def test_an_unknown_field_is_left_alone(self) -> None:
+        # A file written by a later version has to keep loading here.
+        self._write({"expansions": [{"trigger": ";a", "replacement": "x", "later": {"z": 1}}]})
+
+        self.assertEqual(ExpansionStore.load(self.path).expansions[0].trigger, ";a")
+
     def test_a_missing_file_is_not_an_error(self) -> None:
         self.assertEqual(ExpansionStore.load(self.dir / "absent.json").expansions, [])
 
@@ -228,6 +306,7 @@ class StartupRecoveryTests(_RedirectedPaths, unittest.TestCase):
             ("null sections", '{"sections": null}'),
             ("numeric templates", '{"templates": 7}'),
             ("a non-object expansion", '{"expansions": [1]}'),
+            ("a bad field type", '{"expansions": [{"enabled": "false"}]}'),
         ):
             with self.subTest(label):
                 self.json_path.write_text(content, encoding="utf-8")

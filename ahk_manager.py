@@ -191,14 +191,68 @@ def _collection_field(data: dict[str, Any], key: str, filename: str) -> list[Any
     return cast(list[Any], value)
 
 
+# What each record's fields have to be on disk. from_dict coerces whatever it
+# finds -- str() turns an object into its Python repr and bool() turns the
+# string "false" into True -- and the coerced value is what the next autosave
+# writes back, so the original is gone. Checked here instead, before from_dict
+# sees it.
+#
+# "text" tolerates null as a way of writing "not set", which is how from_dict
+# has always read it. "bool" does not: bool(None) is False, so a null enabled
+# would quietly disable an expansion. "text_list" also accepts a single string,
+# the newline-separated form VariableDef.from_dict already splits.
+_FIELD_TYPES = {
+    "expansions": {
+        "section": "text", "trigger": "text", "replacement": "text",
+        "enabled": "bool", "notes": "text",
+    },
+    "variables": {
+        "name": "text", "type": "text", "prompt_text": "text",
+        "default_value": "text", "list_options": "text_list", "notes": "text",
+    },
+    "templates": {
+        "name": "text", "description": "text", "body": "text", "notes": "text",
+    },
+}
+def _field_problem(value: Any, expected: str) -> str | None:
+    """What is wrong with this field, phrased to follow its name, or None."""
+    if expected == "text":
+        if value is None or isinstance(value, str):
+            return None
+        return f"must be a string, found {type(value).__name__}"
+    if expected == "bool":
+        # isinstance(1, bool) is False, so a JSON number is refused here even
+        # though Python would happily treat it as truthy.
+        if isinstance(value, bool):
+            return None
+        return f"must be true or false, found {type(value).__name__}"
+    if value is None or isinstance(value, str):
+        return None
+    if not isinstance(value, list):
+        return f"must be an array of strings, found {type(value).__name__}"
+    for position, item in enumerate(cast(list[Any], value)):
+        if not isinstance(item, str):
+            # Naming the position matters here: the field itself is the right
+            # type and only one of its entries is not.
+            return (
+                f"must be an array of strings, but entry {position + 1} is "
+                f"{type(item).__name__}"
+            )
+    return None
+
+
 def _entry_dicts(data: dict[str, Any], key: str, filename: str) -> list[dict[str, Any]]:
-    """The entries of a record collection, each confirmed to be an object.
+    """The entries of a record collection, each confirmed to be a usable object.
 
     A malformed entry is refused rather than skipped. Skipping keeps the file
     open, but the entry is gone for good as soon as autosave rewrites the file
     in the normalised schema, whereas a load error leaves the original on disk
     and routes to the backup restore on the Help page.
+
+    Fields the schema does not name are left alone, so a file written by a
+    later version still loads here.
     """
+    expected_types = _FIELD_TYPES[key]
     entries: list[dict[str, Any]] = []
     for index, item in enumerate(_collection_field(data, key, filename)):
         if not isinstance(item, dict):
@@ -206,7 +260,17 @@ def _entry_dicts(data: dict[str, Any], key: str, filename: str) -> list[dict[str
                 f'Could not load {filename}: "{key}" entry {index + 1} must be '
                 f"a JSON object, found {type(item).__name__}."
             )
-        entries.append(cast(dict[str, Any], item))
+        entry = cast(dict[str, Any], item)
+        for field, expected in expected_types.items():
+            if field not in entry:
+                continue
+            problem = _field_problem(entry[field], expected)
+            if problem:
+                raise ValueError(
+                    f'Could not load {filename}: "{key}" entry {index + 1} '
+                    f'field "{field}" {problem}.'
+                )
+        entries.append(entry)
     return entries
 
 
