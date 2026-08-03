@@ -1897,6 +1897,23 @@ def validate_templates(templates: list[TemplateDef]) -> None:
 def validate_template(template: TemplateDef) -> None:
     if not template.name:
         raise ValueError("Template name cannot be blank.")
+    # A reference is written {TPL:name}, and the placeholder pattern reads the
+    # name as everything up to the next brace. So a name holding one cannot be
+    # referred to: "Bad}Name" yields "{TPL:Bad}Name}", which parses as a
+    # reference to a template called "Bad" followed by the text "Name}", and
+    # "Bad{Name" does not parse at all. Refused here rather than at generate
+    # time, because a rename cascades the broken reference through every
+    # expansion that used the old name first.
+    #
+    # Only braces. Pipes, colons, quotes, semicolons and the rest were each
+    # checked and round-trip exactly, so there is nothing to gain by refusing
+    # them.
+    if "{" in template.name or "}" in template.name:
+        raise ValueError(
+            f'Template name "{template.name}" cannot contain "{{" or "}}": '
+            "a template is referred to as {TPL:name}, so a name holding a "
+            "brace cannot be written as a reference."
+        )
 
 
 # Which library item a reference points at: a variable or another template.

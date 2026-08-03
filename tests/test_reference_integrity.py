@@ -28,6 +28,7 @@ from ahk_manager import (
     render_ahk,
     rename_in_text,
     rename_references,
+    validate_template,
 )
 from app import ExpansionApp
 
@@ -224,6 +225,58 @@ class RenameCascadeTests(_Window, unittest.TestCase):
             self.rename_variable("client")
 
         self.assertEqual(self.app.replacement_text.toPlainText(), "Dear {VAR:client}, unsaved")
+
+
+class TemplateNameTests(unittest.TestCase):
+    """A name that is accepted must be one that can be referred to.
+
+    A reference is written {TPL:name} and the placeholder pattern reads the
+    name as everything up to the next brace, so a name holding one cannot
+    round-trip. validate_template only rejected blank names, and the rename
+    cascade would write the broken reference into every expansion that used
+    the old name.
+    """
+
+    def test_a_name_holding_a_brace_is_rejected(self) -> None:
+        for name in ("Bad}Name", "Bad{Name", "{Bad}", "}"):
+            with self.subTest(name):
+                with self.assertRaisesRegex(ValueError, "brace"):
+                    validate_template(TemplateDef(name, body="x"))
+
+    def test_names_that_only_look_awkward_are_accepted(self) -> None:
+        # Each of these was checked against the parser and round-trips
+        # exactly, so refusing them would gain nothing.
+        for name in ("Client Follow-Up", "Bad|Name", "Bad:Name", 'Bad"Name',
+                     "Bad;Name", "Signoff — EU", "50% Off"):
+            with self.subTest(name):
+                validate_template(TemplateDef(name, body="x"))
+
+    def test_every_accepted_name_survives_a_cascade_rename(self) -> None:
+        # The property the rule exists for: rename a referenced template to
+        # each accepted name and the library must still generate.
+        for name in ("Renamed", "With Spaces", "Bad|Name", "Bad:Name",
+                     'Bad"Name', "Bad;Name", "50% Off"):
+            with self.subTest(name):
+                store = ExpansionStore(
+                    sections=["Work"],
+                    expansions=[Expansion("Work", ";sig", "A {TPL:Old} B")],
+                    templates=[TemplateDef("Old", body="body text")],
+                )
+
+                validate_template(TemplateDef(name, body="body text"))
+                rename_references(store, "TPL", "Old", name)
+                store.templates[0].name = name
+
+                self.assertEqual(
+                    store.expansions[0].replacement, "A {TPL:%s} B" % name
+                )
+                self.assertIn("A body text B", render_ahk(store))
+
+    def test_a_brace_name_never_reaches_the_cascade(self) -> None:
+        # apply_template validates before renaming, so the store is never left
+        # holding a reference that cannot be parsed.
+        with self.assertRaises(ValueError):
+            validate_template(TemplateDef("Bad}Name", body="x"))
 
 
 class DeleteBlockTests(_Window, unittest.TestCase):
