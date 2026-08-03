@@ -196,6 +196,69 @@ class VariableTemplateTests(unittest.TestCase):
         self.assertIn('client_name := __tem_vals["client_name"]', output)
         self.assertIn('__tem_result .= "`nThank you."', output)
 
+    def test_template_with_a_literal_body_resolves_in_the_generated_script(self) -> None:
+        # The static branch used to emit expansion.replacement, so a template
+        # holding nothing but text was sent as the raw {TPL:Name} reference.
+        # Every other template test here keeps a {VAR:...} in the body, which
+        # takes the dynamic branch and hid this.
+        store = ExpansionStore(
+            sections=["Letters"],
+            expansions=[Expansion("Letters", "sig", "{TPL:Signoff}")],
+            templates=[TemplateDef("Signoff", body="Regards, Don")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn(":sig::Regards, Don", output)
+        self.assertNotIn(":sig::{TPL:Signoff}", output)
+
+    def test_literal_template_resolves_alongside_surrounding_text(self) -> None:
+        store = ExpansionStore(
+            sections=["Letters"],
+            expansions=[Expansion("Letters", "sig", "Thanks. {TPL:Signoff}!")],
+            templates=[TemplateDef("Signoff", body="Regards, Don")],
+        )
+
+        self.assertIn(":sig::Thanks. Regards, Don!", render_ahk(store))
+
+    def test_nested_literal_templates_resolve(self) -> None:
+        store = ExpansionStore(
+            sections=["Letters"],
+            expansions=[Expansion("Letters", "sig", "{TPL:Outer}")],
+            templates=[
+                TemplateDef("Signoff", body="Regards, Don"),
+                TemplateDef("Outer", body="Well? {TPL:Signoff}"),
+            ],
+        )
+
+        self.assertIn(":sig::Well? Regards, Don", render_ahk(store))
+
+    def test_the_source_marker_keeps_the_unresolved_reference(self) -> None:
+        # Import reads the marker in preference to the hotstring, so resolving
+        # the emitted text must not flatten the template out of the round trip.
+        store = ExpansionStore(
+            sections=["Letters"],
+            expansions=[Expansion("Letters", "sig", "{TPL:Signoff}")],
+            templates=[TemplateDef("Signoff", body="Regards, Don")],
+        )
+
+        self.assertIn('"replacement":"{TPL:Signoff}"', render_ahk(store))
+
+    def test_a_template_that_resolves_to_nothing_is_skipped(self) -> None:
+        # "::" with nothing after it is read as an execute hotstring and the
+        # script fails to load, which the empty-replacement guard at the top of
+        # render_expansion cannot see through a template.
+        store = ExpansionStore(
+            sections=["Letters"],
+            expansions=[Expansion("Letters", "sig", "{TPL:Empty}")],
+            templates=[TemplateDef("Empty", body="")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertNotIn(":sig::\n", output)
+        self.assertIn('; Skipped "sig"', output)
+
     def test_circular_template_reference_is_rejected(self) -> None:
         store = ExpansionStore(
             sections=["Letters"],

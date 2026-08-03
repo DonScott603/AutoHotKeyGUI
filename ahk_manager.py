@@ -1212,14 +1212,37 @@ def render_expansion(
     )
 
     if not dynamic:
-        if use_paste:
+        # Every segment is literal on this branch, but expansion.replacement is
+        # still the unresolved source. Emitting it verbatim sends the raw
+        # {TPL:Name} text for any template whose body holds no placeholder of
+        # its own -- so templates appeared to work only while something in them
+        # stayed dynamic. The source marker keeps the unresolved text for
+        # import; the hotstring gets the resolved text.
+        resolved = "".join(cast(str, segment) for segment in segments)
+        if resolved == "":
+            # As above: "::" with nothing after it is read as an execute
+            # hotstring and fails to load. Reachable through a template whose
+            # body is empty, which the check at the top of the function cannot
+            # see.
+            return RenderedExpansion(
+                [f'; Skipped "{expansion.trigger}": replacement resolves to nothing.']
+            )
+        # A static hotstring's replacement runs to the end of its own line, so
+        # a line break cannot survive there -- _single_line_replacement folds
+        # each one to a space. Replacement text is written in a multiline box,
+        # so that silently rewrote anything typed across two lines, and only
+        # when the text happened to hold no placeholder: the same paragraph
+        # kept its breaks as soon as a variable was added to it. Text with
+        # breaks takes the block form instead, where _ahk_string encodes them.
+        if use_paste or _is_multiline(resolved):
+            send = "TEM_Paste" if use_paste else "SendText"
             lines = [f":{HOTSTRING_OPTIONS}:{expansion.trigger}::", "{"]
-            lines.append(f"    TEM_Paste({_ahk_string(expansion.replacement)})")
+            lines.append(f"    {send}({_ahk_string(resolved)})")
             lines.extend(_end_char_lines())
             lines.append("}")
         else:
             lines = [
-                f":{STATIC_HOTSTRING_OPTIONS}:{expansion.trigger}::{_single_line_replacement(expansion.replacement)}"
+                f":{STATIC_HOTSTRING_OPTIONS}:{expansion.trigger}::{_single_line_replacement(resolved)}"
             ]
         if expansion.notes:
             lines.append(f"; Notes: {expansion.notes}")
@@ -2084,7 +2107,16 @@ def _end_char_lines() -> list[str]:
     ]
 
 
+def _is_multiline(text: str) -> bool:
+    return "\n" in text or "\r" in text
+
+
 def _single_line_replacement(text: str) -> str:
+    # render_expansion routes text with line breaks to the block form, so the
+    # collapse below should no longer have anything to do. It stays as a guard
+    # rather than an assertion because the failure it prevents is the worse
+    # one: a raw newline here would end the hotstring and leave the rest of the
+    # replacement sitting in code position, where AutoHotkey tries to run it.
     collapsed = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
     # A static replacement runs to the end of the line, where AHK still reads a
     # backtick as its escape character and opens a comment at a semicolon that

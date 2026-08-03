@@ -7,6 +7,7 @@ from ahk_manager import (
     AHK_THEME_COLORS,
     Expansion,
     ExpansionStore,
+    TemplateDef,
     TemplatePlaceholder,
     generate_ahk,
     parse_replacement_template,
@@ -25,6 +26,52 @@ class PlaceholderGenerationTests(unittest.TestCase):
 
         self.assertIn(":CT:brb::Be right back", output)
         self.assertNotIn("SendText(__tem_result)", output)
+
+    def _rendered(self, replacement: str, templates: list[TemplateDef] | None = None) -> str:
+        return render_ahk(
+            ExpansionStore(
+                sections=["Common"],
+                expansions=[Expansion("Common", "sig", replacement)],
+                templates=templates or [],
+            )
+        )
+
+    def test_a_line_break_in_literal_text_survives(self) -> None:
+        # A static hotstring ends at its own line break, so this text used to be
+        # folded to "first second" with nothing said about it.
+        output = self._rendered("first\nsecond")
+
+        self.assertIn('SendText("first`nsecond")', output)
+        self.assertNotIn("first second", output)
+
+    def test_a_crlf_line_break_survives(self) -> None:
+        self.assertIn('SendText("first`r`nsecond")', self._rendered("first\r\nsecond"))
+
+    def test_a_template_supplied_line_break_survives(self) -> None:
+        output = self._rendered("{TPL:Signoff}", [TemplateDef("Signoff", body="Regards,\nDon")])
+
+        self.assertIn('SendText("Regards,`nDon")', output)
+
+    def test_multiline_text_needing_paste_still_pastes(self) -> None:
+        # The dash rule picks the delivery method; the line break only decides
+        # that this cannot be a static hotstring.
+        output = self._rendered("A -- B\nnext")
+
+        self.assertIn('TEM_Paste("A -- B`nnext")', output)
+        self.assertNotIn("SendText(\"A", output)
+
+    def test_single_line_text_is_still_a_static_hotstring(self) -> None:
+        # The block form costs a helper and a code path, so text that does not
+        # need it must not get it.
+        output = self._rendered("Regards, Don")
+
+        self.assertIn(":CT:sig::Regards, Don", output)
+        self.assertNotIn("SendText", output)
+
+    def test_the_source_marker_keeps_the_original_line_breaks(self) -> None:
+        # The marker is what import reads back, so the stored replacement has
+        # to survive the trip unchanged.
+        self.assertIn(r'"replacement":"first\nsecond"', self._rendered("first\nsecond"))
 
     def test_empty_replacement_is_skipped_not_broken(self) -> None:
         # A ":opts:trigger::" line with nothing after "::" makes AutoHotkey expect
