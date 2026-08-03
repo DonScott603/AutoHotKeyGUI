@@ -14,6 +14,51 @@ from ahk_manager import (
 )
 
 
+class NotesRoundTripTests(unittest.TestCase):
+    """A note must not be able to forge the structures import looks for.
+
+    Notes are free text from a multiline box and are written into the script as
+    comments, which import reads past. A note line that looks like a hotstring
+    or a section header used to come back as one.
+    """
+
+    def _round_trip(self, notes: str) -> ExpansionStore:
+        with TemporaryDirectory() as temp_dir:
+            script = Path(temp_dir) / "generated.ahk"
+            generate_ahk(
+                ExpansionStore(
+                    sections=["General"],
+                    expansions=[Expansion("General", ";sig", "x", True, notes)],
+                ),
+                script,
+                backup=False,
+            )
+            return import_ahk(script)
+
+    def test_a_multiline_note_survives_unchanged(self) -> None:
+        for label, notes in (("LF", "one\ntwo"), ("CRLF", "one\r\ntwo")):
+            with self.subTest(label):
+                imported = self._round_trip(notes)
+
+                self.assertEqual(len(imported.expansions), 1)
+                self.assertEqual(imported.expansions[0].notes, notes)
+
+    def test_a_note_line_shaped_like_a_hotstring_stays_a_note(self) -> None:
+        imported = self._round_trip("one\n:CT:;evil::pwned")
+
+        self.assertEqual([e.trigger for e in imported.expansions], [";sig"])
+
+    def test_a_note_line_shaped_like_a_section_header_stays_a_note(self) -> None:
+        imported = self._round_trip("one\n=== Injected ===")
+
+        self.assertEqual(imported.sections, ["General"])
+
+    def test_a_note_line_shaped_like_a_marker_stays_a_note(self) -> None:
+        imported = self._round_trip('one\n@tem-var: {"name":"zzz","type":"text_input"}')
+
+        self.assertEqual(imported.variables, [])
+
+
 class ImportMergeTests(unittest.TestCase):
     def test_imported_sections_and_expansions_are_merged(self) -> None:
         target = ExpansionStore(

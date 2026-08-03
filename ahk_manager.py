@@ -1245,7 +1245,7 @@ def render_expansion(
                 f":{STATIC_HOTSTRING_OPTIONS}:{expansion.trigger}::{_single_line_replacement(resolved)}"
             ]
         if expansion.notes:
-            lines.append(f"; Notes: {expansion.notes}")
+            lines.extend(_notes_lines(expansion.notes))
         body = [_source_marker(expansion), *_maybe_disable_lines(lines, expansion.enabled)]
         return RenderedExpansion(body, needs_paste_helper=use_paste)
 
@@ -1327,7 +1327,7 @@ def render_expansion(
         lines.extend(_end_char_lines())
     lines.append("}")
     if expansion.notes:
-        lines.append(f"; Notes: {expansion.notes}")
+        lines.extend(_notes_lines(expansion.notes))
     body = [_source_marker(expansion), *_maybe_disable_lines(lines, expansion.enabled)]
     return RenderedExpansion(
         body,
@@ -1818,6 +1818,37 @@ def _template_marker(template: TemplateDef) -> str:
     return "; @tem-template: " + json.dumps(
         template.to_dict(), ensure_ascii=False, separators=(",", ":")
     )
+
+
+def _notes_lines(notes: str) -> list[str]:
+    """The human-readable notes comment, one comment marker per physical line.
+
+    Notes are written in a multiline box, so the value arrives with the line
+    breaks the user typed. Emitted as a single "; Notes: <value>" string, only
+    the first physical line is commented -- every line after it is written to
+    the script at column zero, in code position, where AutoHotkey parses it. A
+    stray brace or an unbalanced bracket fails the load outright; a line that
+    happens to be valid syntax runs, and a line that happens to look like a
+    hotstring silently defines a second one.
+
+    Returning a line per element rather than one embedded-newline string also
+    covers the disabled case, since _maybe_disable_lines prefixes each element
+    and cannot see inside one.
+
+    The label repeats on every line instead of indenting the continuations to
+    align under it, which would read better but is not safe: this file is also
+    parsed by import_ahk, and a comment marker followed by only whitespace is
+    exactly the prefix HOTSTRING_RE accepts for a disabled hotstring and
+    SECTION_RE for a section header. An aligned note line beginning ":CT:..."
+    would come back as a real (disabled) expansion and one reading "=== x ==="
+    would open a new section. "Notes: " is non-blank, so neither pattern can
+    reach past it.
+
+    The source marker above carries the notes as JSON on a single line and is
+    what import reads back, so this comment exists purely for someone reading
+    the generated file.
+    """
+    return [f"; Notes: {line}" for line in notes.splitlines() or [""]]
 
 
 def _maybe_disable_lines(lines: list[str], enabled: bool) -> list[str]:

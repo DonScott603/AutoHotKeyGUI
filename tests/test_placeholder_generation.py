@@ -73,6 +73,69 @@ class PlaceholderGenerationTests(unittest.TestCase):
         # to survive the trip unchanged.
         self.assertIn(r'"replacement":"first\nsecond"', self._rendered("first\nsecond"))
 
+    def _with_notes(self, notes: str, enabled: bool = True, replacement: str = "x") -> str:
+        return render_ahk(
+            ExpansionStore(
+                sections=["Common"],
+                expansions=[Expansion("Common", "sig", replacement, enabled, notes)],
+            )
+        )
+
+    def test_every_line_of_a_multiline_note_is_commented(self) -> None:
+        # Only the first line used to get a marker; the rest were written at
+        # column zero, where AutoHotkey parses them as code.
+        output = self._with_notes("Used for clients\nUpdated July 2026")
+
+        self.assertIn("; Notes: Used for clients", output)
+        self.assertIn("; Notes: Updated July 2026", output)
+        for line in output.splitlines():
+            if "Updated July 2026" in line:
+                self.assertTrue(line.startswith(";"), line)
+
+    def test_a_note_cannot_introduce_a_statement(self) -> None:
+        output = self._with_notes('one\nMsgBox("unexpected")')
+
+        self.assertNotIn('\nMsgBox("unexpected")', output)
+
+    def test_a_note_cannot_introduce_a_second_hotstring(self) -> None:
+        # This one is the quiet failure: it is valid AutoHotkey, so the script
+        # loads and the extra trigger is simply live.
+        output = self._with_notes("one\n:CT:;evil::pwned")
+
+        self.assertNotIn("\n:CT:;evil::pwned", output)
+
+    def test_a_disabled_expansion_comments_every_note_line_too(self) -> None:
+        # _maybe_disable_lines prefixes each list element and cannot see inside
+        # one, so an embedded newline escaped it as well.
+        output = self._with_notes("one\nMsgBox(1)", enabled=False)
+
+        for line in output.splitlines():
+            if "MsgBox(1)" in line:
+                self.assertTrue(line.startswith(";"), line)
+
+    def test_notes_on_a_dynamic_expansion_are_commented_per_line(self) -> None:
+        output = self._with_notes("one\nMsgBox(1)", replacement="hi {AHK_INPUT:n|Name|T|}")
+
+        self.assertIn("; Notes: MsgBox(1)", output)
+        self.assertNotIn("\nMsgBox(1)", output)
+
+    def test_the_label_repeats_rather_than_aligning(self) -> None:
+        # A comment marker followed by only whitespace is the prefix
+        # HOTSTRING_RE reads as a disabled hotstring, so aligned continuations
+        # would be safe from AutoHotkey but not from our own importer.
+        output = self._with_notes("one\ntwo")
+
+        self.assertNotIn(";        two", output)
+        self.assertEqual(output.count("; Notes: "), 2)
+
+    def test_a_single_line_note_is_unchanged(self) -> None:
+        self.assertIn("; Notes: just one", self._with_notes("just one"))
+
+    def test_the_source_marker_still_carries_the_whole_note(self) -> None:
+        # The marker is what import reads back, so the line breaks have to
+        # survive there even though the comment splits them.
+        self.assertIn(r'"notes":"one\ntwo"', self._with_notes("one\ntwo"))
+
     def test_empty_replacement_is_skipped_not_broken(self) -> None:
         # A ":opts:trigger::" line with nothing after "::" makes AutoHotkey expect
         # a code block and error. An empty replacement must instead be skipped.
