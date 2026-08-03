@@ -156,13 +156,11 @@ class LoadValidationTests(unittest.TestCase):
         self.assertEqual(loaded.expansions[0].trigger, ";a")
 
 
-class StartupRecoveryTests(unittest.TestCase):
-    """A clobbered store must not stop the window opening.
+class _RedirectedPaths:
+    """Point every path the window touches at a temporary folder.
 
-    The Help page restores a backup, which is the fix for a bad
-    expansions.json -- and it is unreachable if the window never opens. The exe
-    is built windowed, so an exception here surfaces as a crash box rather than
-    anything the user can act on.
+    A mixin rather than a base test case: inheriting one test class from
+    another would re-run its tests under the subclass's name.
     """
 
     def setUp(self) -> None:
@@ -191,6 +189,16 @@ class StartupRecoveryTests(unittest.TestCase):
         ) = self._saved_paths
         self._temp.cleanup()
 
+
+class StartupRecoveryTests(_RedirectedPaths, unittest.TestCase):
+    """A clobbered store must not stop the window opening.
+
+    The Help page restores a backup, which is the fix for a bad
+    expansions.json -- and it is unreachable if the window never opens. The exe
+    is built windowed, so an exception here surfaces as a crash box rather than
+    anything the user can act on.
+    """
+
     def test_the_window_opens_on_a_store_that_is_not_an_object(self) -> None:
         self.json_path.write_text("null", encoding="utf-8")
 
@@ -218,6 +226,86 @@ class StartupRecoveryTests(unittest.TestCase):
 
                 self.assertTrue(reported.called, "the user was told nothing")
                 self.assertEqual(window.store.expansions, [])
+
+
+# Malformed JSON that plainly still holds a library: the point of refusing to
+# overwrite it is that a human, or a later version, could get this back.
+RECOVERABLE = '{"expansions": [{"trigger": ";a", "replacement": "important"}]'
+
+
+class UnreadableStoreWriteTests(_RedirectedPaths, unittest.TestCase):
+    """A store that failed to load must not be overwritten unasked.
+
+    Autosave writes on every edit, so the empty store standing in for an
+    unreadable file would replace it at the first keystroke. _backup_once
+    copies the file aside, but only once a session and into a folder that
+    rotates, so that alone is not enough.
+    """
+
+    def _window(self) -> ExpansionApp:
+        self.json_path.write_text(RECOVERABLE, encoding="utf-8")
+        with mock.patch.object(app_module, "show_error"):
+            window = ExpansionApp()
+        self.addCleanup(window.close)
+        return window
+
+    def test_declining_leaves_the_file_untouched(self) -> None:
+        window = self._window()
+
+        with mock.patch.object(app_module, "confirm", return_value=False) as asked:
+            saved = window.persist()
+
+        self.assertFalse(saved)
+        self.assertTrue(asked.called, "the file was replaced without asking")
+        self.assertEqual(self.json_path.read_text(encoding="utf-8"), RECOVERABLE)
+
+    def test_confirming_writes_and_backs_the_original_up(self) -> None:
+        window = self._window()
+
+        with mock.patch.object(app_module, "confirm", return_value=True):
+            self.assertTrue(window.persist())
+
+        self.assertNotEqual(self.json_path.read_text(encoding="utf-8"), RECOVERABLE)
+        backups = list((Path(self._temp.name) / "backups").glob("*"))
+        self.assertTrue(
+            any(b.read_text(encoding="utf-8") == RECOVERABLE for b in backups),
+            f"the unreadable file was not kept: {[b.name for b in backups]}",
+        )
+
+    def test_the_question_is_asked_once(self) -> None:
+        # Every edit autosaves, so a prompt that repeated would be unusable.
+        window = self._window()
+
+        with mock.patch.object(app_module, "confirm", return_value=True) as asked:
+            window.persist()
+            window.persist()
+
+        self.assertEqual(asked.call_count, 1)
+
+    def test_generate_and_run_does_not_bypass_the_question(self) -> None:
+        # This path called store.save directly, so it wrote over the file
+        # without the backup persist takes.
+        window = self._window()
+
+        with mock.patch.object(app_module, "confirm", return_value=False) as asked:
+            with mock.patch.object(app_module, "generate_ahk") as generated:
+                window.generate_and_run_ahk()
+
+        self.assertTrue(asked.called)
+        self.assertFalse(generated.called, "the script was written anyway")
+        self.assertEqual(self.json_path.read_text(encoding="utf-8"), RECOVERABLE)
+
+    def test_a_store_that_loaded_is_never_questioned(self) -> None:
+        ExpansionStore(
+            sections=["Work"], expansions=[Expansion("Work", ";a", "first")]
+        ).save(self.json_path)
+        window = ExpansionApp()
+        self.addCleanup(window.close)
+
+        with mock.patch.object(app_module, "confirm") as asked:
+            self.assertTrue(window.persist())
+
+        self.assertFalse(asked.called)
 
 
 if __name__ == "__main__":

@@ -860,6 +860,9 @@ class ExpansionApp(QMainWindow):
         # horizontal scrollbar (even when a vertical scrollbar is present).
         self.resize(1448, 720)
 
+        # Set by _load_store, and read by persist before it writes over the
+        # file it could not read. Declared first because _load_store runs here.
+        self._store_unreadable = False
         self.store = self._load_store()
         self.settings = self._load_settings()
         self.ahk_process: subprocess.Popen | None = None
@@ -894,11 +897,22 @@ class ExpansionApp(QMainWindow):
 
     # -- loading -----------------------------------------------------------
     def _load_store(self) -> ExpansionStore:
+        """The library on disk, or an empty one if the file cannot be read.
+
+        Opening anyway is deliberate -- restoring a backup is done from the
+        Help page, which is unreachable if the window never opens. But the
+        empty store that stands in is not the user's library, so the failure is
+        recorded: see persist, which will not write over the unread file
+        without being told to.
+        """
         try:
-            return ExpansionStore.load(JSON_PATH)
+            store = ExpansionStore.load(JSON_PATH)
         except ValueError as exc:
             show_error(None, "Load error", str(exc))
+            self._store_unreadable = True
             return ExpansionStore()
+        self._store_unreadable = False
+        return store
 
     def _load_settings(self) -> AppSettings:
         try:
@@ -2225,6 +2239,49 @@ class ExpansionApp(QMainWindow):
         ):
             self.run_ahk()
 
+    def _may_replace_unreadable_store(self) -> bool:
+        """Whether to write over a store file that failed to load.
+
+        Autosave means the first edit after a failed load would silently
+        replace a recoverable file with whatever is in the window -- usually
+        the empty store that stood in for it. _backup_once does copy the file
+        aside first, but only once per session and into a folder that rotates,
+        so a few sessions of ordinary use can retire the last good copy.
+
+        Answering yes clears the flag, so the question is asked once and
+        saving is normal from then on. Answering no leaves the file untouched
+        and the in-memory change unsaved -- which persist already reports --
+        and leaves the flag set, so the next edit asks again. That is the
+        intended shape: the alternative is to stop saving silently, which is
+        the failure this whole path exists to avoid.
+        """
+        if not self._store_unreadable:
+            return True
+        count = len(self.store.expansions)
+        # Naming the count is the point of the warning: the usual case is the
+        # empty store that stood in for the file, and "an empty library" says
+        # that far more plainly than "0 expansions".
+        replacing = (
+            "an empty library"
+            if count == 0
+            else f"the {count} expansion currently in the window"
+            if count == 1
+            else f"the {count} expansions currently in the window"
+        )
+        if not confirm(
+            self,
+            "Replace unreadable library",
+            f"{JSON_PATH.name} could not be read when this window opened, so "
+            "it was not loaded.\n\n"
+            f"Saving now replaces that file with {replacing}. If the file "
+            "holds a library worth keeping, restore a backup from the Help "
+            "page instead.\n\n"
+            "Replace it? The current file is backed up first.",
+        ):
+            return False
+        self._store_unreadable = False
+        return True
+
     def persist(self) -> bool:
         """Write the store to disk immediately after a change to it.
 
@@ -2233,6 +2290,9 @@ class ExpansionApp(QMainWindow):
         having already reported the failure, so callers that want to say more
         about it can; the in-memory change stands either way.
         """
+        if not self._may_replace_unreadable_store():
+            self.set_status(f"{JSON_PATH.name} left unchanged; nothing was saved.")
+            return False
         self._backup_once()
         try:
             self.store.save(JSON_PATH)
@@ -2243,9 +2303,16 @@ class ExpansionApp(QMainWindow):
 
     def generate_and_run_ahk(self) -> None:
         ahk_path = self.current_ahk_path()
+        self.save_settings()
+        # Through persist rather than store.save: this is the one write that
+        # did not take a backup first, and it is reachable straight from a
+        # failed load, so it was the shortest path from a recoverable file to
+        # an empty one. A refusal here stops the run too -- generating the
+        # script from a library the user declined to save would overwrite the
+        # script as well.
+        if not self.persist():
+            return
         try:
-            self.save_settings()
-            self.store.save(JSON_PATH)
             backup_path = generate_ahk(
                 self.store,
                 ahk_path,
