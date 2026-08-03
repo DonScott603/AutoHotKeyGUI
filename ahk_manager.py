@@ -408,6 +408,11 @@ SOURCE_MARKER_RE = re.compile(r"^\s*;\s*@tem:\s*(?P<json>.*)$")
 # carry the definitions verbatim so they survive a generate -> import round trip.
 VAR_MARKER_RE = re.compile(r"^\s*;\s*@tem-var:\s*(?P<json>.*)$")
 TEMPLATE_MARKER_RE = re.compile(r"^\s*;\s*@tem-template:\s*(?P<json>.*)$")
+# An expansion that generates no hotstring at all has nothing for the source
+# marker above to attach to, so it carries its whole record instead -- section
+# and trigger included -- the same way the two markers above do. Without it a
+# skipped expansion was simply absent from a re-import and quietly lost.
+SKIPPED_MARKER_RE = re.compile(r"^\s*;\s*@tem-skipped:\s*(?P<json>.*)$")
 PLACEHOLDER_RE = re.compile(r"\{(AHK_EXPR|AHK_INPUT|AHK_SELECT|AHK_KEY|AHK_IMAGE|VAR|TPL):([^{}]*)\}")
 PLACEHOLDER_START_RE = re.compile(r"\{(?:AHK_(?:EXPR|INPUT|SELECT|KEY|IMAGE)|VAR|TPL):")
 VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -456,6 +461,22 @@ def import_ahk(path: Path) -> ExpansionStore:
                 data = None
             if isinstance(data, dict):
                 templates.append(TemplateDef.from_dict(data))
+            continue
+
+        skipped_match = SKIPPED_MARKER_RE.match(line)
+        if skipped_match:
+            try:
+                data = json.loads(skipped_match.group("json"))
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict):
+                skipped = Expansion.from_dict(data, current_section)
+                if skipped.trigger:
+                    # The record carries its own section, so it lands where it
+                    # started even though no "; === ... ===" header precedes it.
+                    if skipped.section not in sections:
+                        sections.append(skipped.section)
+                    expansions.append(skipped)
             continue
 
         marker_match = SOURCE_MARKER_RE.match(line)
@@ -1212,7 +1233,7 @@ def render_expansion(
         # "::", which AutoHotkey reads as the start of an execute hotstring and
         # then errors ("hotstring is missing its opening brace"). Emit an inert
         # comment instead so the generated script always runs.
-        return RenderedExpansion([f'; Skipped "{expansion.trigger}": empty replacement.'])
+        return _skipped(expansion, "empty replacement.")
 
     segments = resolve_template_segments(
         parse_replacement_template(expansion.replacement),
@@ -1241,10 +1262,9 @@ def render_expansion(
             # As above: "::" with nothing after it is read as an execute
             # hotstring and fails to load. Reachable through a template whose
             # body is empty, which the check at the top of the function cannot
-            # see.
-            return RenderedExpansion(
-                [f'; Skipped "{expansion.trigger}": replacement resolves to nothing.']
-            )
+            # see -- and an empty body is easy to arrive at, since a template
+            # can be created before it is written.
+            return _skipped(expansion, "replacement resolves to nothing.")
         # A static hotstring's replacement runs to the end of its own line, so
         # a line break cannot survive there -- _single_line_replacement folds
         # each one to a space. Replacement text is written in a multiline box,
@@ -1911,6 +1931,34 @@ def _validate_variable_name(value: str, placeholder_name: str) -> None:
     # just be refusing valid input.
     if not VARIABLE_RE.match(value):
         raise ValueError(f"{placeholder_name} variable must be a valid AutoHotkey identifier.")
+
+
+def _skipped_marker(expansion: Expansion) -> str:
+    """The whole record for an expansion that generates no hotstring.
+
+    _source_marker carries only what the hotstring line cannot -- the trigger,
+    the enabled state and the section come from the line and the header. A
+    skipped expansion emits neither, so nothing tied the marker to an
+    expansion and a re-import dropped it. This carries the full record, as the
+    variable and template markers already do.
+    """
+    return "; @tem-skipped: " + json.dumps(
+        expansion.to_dict(), ensure_ascii=False, separators=(",", ":")
+    )
+
+
+def _skipped(expansion: Expansion, reason: str) -> RenderedExpansion:
+    """An expansion that emits no hotstring, plus the record to get it back.
+
+    The comment is for whoever reads the generated file; the marker above it is
+    what import reads.
+    """
+    return RenderedExpansion(
+        [
+            _skipped_marker(expansion),
+            f'; Skipped "{expansion.trigger}": {reason}',
+        ]
+    )
 
 
 def _source_marker(expansion: Expansion) -> str:

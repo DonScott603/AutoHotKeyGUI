@@ -409,6 +409,89 @@ class ImportMergeTests(unittest.TestCase):
             imported.expansions[0].replacement, "Dear {AHK_INPUT:who|Name|Name|}"
         )
 
+    def _round_trip(self, store: ExpansionStore) -> ExpansionStore:
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "gen.ahk"
+            generate_ahk(store, ahk_path, backup=False)
+            return import_ahk(ahk_path)
+
+    def _empty_template_store(self) -> ExpansionStore:
+        # A template created but not yet written is an easy state to reach, and
+        # an expansion referencing it generates no hotstring at all.
+        return ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion("Work", ";empty", "{TPL:Empty}", True, "keep me"),
+                Expansion("Work", ";next", "works"),
+            ],
+            templates=[TemplateDef("Empty", body="")],
+        )
+
+    def test_an_expansion_that_generates_nothing_still_round_trips(self) -> None:
+        # It used to emit only a comment, so there was nothing for import to
+        # find and the expansion was silently gone.
+        imported = self._round_trip(self._empty_template_store())
+
+        self.assertEqual([e.trigger for e in imported.expansions], [";empty", ";next"])
+
+    def test_the_skipped_record_keeps_everything_about_it(self) -> None:
+        imported = self._round_trip(self._empty_template_store())
+        skipped = imported.expansions[0]
+
+        self.assertEqual(skipped.replacement, "{TPL:Empty}")
+        self.assertEqual(skipped.section, "Work")
+        self.assertEqual(skipped.notes, "keep me")
+        self.assertTrue(skipped.enabled)
+
+    def test_a_disabled_skipped_expansion_stays_disabled(self) -> None:
+        # There is no hotstring line for the enabled state to be read off, so
+        # the record has to carry it.
+        store = self._empty_template_store()
+        store.expansions[0].enabled = False
+
+        self.assertFalse(self._round_trip(store).expansions[0].enabled)
+
+    def test_a_blank_replacement_round_trips(self) -> None:
+        store = ExpansionStore(
+            sections=["Work"], expansions=[Expansion("Work", ";blank", "")]
+        )
+
+        imported = self._round_trip(store)
+
+        self.assertEqual([e.trigger for e in imported.expansions], [";blank"])
+        self.assertEqual(imported.expansions[0].replacement, "")
+
+    def test_a_nested_template_resolving_to_nothing_round_trips(self) -> None:
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";n", "{TPL:Outer}")],
+            templates=[
+                TemplateDef("Empty", body=""),
+                TemplateDef("Outer", body="{TPL:Empty}"),
+            ],
+        )
+
+        imported = self._round_trip(store)
+
+        self.assertEqual(imported.expansions[0].replacement, "{TPL:Outer}")
+
+    def test_a_skipped_expansion_keeps_its_own_section(self) -> None:
+        # No "; === ... ===" header precedes the record, so the section has to
+        # come from the record itself.
+        store = ExpansionStore(
+            sections=["First", "Second"],
+            expansions=[
+                Expansion("First", ";a", "text"),
+                Expansion("Second", ";empty", "{TPL:Empty}"),
+            ],
+            templates=[TemplateDef("Empty", body="")],
+        )
+
+        imported = self._round_trip(store)
+        by_trigger = {e.trigger: e.section for e in imported.expansions}
+
+        self.assertEqual(by_trigger[";empty"], "Second")
+
     def test_legacy_three_argument_select_still_imports(self) -> None:
         # Scripts generated before the window title was added have no fourth
         # argument, and must keep importing with their options intact.
