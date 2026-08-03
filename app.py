@@ -54,12 +54,14 @@ from ahk_manager import (
     AppSettings,
     Expansion,
     ExpansionStore,
+    ReferenceKind,
     TemplateDef,
     VariableDef,
     VARIABLE_TYPES,
     backup_file,
     backup_timestamp,
     count_import_conflicts,
+    find_references,
     generate_ahk,
     import_ahk,
     list_backups,
@@ -67,6 +69,8 @@ from ahk_manager import (
     migrate_backups,
     restore_backup,
     parse_replacement_template,
+    rename_in_text,
+    rename_references,
     resolve_expansion_preview,
     resolve_template_preview,
     resolve_template_segments,
@@ -540,6 +544,23 @@ def show_info(parent: QWidget | None, title: str, message: str) -> None:
 
 def show_warning(parent: QWidget | None, title: str, message: str) -> None:
     QMessageBox.warning(parent, title, message)
+
+
+def item_count(count: int) -> str:
+    """"1 item" or "N items", to be read as "... is used by <this>"."""
+    return "1 item" if count == 1 else f"{count} items"
+
+
+def reference_listing(users: list[str], limit: int = 12) -> str:
+    """The affected items as dialog text, capped so a long list still fits.
+
+    A library can reference one variable from dozens of expansions, and a
+    message box that tall is unreadable and can run off the screen.
+    """
+    shown = [f"  - {user}" for user in users[:limit]]
+    if len(users) > limit:
+        shown.append(f"  - ... and {len(users) - limit} more")
+    return "\n".join(shown)
 
 
 def confirm(parent: QWidget | None, title: str, message: str) -> bool:
@@ -1611,6 +1632,43 @@ class ExpansionApp(QMainWindow):
         parse_replacement_template(template.body)
         return template
 
+    def _cascade_rename(
+        self, kind: ReferenceKind, old: str, new: str, label: str
+    ) -> bool:
+        """Ask before repointing the library at a renamed item, then do it.
+
+        A rename used to change the definition and nothing else, so every
+        {VAR:old} still in the library was left undefined. That state autosaved
+        without complaint and only surfaced at Generate & Run, by which point
+        the rename that caused it was several actions ago.
+
+        Returns False if the user declined, in which case the caller must
+        abandon the rename entirely rather than apply half of it.
+        """
+        users = find_references(self.store, kind, old)
+        if not users:
+            return True
+        if not confirm(
+            self,
+            f"Rename {label}",
+            f'"{old}" is used by {item_count(len(users))}:\n\n'
+            f"{reference_listing(users)}\n\n"
+            f'Update them to use "{new}"?\n\n'
+            "Choosing No leaves the rename unapplied, because renaming "
+            "without updating them would stop the script generating.",
+        ):
+            return False
+        rename_references(self.store, kind, old, new)
+        # The editors hold their own copy of the text, which may include edits
+        # not applied yet. Renaming in place keeps those rather than reloading
+        # over them from the store.
+        for box in (self.replacement_text, self.template_body_text):
+            text = box.toPlainText()
+            updated = rename_in_text(text, kind, old, new)
+            if updated != text:
+                box.setPlainText(updated)
+        return True
+
     def apply_variable(self) -> None:
         try:
             variable = self.read_variable_form()
@@ -1618,6 +1676,11 @@ class ExpansionApp(QMainWindow):
         except ValueError as exc:
             show_error(self, "Variable error", str(exc))
             return
+        if self.current_variable is not None and self.current_variable.name != variable.name:
+            if not self._cascade_rename(
+                "VAR", self.current_variable.name, variable.name, "variable"
+            ):
+                return
         if self.current_variable is None:
             self.store.variables.append(variable)
             self.current_variable = variable
@@ -1660,6 +1723,11 @@ class ExpansionApp(QMainWindow):
         except ValueError as exc:
             show_error(self, "Template error", str(exc))
             return
+        if self.current_template is not None and self.current_template.name != template.name:
+            if not self._cascade_rename(
+                "TPL", self.current_template.name, template.name, "template"
+            ):
+                return
         if self.current_template is None:
             self.store.templates.append(template)
             self.current_template = template
@@ -1703,12 +1771,37 @@ class ExpansionApp(QMainWindow):
             if template is not current and template.name == name:
                 raise ValueError(f'Duplicate template name "{name}".')
 
+    def _blocked_by_references(
+        self, kind: ReferenceKind, name: str, label: str
+    ) -> bool:
+        """Refuse to delete something the library still points at.
+
+        Refused rather than confirmed: unlike a rename there is no repair to
+        offer, so agreeing would knowingly leave a library that cannot
+        generate. Naming the dependents makes the refusal actionable -- edit
+        or delete those first, then the delete goes through.
+        """
+        users = find_references(self.store, kind, name)
+        if not users:
+            return False
+        show_error(
+            self,
+            f"Delete {label}",
+            f'"{name}" is still used by {item_count(len(users))}:\n\n'
+            f"{reference_listing(users)}\n\n"
+            f"Deleting it would stop the script generating. Change those to "
+            f"stop using it first.",
+        )
+        return True
+
     def delete_variable(self) -> None:
         index = self._table_selected_store_index(self.variable_tree)
         if index is None:
             show_info(self, "Delete variable", "Select a variable first.")
             return
         variable = self.store.variables[index]
+        if self._blocked_by_references("VAR", variable.name, "variable"):
+            return
         if not confirm(self, "Delete variable", f'Delete variable "{variable.name}"?'):
             return
         self.store.variables.remove(variable)
@@ -1723,6 +1816,8 @@ class ExpansionApp(QMainWindow):
             show_info(self, "Delete template", "Select a template first.")
             return
         template = self.store.templates[index]
+        if self._blocked_by_references("TPL", template.name, "template"):
+            return
         if not confirm(self, "Delete template", f'Delete template "{template.name}"?'):
             return
         self.store.templates.remove(template)

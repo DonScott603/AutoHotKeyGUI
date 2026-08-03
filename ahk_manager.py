@@ -1786,6 +1786,83 @@ def validate_template(template: TemplateDef) -> None:
         raise ValueError("Template name cannot be blank.")
 
 
+# Which library item a reference points at: a variable or another template.
+ReferenceKind = Literal["VAR", "TPL"]
+
+
+def _text_references(text: str, kind: ReferenceKind, name: str) -> bool:
+    """Whether text uses {VAR:name} or {TPL:name}.
+
+    Matched with the placeholder pattern rather than parsed, because the
+    callers ask this while deciding whether a rename or a delete is safe --
+    exactly when a library is most likely to be half-broken elsewhere, and a
+    parse error somewhere unrelated must not hide a real reference here.
+    """
+    return any(
+        match.group(1) == kind and match.group(2).strip() == name
+        for match in PLACEHOLDER_RE.finditer(text)
+    )
+
+
+def find_references(store: ExpansionStore, kind: ReferenceKind, name: str) -> list[str]:
+    """Everything in the library that uses this variable or template.
+
+    Labelled for a dialog rather than returned as objects: the callers only
+    need to tell the user what would break.
+    """
+    labels = [
+        f'expansion "{expansion.trigger}"'
+        for expansion in store.expansions
+        if _text_references(expansion.replacement, kind, name)
+    ]
+    labels += [
+        f'template "{template.name}"'
+        for template in store.templates
+        if _text_references(template.body, kind, name)
+    ]
+    return labels
+
+
+def rename_in_text(text: str, kind: ReferenceKind, old: str, new: str) -> str:
+    """Point every {VAR:old} / {TPL:old} in text at new.
+
+    Substituted over the matched spans so everything else in the text -- other
+    placeholders, spacing, the surrounding prose -- is returned byte for byte.
+    Rebuilding the string from parsed segments would reformat placeholders the
+    user never touched.
+    """
+
+    def swap(match: re.Match[str]) -> str:
+        if match.group(1) != kind or match.group(2).strip() != old:
+            return match.group(0)
+        return f"{{{kind}:{new}}}"
+
+    return PLACEHOLDER_RE.sub(swap, text)
+
+
+def rename_references(
+    store: ExpansionStore, kind: ReferenceKind, old: str, new: str
+) -> int:
+    """Point the whole library at the new name. Returns how many texts changed.
+
+    Renaming a variable or template used to leave every reference to it
+    dangling: the library still autosaved, and only generation failed, well
+    after the rename that caused it.
+    """
+    changed = 0
+    for expansion in store.expansions:
+        updated = rename_in_text(expansion.replacement, kind, old, new)
+        if updated != expansion.replacement:
+            expansion.replacement = updated
+            changed += 1
+    for template in store.templates:
+        updated = rename_in_text(template.body, kind, old, new)
+        if updated != template.body:
+            template.body = updated
+            changed += 1
+    return changed
+
+
 def _validate_unmatched_placeholders(text: str, matched_starts: set[int]) -> None:
     for match in PLACEHOLDER_START_RE.finditer(text):
         if match.start() in matched_starts:
