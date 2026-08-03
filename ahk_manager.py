@@ -5,7 +5,7 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict, cast
 
 
 DEFAULT_JSON = "expansions.json"
@@ -55,9 +55,21 @@ class AppSettings:
 
         try:
             with path.open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
+                parsed: object = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"Could not load {path.name}: {exc}") from exc
+
+        # Valid JSON that is not an object would reach .get and raise
+        # AttributeError, which callers do not catch. Refuse it as a load error
+        # so the caller's recovery path handles it like any other bad file.
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"Could not load {path.name}: expected a JSON object, "
+                f"found {type(parsed).__name__}."
+            )
+        # The isinstance check earns the dict; the key and value types are still
+        # whatever was on disk, which is what every read below assumes.
+        data = cast(dict[str, Any], parsed)
 
         configured_path = str(data.get("generated_ahk_path") or "").strip()
         backup_directory = str(data.get("backup_directory") or "").strip()
@@ -160,6 +172,64 @@ class TemplateDef:
         }
 
 
+def _collection_field(data: dict[str, Any], key: str, filename: str) -> list[Any]:
+    """The named collection, or a load error naming what was found instead.
+
+    save writes every one of these fields as a JSON array. Another type reaches
+    a for loop and raises TypeError, which -- unlike the ValueError the rest of
+    this loader raises -- no caller catches, so the window never opens at all.
+    The types that do iterate are worse than the crash: an object yields its
+    keys and a string yields one character at a time, both without complaint,
+    and the next autosave writes that result back over the original.
+    """
+    value = data.get(key, [])
+    if not isinstance(value, list):
+        raise ValueError(
+            f'Could not load {filename}: "{key}" must be a JSON array, '
+            f"found {type(value).__name__}."
+        )
+    return cast(list[Any], value)
+
+
+def _entry_dicts(data: dict[str, Any], key: str, filename: str) -> list[dict[str, Any]]:
+    """The entries of a record collection, each confirmed to be an object.
+
+    A malformed entry is refused rather than skipped. Skipping keeps the file
+    open, but the entry is gone for good as soon as autosave rewrites the file
+    in the normalised schema, whereas a load error leaves the original on disk
+    and routes to the backup restore on the Help page.
+    """
+    entries: list[dict[str, Any]] = []
+    for index, item in enumerate(_collection_field(data, key, filename)):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f'Could not load {filename}: "{key}" entry {index + 1} must be '
+                f"a JSON object, found {type(item).__name__}."
+            )
+        entries.append(cast(dict[str, Any], item))
+    return entries
+
+
+def _section_names(data: dict[str, Any], filename: str) -> list[str]:
+    """The section names, each confirmed to be a string.
+
+    str() accepts anything and coerces it into a plausible-looking name -- 4
+    becomes "4", an object becomes its Python repr -- so the wrong shape has to
+    be refused before the conversion rather than after it. Blank names are
+    still dropped: that is normalisation, not corruption.
+    """
+    names: list[str] = []
+    for index, item in enumerate(_collection_field(data, "sections", filename)):
+        if not isinstance(item, str):
+            raise ValueError(
+                f'Could not load {filename}: "sections" entry {index + 1} must '
+                f"be a string, found {type(item).__name__}."
+            )
+        if item.strip():
+            names.append(item.strip())
+    return names
+
+
 @dataclass
 class ExpansionStore:
     sections: list[str] = field(default_factory=lambda: ["General"])
@@ -174,25 +244,36 @@ class ExpansionStore:
 
         try:
             with path.open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
+                parsed: object = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"Could not load {path.name}: {exc}") from exc
 
-        sections = [str(item).strip() for item in data.get("sections", []) if str(item).strip()]
+        # See AppSettings.load: a JSON array, string, number or null parses
+        # cleanly and then blows up on .get with an AttributeError the caller
+        # does not expect. The app falls back to an empty store on ValueError,
+        # which is the behaviour a corrupt file should get.
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"Could not load {path.name}: expected a JSON object, "
+                f"found {type(parsed).__name__}."
+            )
+        data = cast(dict[str, Any], parsed)
+
+        # The isinstance check above earns the outer object; the collections
+        # inside it are still whatever was on disk, and each one is iterated
+        # directly below.
+        sections = _section_names(data, path.name)
         expansions = [
             Expansion.from_dict(item)
-            for item in data.get("expansions", [])
-            if isinstance(item, dict)
+            for item in _entry_dicts(data, "expansions", path.name)
         ]
         variables = [
             VariableDef.from_dict(item)
-            for item in data.get("variables", [])
-            if isinstance(item, dict)
+            for item in _entry_dicts(data, "variables", path.name)
         ]
         templates = [
             TemplateDef.from_dict(item)
-            for item in data.get("templates", [])
-            if isinstance(item, dict)
+            for item in _entry_dicts(data, "templates", path.name)
         ]
 
         for expansion in expansions:
