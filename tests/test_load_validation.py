@@ -156,6 +156,18 @@ class LoadValidationTests(unittest.TestCase):
         self.assertEqual(loaded.expansions[0].trigger, ";a")
 
 
+def close_window(window: ExpansionApp) -> None:
+    """Close a test window without tripping the unsaved-changes prompt.
+
+    closeEvent asks before discarding a refused write, which is right in the
+    application and fatal here: the dialog is modal, so a headless run blocks
+    on it forever rather than failing. Tests that care about the prompt drive
+    it explicitly; everything else closes through this.
+    """
+    window._set_unsaved(False)
+    window.close()
+
+
 class _RedirectedPaths:
     """Point every path the window touches at a temporary folder.
 
@@ -204,7 +216,7 @@ class StartupRecoveryTests(_RedirectedPaths, unittest.TestCase):
 
         with mock.patch.object(app_module, "show_error") as reported:
             window = ExpansionApp()
-        self.addCleanup(window.close)
+        self.addCleanup(close_window, window)
 
         self.assertTrue(reported.called, "the user was told nothing")
         self.assertEqual(window.store.expansions, [])
@@ -222,7 +234,7 @@ class StartupRecoveryTests(_RedirectedPaths, unittest.TestCase):
 
                 with mock.patch.object(app_module, "show_error") as reported:
                     window = ExpansionApp()
-                self.addCleanup(window.close)
+                self.addCleanup(close_window, window)
 
                 self.assertTrue(reported.called, "the user was told nothing")
                 self.assertEqual(window.store.expansions, [])
@@ -246,7 +258,7 @@ class UnreadableStoreWriteTests(_RedirectedPaths, unittest.TestCase):
         self.json_path.write_text(RECOVERABLE, encoding="utf-8")
         with mock.patch.object(app_module, "show_error"):
             window = ExpansionApp()
-        self.addCleanup(window.close)
+        self.addCleanup(close_window, window)
         return window
 
     def test_declining_leaves_the_file_untouched(self) -> None:
@@ -300,12 +312,125 @@ class UnreadableStoreWriteTests(_RedirectedPaths, unittest.TestCase):
             sections=["Work"], expansions=[Expansion("Work", ";a", "first")]
         ).save(self.json_path)
         window = ExpansionApp()
-        self.addCleanup(window.close)
+        self.addCleanup(close_window, window)
 
         with mock.patch.object(app_module, "confirm") as asked:
             self.assertTrue(window.persist())
 
         self.assertFalse(asked.called)
+
+
+class FailedSaveReportingTests(_RedirectedPaths, unittest.TestCase):
+    """A write that did not happen must not be reported as one.
+
+    persist has always returned False on failure, but every handler ignored it
+    and set its own success status afterwards -- so a refused write ended with
+    'Saved variable "x".' on screen while the file was untouched and the edit
+    existed only in memory, ready to be lost on close.
+    """
+
+    def _window(self) -> ExpansionApp:
+        self.json_path.write_text(RECOVERABLE, encoding="utf-8")
+        with mock.patch.object(app_module, "show_error"):
+            window = ExpansionApp()
+        self.addCleanup(close_window, window)
+        return window
+
+    def _add_variable(self, window: ExpansionApp) -> None:
+        window.current_variable = None
+        window.variable_name_edit.setText("client")
+        window.variable_type_combo.setCurrentText("text_input")
+        window.variable_prompt_edit.setText("Client")
+        window.apply_variable()
+
+    def test_a_refused_save_is_not_reported_as_saved(self) -> None:
+        window = self._window()
+
+        with mock.patch.object(app_module, "confirm", return_value=False):
+            self._add_variable(window)
+
+        self.assertNotIn("Saved variable", window.status_label.text())
+        self.assertIn("nothing was saved", window.status_label.text())
+
+    def test_a_refused_save_leaves_the_unsaved_marker_showing(self) -> None:
+        # The status line is transient; this is what has to survive until the
+        # write actually happens.
+        window = self._window()
+
+        with mock.patch.object(app_module, "confirm", return_value=False):
+            self._add_variable(window)
+
+        self.assertTrue(window._unsaved_changes)
+        self.assertEqual(window.unsaved_label.text(), "Unsaved changes")
+
+    def test_a_successful_save_reports_and_clears_the_marker(self) -> None:
+        window = self._window()
+
+        with mock.patch.object(app_module, "confirm", return_value=True):
+            self._add_variable(window)
+
+        self.assertIn("Saved variable", window.status_label.text())
+        self.assertFalse(window._unsaved_changes)
+        self.assertEqual(window.unsaved_label.text(), "")
+
+    def test_the_marker_survives_a_later_unrelated_status(self) -> None:
+        window = self._window()
+
+        with mock.patch.object(app_module, "confirm", return_value=False):
+            self._add_variable(window)
+        window.set_status("something else happened")
+
+        self.assertEqual(window.unsaved_label.text(), "Unsaved changes")
+
+    def test_closing_with_unsaved_changes_asks_first(self) -> None:
+        window = self._window()
+        with mock.patch.object(app_module, "confirm", return_value=False):
+            self._add_variable(window)
+
+        with mock.patch.object(app_module, "confirm", return_value=False) as asked:
+            closed = window.close()
+
+        self.assertTrue(asked.called, "the edit would have been lost silently")
+        self.assertFalse(closed, "the window closed despite the refusal")
+
+    def test_closing_proceeds_when_confirmed(self) -> None:
+        window = self._window()
+        with mock.patch.object(app_module, "confirm", return_value=False):
+            self._add_variable(window)
+
+        with mock.patch.object(app_module, "confirm", return_value=True):
+            self.assertTrue(window.close())
+
+    def test_closing_a_saved_window_does_not_ask(self) -> None:
+        # Autosave means closing is normally free, and it has to stay free.
+        window = self._window()
+        with mock.patch.object(app_module, "confirm", return_value=True):
+            self._add_variable(window)
+
+        with mock.patch.object(app_module, "confirm") as asked:
+            self.assertTrue(window.close())
+
+        self.assertFalse(asked.called)
+
+    def test_restoring_a_backup_clears_the_marker(self) -> None:
+        # The store is reloaded from disk, so the window and the file agree
+        # again whatever the refused write left behind.
+        window = self._window()
+        with mock.patch.object(app_module, "confirm", return_value=False):
+            self._add_variable(window)
+
+        # Stand in for the restore having put a readable file back, so the
+        # reload inside restore_json_backup succeeds as it would in practice.
+        ExpansionStore(
+            sections=["Work"], expansions=[Expansion("Work", ";a", "x")]
+        ).save(self.json_path)
+        with mock.patch.object(
+            ExpansionApp, "_restore_from_backup", return_value=self.json_path
+        ):
+            window.restore_json_backup()
+
+        self.assertFalse(window._unsaved_changes)
+        self.assertEqual(window.unsaved_label.text(), "")
 
 
 if __name__ == "__main__":

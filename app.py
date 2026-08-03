@@ -9,6 +9,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt
 from PySide6.QtGui import (
+    QCloseEvent,
     QColor,
     QFont,
     QFontDatabase,
@@ -884,6 +885,10 @@ class ExpansionApp(QMainWindow):
         # Set by _load_store, and read by persist before it writes over the
         # file it could not read. Declared first because _load_store runs here.
         self._store_unreadable = False
+        # Only ever true after a write was refused: every edit otherwise
+        # reaches disk as it is applied. Shown in the footer and checked on
+        # close. _set_unsaved needs the footer, which does not exist yet.
+        self._unsaved_changes = False
         self.store = self._load_store()
         self.settings = self._load_settings()
         self.ahk_process: subprocess.Popen | None = None
@@ -1415,6 +1420,12 @@ class ExpansionApp(QMainWindow):
         self.status_label = QLabel("Ready.")
         self.status_label.setObjectName("Muted")
         action_row.addWidget(self.status_label, 1)
+        # Beside the status rather than in it: the status line is overwritten
+        # by the next action, and an unsaved edit has to stay visible until it
+        # is resolved. Blank whenever the window and the file agree.
+        self.unsaved_label = QLabel("")
+        self.unsaved_label.setObjectName("Warn")
+        action_row.addWidget(self.unsaved_label)
         # No separate save button: every edit persists as it is applied, and
         # Generate & Run writes the store before generating regardless.
         for text, slot, primary in (
@@ -1691,9 +1702,8 @@ class ExpansionApp(QMainWindow):
             self.current_variable.default_value = variable.default_value
             self.current_variable.list_options = variable.list_options
             self.current_variable.notes = variable.notes
-        self.persist()
         self.refresh_variables()
-        self.set_status(f'Saved variable "{variable.name}".')
+        self._persist_reporting(f'Saved variable "{variable.name}".')
 
     def preview_variable(self) -> None:
         try:
@@ -1736,9 +1746,8 @@ class ExpansionApp(QMainWindow):
             self.current_template.description = template.description
             self.current_template.body = template.body
             self.current_template.notes = template.notes
-        self.persist()
         self.refresh_templates()
-        self.set_status(f'Saved template "{template.name}".')
+        self._persist_reporting(f'Saved template "{template.name}".')
 
     def preview_template(self) -> None:
         try:
@@ -1805,10 +1814,10 @@ class ExpansionApp(QMainWindow):
         if not confirm(self, "Delete variable", f'Delete variable "{variable.name}"?'):
             return
         self.store.variables.remove(variable)
-        self.persist()
         self.current_variable = None
         self.new_variable()
         self.refresh_variables()
+        self._persist_reporting(f'Deleted variable "{variable.name}".')
 
     def delete_template(self) -> None:
         index = self._table_selected_store_index(self.template_tree)
@@ -1821,10 +1830,10 @@ class ExpansionApp(QMainWindow):
         if not confirm(self, "Delete template", f'Delete template "{template.name}"?'):
             return
         self.store.templates.remove(template)
-        self.persist()
         self.current_template = None
         self.new_template()
         self.refresh_templates()
+        self._persist_reporting(f'Deleted template "{template.name}".')
 
     def duplicate_template(self) -> None:
         index = self._table_selected_store_index(self.template_tree)
@@ -1840,11 +1849,11 @@ class ExpansionApp(QMainWindow):
             suffix += 1
         copy = TemplateDef(name, template.description, template.body, template.notes)
         self.store.templates.append(copy)
-        self.persist()
         self.current_template = copy
         self.refresh_templates()
         self.template_tree.selectRow(len(self.store.templates) - 1)
         self.on_template_select()
+        self._persist_reporting(f'Duplicated template as "{copy.name}".')
 
     # -- expansion filtering / preview ------------------------------------
     def _matches_filter(self, expansion: Expansion, section: str, query: str) -> bool:
@@ -1890,11 +1899,10 @@ class ExpansionApp(QMainWindow):
         except ValueError as exc:
             show_error(self, "Section error", str(exc))
             return
-        self.persist()
         self.selected_section = name.strip()
         self.refresh_sections()
         self.refresh_expansions()
-        self.set_status(f'Added section "{name.strip()}".')
+        self._persist_reporting(f'Added section "{name.strip()}".')
 
     def rename_section(self) -> None:
         old_name = self.selected_section
@@ -1908,11 +1916,10 @@ class ExpansionApp(QMainWindow):
         except ValueError as exc:
             show_error(self, "Section error", str(exc))
             return
-        self.persist()
         self.selected_section = new_name.strip()
         self.refresh_sections()
         self.refresh_expansions()
-        self.set_status(f'Renamed section to "{new_name.strip()}".')
+        self._persist_reporting(f'Renamed section to "{new_name.strip()}".')
 
     def delete_section(self) -> None:
         section = self.selected_section
@@ -1920,11 +1927,11 @@ class ExpansionApp(QMainWindow):
         if not confirm(self, "Delete section", f'Delete "{section}" and {count} expansion(s)?'):
             return
         self.store.delete_section(section)
-        self.persist()
         self.selected_section = self.store.sections[0]
         self.refresh_sections()
         self.refresh_expansions()
         self.clear_form()
+        self._persist_reporting(f'Deleted section "{section}".')
         self.set_status(f'Deleted section "{section}".')
 
     def new_expansion(self) -> None:
@@ -2008,19 +2015,22 @@ class ExpansionApp(QMainWindow):
         if self.current_expansion is None:
             self.store.expansions.append(expansion)
             self.current_expansion = expansion
-            self.set_status(f'Added trigger "{expansion.trigger}".')
+            outcome = f'Added trigger "{expansion.trigger}".'
         else:
             self.current_expansion.section = expansion.section
             self.current_expansion.trigger = expansion.trigger
             self.current_expansion.replacement = expansion.replacement
             self.current_expansion.enabled = expansion.enabled
             self.current_expansion.notes = expansion.notes
-            self.set_status(f'Updated trigger "{expansion.trigger}".')
+            outcome = f'Updated trigger "{expansion.trigger}".'
 
-        self.persist()
         self.selected_section = expansion.section
         self.refresh_sections()
         self.refresh_expansions()
+        # Reported after the write rather than before it. Setting the status
+        # first happened to survive a refusal only because persist overwrote
+        # it, which is the wrong way round to depend on.
+        self._persist_reporting(outcome)
         self.warn_if_duplicate(expansion.trigger)
 
     def preview_expansion(self) -> None:
@@ -2063,11 +2073,10 @@ class ExpansionApp(QMainWindow):
         if not confirm(self, "Delete expansion", f'Delete trigger "{expansion.trigger}"?'):
             return
         del self.store.expansions[index]
-        self.persist()
         self.current_expansion = None
         self.refresh_expansions()
         self.clear_form(keep_section=True)
-        self.set_status(f'Deleted trigger "{expansion.trigger}".')
+        self._persist_reporting(f'Deleted trigger "{expansion.trigger}".')
 
     def toggle_enabled(self) -> None:
         index = self.selected_expansion_index()
@@ -2076,9 +2085,10 @@ class ExpansionApp(QMainWindow):
             return
         expansion = self.store.expansions[index]
         expansion.enabled = not expansion.enabled
-        self.persist()
         self.refresh_expansions()
-        self.set_status(f'{"Enabled" if expansion.enabled else "Disabled"} "{expansion.trigger}".')
+        self._persist_reporting(
+            f'{"Enabled" if expansion.enabled else "Disabled"} "{expansion.trigger}".'
+        )
 
     # -- AHK path / settings ----------------------------------------------
     def current_ahk_path(self) -> Path:
@@ -2309,6 +2319,9 @@ class ExpansionApp(QMainWindow):
             return
         # The file underneath the UI changed, so everything on screen is stale.
         self.store = self._load_store()
+        # Reloaded from disk, so the window and the file agree again -- whatever
+        # refused write left the marker behind has been superseded.
+        self._set_unsaved(False)
         self.current_expansion = None
         self.current_variable = None
         self.current_template = None
@@ -2377,23 +2390,61 @@ class ExpansionApp(QMainWindow):
         self._store_unreadable = False
         return True
 
+    def _set_unsaved(self, unsaved: bool) -> None:
+        """Record and show whether the window holds changes not on disk."""
+        self._unsaved_changes = unsaved
+        self.unsaved_label.setText("Unsaved changes" if unsaved else "")
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Do not let a refused save leave quietly.
+
+        Autosave means closing is normally free, and it stays free: this asks
+        only when a write was actually refused, which is the one case where
+        the window holds something the file does not.
+        """
+        if self._unsaved_changes and not confirm(
+            self,
+            "Unsaved changes",
+            f"Changes in this window were not written to {JSON_PATH.name}.\n\n"
+            "Closing now discards them. Close anyway?",
+        ):
+            event.ignore()
+            return
+        super().closeEvent(event)
+
     def persist(self) -> bool:
         """Write the store to disk immediately after a change to it.
 
-        Every edit saves as it is applied, so closing the window cannot lose
-        work and there is no separate save step to remember. Returns False
-        having already reported the failure, so callers that want to say more
-        about it can; the in-memory change stands either way.
+        Every edit saves as it is applied, so there is no separate save step to
+        remember. Returns False having already reported the failure; the
+        in-memory change stands either way, which is why a refusal has to leave
+        the unsaved marker behind rather than passing quietly.
         """
         if not self._may_replace_unreadable_store():
             self.set_status(f"{JSON_PATH.name} left unchanged; nothing was saved.")
+            self._set_unsaved(True)
             return False
         self._backup_once()
         try:
             self.store.save(JSON_PATH)
         except OSError as exc:
             show_error(self, "Save error", f"Could not save {JSON_PATH.name}: {exc}")
+            self._set_unsaved(True)
             return False
+        self._set_unsaved(False)
+        return True
+
+    def _persist_reporting(self, success: str) -> bool:
+        """Save, and report success only where there was some.
+
+        Handlers used to set their own status after persist regardless of the
+        result, overwriting the warning persist had just set -- so a refused
+        write ended with 'Saved variable "x".' on screen while the file was
+        untouched and the edit existed only in memory.
+        """
+        if not self.persist():
+            return False
+        self.set_status(success)
         return True
 
     def generate_and_run_ahk(self) -> None:
@@ -2582,7 +2633,6 @@ class ExpansionApp(QMainWindow):
                 return
 
         result = merge_imported_store(self.store, imported, conflict_action)
-        self.persist()
         self.selected_section = imported.sections[0] if imported.sections else self.store.sections[0]
         self.current_expansion = None
         self.refresh_sections()
@@ -2601,7 +2651,7 @@ class ExpansionApp(QMainWindow):
                 f" Added {result.variables_added} variable(s), "
                 f"{result.templates_added} template(s)."
             )
-        self.set_status(status)
+        self._persist_reporting(status)
 
     # -- misc --------------------------------------------------------------
     def clear_search(self) -> None:
