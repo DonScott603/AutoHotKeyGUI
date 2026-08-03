@@ -304,6 +304,111 @@ class ImportMergeTests(unittest.TestCase):
 
         self.assertEqual(imported.expansions[0].replacement, "Value{AHK_KEY:Tab}")
 
+    def _without_markers(self, store: ExpansionStore) -> ExpansionStore:
+        """Generate, strip the @tem markers, and import what is left.
+
+        The markers are authoritative for any file this app wrote, so this is
+        what exercises _reconstruct_replacement -- the path that has to read the
+        generated code itself.
+        """
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "gen.ahk"
+            generate_ahk(store, ahk_path, backup=False)
+            text = ahk_path.read_text(encoding="utf-8")
+            ahk_path.write_text(
+                "\n".join(
+                    line
+                    for line in text.splitlines()
+                    if not line.strip().startswith("; @tem:")
+                ),
+                encoding="utf-8",
+            )
+            return import_ahk(ahk_path)
+
+    def test_form_fields_read_from_the_map_round_trip(self) -> None:
+        # The answers are no longer copied into locals, so reconstruction reads
+        # the placeholder off the map lookup instead of a bare name.
+        store = ExpansionStore(
+            sections=["Letters"],
+            expansions=[
+                Expansion("Letters", ";dear", "Dear {AHK_INPUT:who|Name|Name|}, hello")
+            ],
+        )
+
+        imported = self._without_markers(store)
+
+        self.assertEqual(
+            imported.expansions[0].replacement,
+            "Dear {AHK_INPUT:who|Name|Name|}, hello",
+        )
+
+    def test_a_repeated_field_round_trips_as_two_placeholders(self) -> None:
+        store = ExpansionStore(
+            sections=["Letters"],
+            expansions=[
+                Expansion("Letters", ";t", "{AHK_INPUT:n|N|N|} and {AHK_INPUT:n|N|N|}")
+            ],
+        )
+
+        imported = self._without_markers(store)
+
+        self.assertEqual(
+            imported.expansions[0].replacement,
+            "{AHK_INPUT:n|N|N|} and {AHK_INPUT:n|N|N|}",
+        )
+
+    def test_a_select_read_from_its_own_local_round_trips(self) -> None:
+        store = ExpansionStore(
+            sections=["Status"],
+            expansions=[
+                Expansion("Status", ";st", "Status: {AHK_SELECT:s|Pick|State|Open||Shut}")
+            ],
+        )
+
+        imported = self._without_markers(store)
+
+        self.assertEqual(
+            imported.expansions[0].replacement,
+            "Status: {AHK_SELECT:s|Pick|State|Open||Shut}",
+        )
+
+    def test_legacy_form_assignments_still_import(self) -> None:
+        # Scripts generated while each answer was copied into a local named by
+        # the user. Those files are still on disk, so both shapes have to read.
+        legacy = "\n".join(
+            [
+                "#Requires AutoHotkey v2.0",
+                "",
+                "; === Letters ===",
+                ":C:;dear::",
+                "{",
+                '    __tem_result := ""',
+                '    __tem_fields := [Map("name", "who", "label", "Name", '
+                '"title", "Name", "kind", "input", "default", "")]',
+                '    __tem_parts := ["Dear ", Map("var", "who")]',
+                '    __tem_vals := TEM_Form("t", __tem_fields, __tem_parts)',
+                "    if (!IsObject(__tem_vals))",
+                "        return",
+                '    who := __tem_vals["who"]',
+                '    __tem_result .= "Dear "',
+                "    __tem_result .= who",
+                '    if (__tem_result != "") {',
+                "        SendText(__tem_result)",
+                '        __tem_result := ""',
+                "    }",
+                "}",
+                "",
+            ]
+        )
+        with TemporaryDirectory() as temp_dir:
+            ahk_path = Path(temp_dir) / "legacy.ahk"
+            ahk_path.write_text(legacy, encoding="utf-8")
+            imported = import_ahk(ahk_path)
+
+        self.assertEqual(
+            imported.expansions[0].replacement, "Dear {AHK_INPUT:who|Name|Name|}"
+        )
+
     def test_legacy_three_argument_select_still_imports(self) -> None:
         # Scripts generated before the window title was added have no fourth
         # argument, and must keep importing with their options intact.

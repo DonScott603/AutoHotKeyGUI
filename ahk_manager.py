@@ -411,29 +411,6 @@ TEMPLATE_MARKER_RE = re.compile(r"^\s*;\s*@tem-template:\s*(?P<json>.*)$")
 PLACEHOLDER_RE = re.compile(r"\{(AHK_EXPR|AHK_INPUT|AHK_SELECT|AHK_KEY|AHK_IMAGE|VAR|TPL):([^{}]*)\}")
 PLACEHOLDER_START_RE = re.compile(r"\{(?:AHK_(?:EXPR|INPUT|SELECT|KEY|IMAGE)|VAR|TPL):")
 VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-# A prompted placeholder becomes a local in the generated script, so a name the
-# script already uses collides with it. All three groups below are compared
-# case-insensitively, because AutoHotkey variable names are.
-#
-# The generator's own working values. These are the quiet ones: the script
-# still loads, and an input named __tem_result assigns the user's answer to the
-# accumulator and then appends the accumulator to itself.
-GENERATED_LOCAL_PREFIX = "__tem_"
-# AutoHotkey's built-in variables. Assigning one is a load error, so the whole
-# script stops working rather than one expansion misbehaving. The prefix is
-# reserved by AutoHotkey for exactly this reason.
-BUILTIN_VARIABLE_PREFIX = "a_"
-# Keywords that are a syntax error where the generator assigns to them.
-# Confirmed one by one against AutoHotkey v2 /validate rather than transcribed:
-# "this", "new" and "default" pass and are deliberately not listed.
-AHK_KEYWORDS = frozenset(
-    {
-        "and", "break", "case", "catch", "contains", "continue", "else",
-        "false", "finally", "for", "global", "goto", "if", "in", "is", "local",
-        "loop", "not", "or", "return", "static", "super", "switch", "throw",
-        "true", "try", "unset", "while",
-    }
-)
 SUPPORTED_KEYS = {"Tab"}
 HOTSTRING_OPTIONS = "C"
 # Static auto-replace hotstrings add "T" (Text mode) so the replacement is sent
@@ -746,7 +723,11 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
             title = _unescape_ahk(quoted[1])
             default = _unescape_ahk(quoted[2]) if len(quoted) > 2 else ""
             parts.append(f"{{AHK_INPUT:{var}|{prompt}|{title}|{default}}}")
-            i += 5
+            # Advance one line and let the rules below absorb the rest of the
+            # block. A fixed count cannot span both shapes: the block used to
+            # be five lines and is four now that the answer is not copied into
+            # a local first, and files generated before that are still read.
+            i += 1
             continue
         # List selection: 5 lines.
         selection = re.match(r"__tem_select_(\w+) := TEM_Select\(", line)
@@ -763,7 +744,7 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
             title = _unescape_ahk(quoted[1])
             options = [_unescape_ahk(option) for option in quoted[2:]]
             parts.append(f"{{AHK_SELECT:{var}|{prompt}|{title}|{'||'.join(options)}}}")
-            i += 5
+            i += 1
             continue
         # Key press: SendEvent("{Tab}") followed by Sleep(...).
         key = re.fullmatch(r'SendEvent\("\{(\w+)\}"\)', line)
@@ -780,6 +761,20 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
             i += 1
             if i < len(body) and body[i] == "return":
                 i += 1
+            continue
+        # Form field read straight from the values map. This is where the
+        # placeholder belongs, and a variable used twice correctly yields two.
+        form_read = re.fullmatch(r'__tem_result \.= __tem_vals\["(\w+)"\]', line)
+        if form_read:
+            if form_read.group(1) not in form_fields:
+                return None
+            parts.append(_form_field_placeholder(form_fields[form_read.group(1)]))
+            i += 1
+            continue
+        # The tail of an input/select block whose placeholder is already
+        # emitted, in the shape that reads the prefixed local directly.
+        if re.fullmatch(r"__tem_result \.= __tem_(input|select)_\w+\.\w+", line):
+            i += 1
             continue
         # AHK expression: __tem_result .= <expr>
         expr = re.fullmatch(r"__tem_result \.= (.+)", line)
@@ -1290,10 +1285,13 @@ def render_expansion(
         )
         lines.append("    if (!IsObject(__tem_vals))")
         lines.append("        return")
-        for field in fields:
-            lines.append(
-                f'    {field["name"]} := __tem_vals[{_ahk_string(field["name"])}]'
-            )
+        # No "<name> := __tem_vals[...]" line per field any more. Copying the
+        # answers into locals named by the user put user-chosen text into
+        # identifier position, where it collided with whatever already had that
+        # name: the generator's own locals, AutoHotkey's built-ins, and the
+        # functions the block goes on to call. Read from the map instead --
+        # the answers are keyed by name and the keys are case-sensitive, which
+        # also keeps "Client" and "client" apart where two locals could not be.
 
     def flush_result() -> None:
         lines.append("    if (__tem_result != \"\") {")
@@ -1310,18 +1308,25 @@ def render_expansion(
         if segment.kind == "AHK_EXPR":
             lines.append(f"    __tem_result .= {segment.value}")
         elif segment.kind == "AHK_INPUT":
-            # The form already assigned the variable, including for a repeat
-            # occurrence, so the value is only appended here.
+            # The form gathered every answer up front, including for a repeat
+            # occurrence, so each occurrence only reads its key back.
             variable, prompt, title, default = segment.args
-            if not use_form:
+            if use_form:
+                lines.append(f"    __tem_result .= __tem_vals[{_ahk_string(variable)}]")
+            else:
+                # Unreachable as it stands: _use_form takes the form for any
+                # text input, so only a lone dropdown gets here. Kept in the
+                # same shape as the branch below so it cannot become a trap if
+                # that rule is ever relaxed.
                 lines.append(f"    __tem_input_{variable} := InputBox({_ahk_string(prompt)}, {_ahk_string(title)}, , {_ahk_string(default)})")
                 lines.append(f"    if (__tem_input_{variable}.Result = \"Cancel\")")
                 lines.append("        return")
-                lines.append(f"    {variable} := __tem_input_{variable}.Value")
-            lines.append(f"    __tem_result .= {variable}")
+                lines.append(f"    __tem_result .= __tem_input_{variable}.Value")
         elif segment.kind == "AHK_SELECT":
             variable, prompt, title, *options = segment.args
-            if not use_form:
+            if use_form:
+                lines.append(f"    __tem_result .= __tem_vals[{_ahk_string(variable)}]")
+            else:
                 option_list = ", ".join(_ahk_string(option) for option in options)
                 window_title = _ahk_string(_prompt_title(expansion.trigger))
                 lines.append(
@@ -1330,9 +1335,10 @@ def render_expansion(
                 )
                 lines.append(f"    if (!__tem_select_{variable}.ok)")
                 lines.append("        return")
-                lines.append(f"    {variable} := __tem_select_{variable}.value")
+                # Read off the prefixed local rather than copying it to one
+                # named by the user, for the reason above.
+                lines.append(f"    __tem_result .= __tem_select_{variable}.value")
                 needs_select_helper = True
-            lines.append(f"    __tem_result .= {variable}")
         elif segment.kind == "AHK_KEY":
             key_name = segment.value
             flush_result()
@@ -1897,30 +1903,14 @@ def _validate_unmatched_placeholders(text: str, matched_starts: set[int]) -> Non
 
 
 def _validate_variable_name(value: str, placeholder_name: str) -> None:
+    # No reserved-name rules any more. They existed because the answer was
+    # copied into a local named by the user, which collided with the
+    # generator's own locals, AutoHotkey's built-ins and its keywords. Answers
+    # are read out of a map now, so the name reaches the script only as a
+    # string key -- and a list of names that no longer break anything would
+    # just be refusing valid input.
     if not VARIABLE_RE.match(value):
         raise ValueError(f"{placeholder_name} variable must be a valid AutoHotkey identifier.")
-    # AutoHotkey variable names are case-insensitive, so __TEM_Result names the
-    # same local as __tem_result and has to be caught by the same check.
-    folded = value.lower()
-    # Phrased as "<caller> name" rather than "<caller> variable": the caller
-    # for a saved definition is "Variable", which would otherwise read
-    # "Variable variable".
-    if folded.startswith(GENERATED_LOCAL_PREFIX):
-        raise ValueError(
-            f'{placeholder_name} name "{value}" is reserved: the generated '
-            f'script uses "{GENERATED_LOCAL_PREFIX}" names for its own working '
-            "values."
-        )
-    if folded.startswith(BUILTIN_VARIABLE_PREFIX):
-        raise ValueError(
-            f'{placeholder_name} name "{value}" is reserved: AutoHotkey uses '
-            f'the "{BUILTIN_VARIABLE_PREFIX.upper()}" prefix for its built-in '
-            "variables, which cannot be assigned."
-        )
-    if folded in AHK_KEYWORDS:
-        raise ValueError(
-            f'{placeholder_name} name "{value}" is an AutoHotkey keyword.'
-        )
 
 
 def _source_marker(expansion: Expansion) -> str:

@@ -208,8 +208,10 @@ class PlaceholderGenerationTests(unittest.TestCase):
             "__tem_fields, __tem_parts)",
             output,
         )
-        self.assertIn('client_name := __tem_vals["client_name"]', output)
-        self.assertIn("__tem_result .= client_name", output)
+        # Read from the values map rather than copied into a local named by
+        # the user, which is what used to collide with built-ins and functions.
+        self.assertIn('__tem_result .= __tem_vals["client_name"]', output)
+        self.assertNotIn('client_name := __tem_vals', output)
         self.assertNotIn("InputBox(", output)
 
     def test_form_preview_parts_carry_literals_and_field_references(self) -> None:
@@ -249,8 +251,7 @@ class PlaceholderGenerationTests(unittest.TestCase):
         output = render_ahk(store)
 
         self.assertEqual(output.count('Map("name", "amount"'), 1)
-        self.assertEqual(output.count('amount := __tem_vals["amount"]'), 1)
-        self.assertEqual(output.count("__tem_result .= amount"), 2)
+        self.assertEqual(output.count('__tem_result .= __tem_vals["amount"]'), 2)
 
     def test_prompts_are_positioned_on_the_typed_on_monitor(self) -> None:
         # Both prompts anchor to where the trigger was typed. The shared helper
@@ -317,7 +318,10 @@ class PlaceholderGenerationTests(unittest.TestCase):
             '["Pending", "Approved", "Rejected"], "Text Expansion Manager - status")',
             output,
         )
-        self.assertIn("status := __tem_select_status.value", output)
+        # The prefixed local is read directly; the answer is never copied to
+        # a local named "status".
+        self.assertIn("__tem_result .= __tem_select_status.value", output)
+        self.assertNotIn("status := __tem_select_status.value", output)
 
     def test_malformed_placeholder_raises_clear_error(self) -> None:
         store = ExpansionStore(
