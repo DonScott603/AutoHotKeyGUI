@@ -9,6 +9,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt
 from PySide6.QtGui import (
+    QCloseEvent,
     QColor,
     QFont,
     QFontDatabase,
@@ -54,12 +55,16 @@ from ahk_manager import (
     AppSettings,
     Expansion,
     ExpansionStore,
+    ImportConflicts,
+    ReferenceKind,
     TemplateDef,
     VariableDef,
     VARIABLE_TYPES,
     backup_file,
     backup_timestamp,
+    copy_store,
     count_import_conflicts,
+    find_references,
     generate_ahk,
     import_ahk,
     list_backups,
@@ -67,6 +72,9 @@ from ahk_manager import (
     migrate_backups,
     restore_backup,
     parse_replacement_template,
+    placeholder_problems,
+    rename_in_text,
+    rename_references,
     resolve_expansion_preview,
     resolve_template_preview,
     resolve_template_segments,
@@ -509,11 +517,24 @@ def detect_system_theme() -> str:
 
 
 def load_theme_pref() -> str | None:
+    """The saved theme, or None to fall back to the system setting.
+
+    Every unreadable shape gives the same answer rather than an error. This
+    runs before the window exists -- so an exception here is a crash box with
+    nothing behind it -- and unlike the library there is nothing here worth
+    recovering: the file holds one preference, and the next theme toggle
+    rewrites it. Losing it costs the user a click.
+
+    A JSON array, string, number or null parses cleanly and then raises
+    AttributeError on .get, which is what took the window down.
+    """
     try:
-        data = json.loads(UI_PREFS_PATH.read_text(encoding="utf-8"))
+        parsed = json.loads(UI_PREFS_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    theme = data.get("theme")
+    if not isinstance(parsed, dict):
+        return None
+    theme = parsed.get("theme")
     return theme if theme in ("light", "dark") else None
 
 
@@ -542,6 +563,23 @@ def show_warning(parent: QWidget | None, title: str, message: str) -> None:
     QMessageBox.warning(parent, title, message)
 
 
+def item_count(count: int) -> str:
+    """"1 item" or "N items", to be read as "... is used by <this>"."""
+    return "1 item" if count == 1 else f"{count} items"
+
+
+def reference_listing(users: list[str], limit: int = 12) -> str:
+    """The affected items as dialog text, capped so a long list still fits.
+
+    A library can reference one variable from dozens of expansions, and a
+    message box that tall is unreadable and can run off the screen.
+    """
+    shown = [f"  - {user}" for user in users[:limit]]
+    if len(users) > limit:
+        shown.append(f"  - ... and {len(users) - limit} more")
+    return "\n".join(shown)
+
+
 def confirm(parent: QWidget | None, title: str, message: str) -> bool:
     reply = QMessageBox.question(
         parent,
@@ -558,25 +596,44 @@ def confirm(parent: QWidget | None, title: str, message: str) -> bool:
 # ---------------------------------------------------------------------------
 
 class ImportConflictDialog(QDialog):
-    def __init__(self, parent, conflict_count: int) -> None:
+    def __init__(self, parent, conflicts: ImportConflicts) -> None:
         super().__init__(parent)
         self.setWindowTitle("Import conflicts")
         self.choice: str | None = None
 
         layout = QVBoxLayout(self)
+        # Counted separately because they read differently: a trigger clash
+        # affects that one expansion, a definition clash can reach every
+        # expansion already here that uses the name.
+        described = []
+        if conflicts.triggers:
+            described.append(f"{conflicts.triggers} trigger(s) in the same section")
+        if conflicts.definitions:
+            described.append(f"{conflicts.definitions} variable(s) or template(s)")
         label = QLabel(
-            f"{conflict_count} imported trigger(s) already exist in the same section. "
-            "Choose how to handle all conflicts."
+            f"The imported file has {' and '.join(described)} that already "
+            "exist here. Choose how to handle all of them."
         )
         label.setWordWrap(True)
         layout.addWidget(label)
 
-        self._skip = QRadioButton("Skip duplicate triggers")
-        self._overwrite = QRadioButton("Overwrite existing expansions")
-        self._rename = QRadioButton("Keep both with renamed trigger")
+        self._skip = QRadioButton("Skip them, keeping what is already here")
+        self._overwrite = QRadioButton("Overwrite with the imported versions")
+        self._rename = QRadioButton("Keep both, renaming what is imported")
         self._skip.setChecked(True)
         for widget in (self._skip, self._overwrite, self._rename):
             layout.addWidget(widget)
+
+        if conflicts.definitions:
+            # The one consequence that is not obvious from the choice itself.
+            note = QLabel(
+                "Overwriting a variable or template also changes every "
+                "expansion already here that uses it. Renaming rewrites the "
+                "imported expansions to use the renamed copies."
+            )
+            note.setObjectName("Muted")
+            note.setWordWrap(True)
+            layout.addWidget(note)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -860,6 +917,13 @@ class ExpansionApp(QMainWindow):
         # horizontal scrollbar (even when a vertical scrollbar is present).
         self.resize(1448, 720)
 
+        # Set by _load_store, and read by persist before it writes over the
+        # file it could not read. Declared first because _load_store runs here.
+        self._store_unreadable = False
+        # Only ever true after a write was refused: every edit otherwise
+        # reaches disk as it is applied. Shown in the footer and checked on
+        # close. _set_unsaved needs the footer, which does not exist yet.
+        self._unsaved_changes = False
         self.store = self._load_store()
         self.settings = self._load_settings()
         self.ahk_process: subprocess.Popen | None = None
@@ -894,11 +958,22 @@ class ExpansionApp(QMainWindow):
 
     # -- loading -----------------------------------------------------------
     def _load_store(self) -> ExpansionStore:
+        """The library on disk, or an empty one if the file cannot be read.
+
+        Opening anyway is deliberate -- restoring a backup is done from the
+        Help page, which is unreachable if the window never opens. But the
+        empty store that stands in is not the user's library, so the failure is
+        recorded: see persist, which will not write over the unread file
+        without being told to.
+        """
         try:
-            return ExpansionStore.load(JSON_PATH)
+            store = ExpansionStore.load(JSON_PATH)
         except ValueError as exc:
             show_error(None, "Load error", str(exc))
+            self._store_unreadable = True
             return ExpansionStore()
+        self._store_unreadable = False
+        return store
 
     def _load_settings(self) -> AppSettings:
         try:
@@ -1380,6 +1455,12 @@ class ExpansionApp(QMainWindow):
         self.status_label = QLabel("Ready.")
         self.status_label.setObjectName("Muted")
         action_row.addWidget(self.status_label, 1)
+        # Beside the status rather than in it: the status line is overwritten
+        # by the next action, and an unsaved edit has to stay visible until it
+        # is resolved. Blank whenever the window and the file agree.
+        self.unsaved_label = QLabel("")
+        self.unsaved_label.setObjectName("Warn")
+        action_row.addWidget(self.unsaved_label)
         # No separate save button: every edit persists as it is applied, and
         # Generate & Run writes the store before generating regardless.
         for text, slot, primary in (
@@ -1597,6 +1678,43 @@ class ExpansionApp(QMainWindow):
         parse_replacement_template(template.body)
         return template
 
+    def _cascade_rename(
+        self, kind: ReferenceKind, old: str, new: str, label: str
+    ) -> bool:
+        """Ask before repointing the library at a renamed item, then do it.
+
+        A rename used to change the definition and nothing else, so every
+        {VAR:old} still in the library was left undefined. That state autosaved
+        without complaint and only surfaced at Generate & Run, by which point
+        the rename that caused it was several actions ago.
+
+        Returns False if the user declined, in which case the caller must
+        abandon the rename entirely rather than apply half of it.
+        """
+        users = find_references(self.store, kind, old)
+        if not users:
+            return True
+        if not confirm(
+            self,
+            f"Rename {label}",
+            f'"{old}" is used by {item_count(len(users))}:\n\n'
+            f"{reference_listing(users)}\n\n"
+            f'Update them to use "{new}"?\n\n'
+            "Choosing No leaves the rename unapplied, because renaming "
+            "without updating them would stop the script generating.",
+        ):
+            return False
+        rename_references(self.store, kind, old, new)
+        # The editors hold their own copy of the text, which may include edits
+        # not applied yet. Renaming in place keeps those rather than reloading
+        # over them from the store.
+        for box in (self.replacement_text, self.template_body_text):
+            text = box.toPlainText()
+            updated = rename_in_text(text, kind, old, new)
+            if updated != text:
+                box.setPlainText(updated)
+        return True
+
     def apply_variable(self) -> None:
         try:
             variable = self.read_variable_form()
@@ -1604,6 +1722,11 @@ class ExpansionApp(QMainWindow):
         except ValueError as exc:
             show_error(self, "Variable error", str(exc))
             return
+        if self.current_variable is not None and self.current_variable.name != variable.name:
+            if not self._cascade_rename(
+                "VAR", self.current_variable.name, variable.name, "variable"
+            ):
+                return
         if self.current_variable is None:
             self.store.variables.append(variable)
             self.current_variable = variable
@@ -1614,9 +1737,8 @@ class ExpansionApp(QMainWindow):
             self.current_variable.default_value = variable.default_value
             self.current_variable.list_options = variable.list_options
             self.current_variable.notes = variable.notes
-        self.persist()
         self.refresh_variables()
-        self.set_status(f'Saved variable "{variable.name}".')
+        self._persist_reporting(f'Saved variable "{variable.name}".')
 
     def preview_variable(self) -> None:
         try:
@@ -1646,6 +1768,11 @@ class ExpansionApp(QMainWindow):
         except ValueError as exc:
             show_error(self, "Template error", str(exc))
             return
+        if self.current_template is not None and self.current_template.name != template.name:
+            if not self._cascade_rename(
+                "TPL", self.current_template.name, template.name, "template"
+            ):
+                return
         if self.current_template is None:
             self.store.templates.append(template)
             self.current_template = template
@@ -1654,9 +1781,8 @@ class ExpansionApp(QMainWindow):
             self.current_template.description = template.description
             self.current_template.body = template.body
             self.current_template.notes = template.notes
-        self.persist()
         self.refresh_templates()
-        self.set_status(f'Saved template "{template.name}".')
+        self._persist_reporting(f'Saved template "{template.name}".')
 
     def preview_template(self) -> None:
         try:
@@ -1689,19 +1815,44 @@ class ExpansionApp(QMainWindow):
             if template is not current and template.name == name:
                 raise ValueError(f'Duplicate template name "{name}".')
 
+    def _blocked_by_references(
+        self, kind: ReferenceKind, name: str, label: str
+    ) -> bool:
+        """Refuse to delete something the library still points at.
+
+        Refused rather than confirmed: unlike a rename there is no repair to
+        offer, so agreeing would knowingly leave a library that cannot
+        generate. Naming the dependents makes the refusal actionable -- edit
+        or delete those first, then the delete goes through.
+        """
+        users = find_references(self.store, kind, name)
+        if not users:
+            return False
+        show_error(
+            self,
+            f"Delete {label}",
+            f'"{name}" is still used by {item_count(len(users))}:\n\n'
+            f"{reference_listing(users)}\n\n"
+            f"Deleting it would stop the script generating. Change those to "
+            f"stop using it first.",
+        )
+        return True
+
     def delete_variable(self) -> None:
         index = self._table_selected_store_index(self.variable_tree)
         if index is None:
             show_info(self, "Delete variable", "Select a variable first.")
             return
         variable = self.store.variables[index]
+        if self._blocked_by_references("VAR", variable.name, "variable"):
+            return
         if not confirm(self, "Delete variable", f'Delete variable "{variable.name}"?'):
             return
         self.store.variables.remove(variable)
-        self.persist()
         self.current_variable = None
         self.new_variable()
         self.refresh_variables()
+        self._persist_reporting(f'Deleted variable "{variable.name}".')
 
     def delete_template(self) -> None:
         index = self._table_selected_store_index(self.template_tree)
@@ -1709,13 +1860,15 @@ class ExpansionApp(QMainWindow):
             show_info(self, "Delete template", "Select a template first.")
             return
         template = self.store.templates[index]
+        if self._blocked_by_references("TPL", template.name, "template"):
+            return
         if not confirm(self, "Delete template", f'Delete template "{template.name}"?'):
             return
         self.store.templates.remove(template)
-        self.persist()
         self.current_template = None
         self.new_template()
         self.refresh_templates()
+        self._persist_reporting(f'Deleted template "{template.name}".')
 
     def duplicate_template(self) -> None:
         index = self._table_selected_store_index(self.template_tree)
@@ -1731,11 +1884,11 @@ class ExpansionApp(QMainWindow):
             suffix += 1
         copy = TemplateDef(name, template.description, template.body, template.notes)
         self.store.templates.append(copy)
-        self.persist()
         self.current_template = copy
         self.refresh_templates()
         self.template_tree.selectRow(len(self.store.templates) - 1)
         self.on_template_select()
+        self._persist_reporting(f'Duplicated template as "{copy.name}".')
 
     # -- expansion filtering / preview ------------------------------------
     def _matches_filter(self, expansion: Expansion, section: str, query: str) -> bool:
@@ -1781,11 +1934,10 @@ class ExpansionApp(QMainWindow):
         except ValueError as exc:
             show_error(self, "Section error", str(exc))
             return
-        self.persist()
         self.selected_section = name.strip()
         self.refresh_sections()
         self.refresh_expansions()
-        self.set_status(f'Added section "{name.strip()}".')
+        self._persist_reporting(f'Added section "{name.strip()}".')
 
     def rename_section(self) -> None:
         old_name = self.selected_section
@@ -1799,11 +1951,10 @@ class ExpansionApp(QMainWindow):
         except ValueError as exc:
             show_error(self, "Section error", str(exc))
             return
-        self.persist()
         self.selected_section = new_name.strip()
         self.refresh_sections()
         self.refresh_expansions()
-        self.set_status(f'Renamed section to "{new_name.strip()}".')
+        self._persist_reporting(f'Renamed section to "{new_name.strip()}".')
 
     def delete_section(self) -> None:
         section = self.selected_section
@@ -1811,12 +1962,11 @@ class ExpansionApp(QMainWindow):
         if not confirm(self, "Delete section", f'Delete "{section}" and {count} expansion(s)?'):
             return
         self.store.delete_section(section)
-        self.persist()
         self.selected_section = self.store.sections[0]
         self.refresh_sections()
         self.refresh_expansions()
         self.clear_form()
-        self.set_status(f'Deleted section "{section}".')
+        self._persist_reporting(f'Deleted section "{section}".')
 
     def new_expansion(self) -> None:
         self.current_expansion = None
@@ -1899,19 +2049,22 @@ class ExpansionApp(QMainWindow):
         if self.current_expansion is None:
             self.store.expansions.append(expansion)
             self.current_expansion = expansion
-            self.set_status(f'Added trigger "{expansion.trigger}".')
+            outcome = f'Added trigger "{expansion.trigger}".'
         else:
             self.current_expansion.section = expansion.section
             self.current_expansion.trigger = expansion.trigger
             self.current_expansion.replacement = expansion.replacement
             self.current_expansion.enabled = expansion.enabled
             self.current_expansion.notes = expansion.notes
-            self.set_status(f'Updated trigger "{expansion.trigger}".')
+            outcome = f'Updated trigger "{expansion.trigger}".'
 
-        self.persist()
         self.selected_section = expansion.section
         self.refresh_sections()
         self.refresh_expansions()
+        # Reported after the write rather than before it. Setting the status
+        # first happened to survive a refusal only because persist overwrote
+        # it, which is the wrong way round to depend on.
+        self._persist_reporting(outcome)
         self.warn_if_duplicate(expansion.trigger)
 
     def preview_expansion(self) -> None:
@@ -1954,11 +2107,10 @@ class ExpansionApp(QMainWindow):
         if not confirm(self, "Delete expansion", f'Delete trigger "{expansion.trigger}"?'):
             return
         del self.store.expansions[index]
-        self.persist()
         self.current_expansion = None
         self.refresh_expansions()
         self.clear_form(keep_section=True)
-        self.set_status(f'Deleted trigger "{expansion.trigger}".')
+        self._persist_reporting(f'Deleted trigger "{expansion.trigger}".')
 
     def toggle_enabled(self) -> None:
         index = self.selected_expansion_index()
@@ -1967,9 +2119,10 @@ class ExpansionApp(QMainWindow):
             return
         expansion = self.store.expansions[index]
         expansion.enabled = not expansion.enabled
-        self.persist()
         self.refresh_expansions()
-        self.set_status(f'{"Enabled" if expansion.enabled else "Disabled"} "{expansion.trigger}".')
+        self._persist_reporting(
+            f'{"Enabled" if expansion.enabled else "Disabled"} "{expansion.trigger}".'
+        )
 
     # -- AHK path / settings ----------------------------------------------
     def current_ahk_path(self) -> Path:
@@ -2200,6 +2353,9 @@ class ExpansionApp(QMainWindow):
             return
         # The file underneath the UI changed, so everything on screen is stale.
         self.store = self._load_store()
+        # Reloaded from disk, so the window and the file agree again -- whatever
+        # refused write left the marker behind has been superseded.
+        self._set_unsaved(False)
         self.current_expansion = None
         self.current_variable = None
         self.current_template = None
@@ -2225,27 +2381,153 @@ class ExpansionApp(QMainWindow):
         ):
             self.run_ahk()
 
+    def _may_replace_unreadable_store(self) -> bool:
+        """Whether to write over a store file that failed to load.
+
+        Autosave means the first edit after a failed load would silently
+        replace a recoverable file with whatever is in the window -- usually
+        the empty store that stood in for it. _backup_once does copy the file
+        aside first, but only once per session and into a folder that rotates,
+        so a few sessions of ordinary use can retire the last good copy.
+
+        Answering yes clears the flag, so the question is asked once and
+        saving is normal from then on. Answering no leaves the file untouched
+        and the in-memory change unsaved -- which persist already reports --
+        and leaves the flag set, so the next edit asks again. That is the
+        intended shape: the alternative is to stop saving silently, which is
+        the failure this whole path exists to avoid.
+        """
+        if not self._store_unreadable:
+            return True
+        count = len(self.store.expansions)
+        # Naming the count is the point of the warning: the usual case is the
+        # empty store that stood in for the file, and "an empty library" says
+        # that far more plainly than "0 expansions".
+        replacing = (
+            "an empty library"
+            if count == 0
+            else f"the {count} expansion currently in the window"
+            if count == 1
+            else f"the {count} expansions currently in the window"
+        )
+        if not confirm(
+            self,
+            "Replace unreadable library",
+            f"{JSON_PATH.name} could not be read when this window opened, so "
+            "it was not loaded.\n\n"
+            f"Saving now replaces that file with {replacing}. If the file "
+            "holds a library worth keeping, restore a backup from the Help "
+            "page instead.\n\n"
+            "Replace it? The current file is backed up first.",
+        ):
+            return False
+        # The flag is cleared only once the copy exists. _backup_once will not
+        # do: it treats a failed copy as a warning and lets the write proceed,
+        # which is right for a readable file whose contents are already known
+        # good, and wrong for this one -- here the copy is the only remaining
+        # route back to whatever the file held.
+        if not self._back_up_before_replacing():
+            return False
+        self._store_unreadable = False
+        return True
+
+    def _back_up_before_replacing(self) -> bool:
+        """Copy the unreadable file aside, or refuse to replace it.
+
+        The dialog above says the file is backed up first, so a failure here
+        has to stop the write rather than warn and carry on. The flag stays
+        set, so the next edit asks again and can succeed once whatever stopped
+        the copy is resolved.
+        """
+        try:
+            backup_file(JSON_PATH, self.current_backup_dir())
+        except OSError as exc:
+            show_error(
+                self,
+                "Replace unreadable library",
+                f"Could not back up {JSON_PATH.name}: {exc}\n\n"
+                f"{JSON_PATH.name} has been left as it is. Replacing it "
+                "without a copy is the one way to lose what it holds for "
+                "good, so nothing was written.",
+            )
+            return False
+        # A missing file returns None and is not a failure: there is nothing to
+        # copy and nothing to lose.
+        #
+        # This copy is also this session's backup, so _backup_once has nothing
+        # left to do and cannot take a second one.
+        self._session_backed_up = True
+        return True
+
+    def _set_unsaved(self, unsaved: bool) -> None:
+        """Record and show whether the window holds changes not on disk."""
+        self._unsaved_changes = unsaved
+        self.unsaved_label.setText("Unsaved changes" if unsaved else "")
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Do not let a refused save leave quietly.
+
+        Autosave means closing is normally free, and it stays free: this asks
+        only when a write was actually refused, which is the one case where
+        the window holds something the file does not.
+        """
+        if self._unsaved_changes and not confirm(
+            self,
+            "Unsaved changes",
+            f"Changes in this window were not written to {JSON_PATH.name}.\n\n"
+            "Closing now discards them. Close anyway?",
+        ):
+            event.ignore()
+            return
+        super().closeEvent(event)
+
     def persist(self) -> bool:
         """Write the store to disk immediately after a change to it.
 
-        Every edit saves as it is applied, so closing the window cannot lose
-        work and there is no separate save step to remember. Returns False
-        having already reported the failure, so callers that want to say more
-        about it can; the in-memory change stands either way.
+        Every edit saves as it is applied, so there is no separate save step to
+        remember. Returns False having already reported the failure; the
+        in-memory change stands either way, which is why a refusal has to leave
+        the unsaved marker behind rather than passing quietly.
         """
+        if not self._may_replace_unreadable_store():
+            self.set_status(f"{JSON_PATH.name} left unchanged; nothing was saved.")
+            self._set_unsaved(True)
+            return False
         self._backup_once()
         try:
             self.store.save(JSON_PATH)
         except OSError as exc:
             show_error(self, "Save error", f"Could not save {JSON_PATH.name}: {exc}")
+            self._set_unsaved(True)
             return False
+        self._set_unsaved(False)
+        return True
+
+    def _persist_reporting(self, success: str) -> bool:
+        """Save, and report success only where there was some.
+
+        Handlers used to set their own status after persist regardless of the
+        result, overwriting the warning persist had just set -- so a refused
+        write ended with 'Saved variable "x".' on screen while the file was
+        untouched and the edit existed only in memory.
+        """
+        if not self.persist():
+            return False
+        self.set_status(success)
         return True
 
     def generate_and_run_ahk(self) -> None:
         ahk_path = self.current_ahk_path()
+        self.save_settings()
+        # Through persist rather than store.save: this is the one write that
+        # did not take a backup first, and it is reachable straight from a
+        # failed load, so it was the shortest path from a recoverable file to
+        # an empty one. A refusal here stops the run too -- generating the
+        # script from a library the user declined to save would overwrite the
+        # script as well.
+        if not self.persist():
+            return
         try:
-            self.save_settings()
-            self.store.save(JSON_PATH)
             backup_path = generate_ahk(
                 self.store,
                 ahk_path,
@@ -2409,20 +2691,53 @@ class ExpansionApp(QMainWindow):
             show_error(self, "Import error", str(exc))
             return
 
-        conflict_count = count_import_conflicts(self.store, imported)
+        conflicts = count_import_conflicts(self.store, imported)
         conflict_action = "skip"
-        if conflict_count:
-            dialog = ImportConflictDialog(self, conflict_count)
+        if conflicts:
+            dialog = ImportConflictDialog(self, conflicts)
             if not dialog.exec():
                 return
             conflict_action = dialog.choice
             if conflict_action is None:
                 return
 
-        result = merge_imported_store(self.store, imported, conflict_action)
-        self.persist()
+        # Merged into a copy first. Whether the result can generate depends on
+        # both libraries and on the action just chosen, so it cannot be settled
+        # any earlier: a reference the imported file leaves open may be one this
+        # library supplies, and two templates that are each fine alone can close
+        # a cycle once they are together. Leaving it to generate time was not an
+        # answer either, because the merge writes straight into the live store
+        # and autosaves.
+        candidate = copy_store(self.store)
+        result = merge_imported_store(candidate, imported, conflict_action)
+        # Refused only for what the import breaks. A library already unable to
+        # generate is the user's to fix, and blaming an import for it would bar
+        # them from importing at all until they had.
+        #
+        # Compared record by record, not "does either store have a problem":
+        # that reading switched the check off entirely once the library had a
+        # single fault of its own, so any number of further broken records
+        # could be imported on top of it.
+        before = placeholder_problems(self.store)
+        introduced = [
+            message
+            for key, message in placeholder_problems(candidate).items()
+            if before.get(key) != message
+        ]
+        if introduced:
+            show_error(
+                self,
+                "Import error",
+                f"{Path(file_path).name} was not imported: {introduced[0]}\n\n"
+                "Nothing in your library has changed.",
+            )
+            return
+
+        self.store = candidate
         self.selected_section = imported.sections[0] if imported.sections else self.store.sections[0]
         self.current_expansion = None
+        self.current_variable = None
+        self.current_template = None
         self.refresh_sections()
         self.refresh_expansions()
         self.refresh_variables()
@@ -2439,7 +2754,17 @@ class ExpansionApp(QMainWindow):
                 f" Added {result.variables_added} variable(s), "
                 f"{result.templates_added} template(s)."
             )
-        self.set_status(status)
+        if (
+            result.definitions_overwritten
+            or result.definitions_renamed
+            or result.definitions_skipped
+        ):
+            status += (
+                f" Existing definitions: {result.definitions_overwritten} "
+                f"overwritten, {result.definitions_renamed} renamed, "
+                f"{result.definitions_skipped} skipped."
+            )
+        self._persist_reporting(status)
 
     # -- misc --------------------------------------------------------------
     def clear_search(self) -> None:

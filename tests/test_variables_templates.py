@@ -1,4 +1,5 @@
 import os
+import re
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,6 +16,7 @@ from ahk_manager import (
     VariableDef,
     render_ahk,
     validate_templates,
+    validate_variable,
     validate_variables,
 )
 from app import ExpansionApp
@@ -61,7 +63,7 @@ class VariableTemplateTests(unittest.TestCase):
             '"title", "Client Name", "kind", "input", "default", "")',
             output,
         )
-        self.assertIn('client_name := __tem_vals["client_name"]', output)
+        self.assertIn('__tem_result .= __tem_vals["client_name"]', output)
 
     def test_list_selection_variable_resolves_to_select_logic(self) -> None:
         store = ExpansionStore(
@@ -193,8 +195,71 @@ class VariableTemplateTests(unittest.TestCase):
 
         output = render_ahk(store)
 
-        self.assertIn('client_name := __tem_vals["client_name"]', output)
+        self.assertIn('__tem_result .= __tem_vals["client_name"]', output)
         self.assertIn('__tem_result .= "`nThank you."', output)
+
+    def test_template_with_a_literal_body_resolves_in_the_generated_script(self) -> None:
+        # The static branch used to emit expansion.replacement, so a template
+        # holding nothing but text was sent as the raw {TPL:Name} reference.
+        # Every other template test here keeps a {VAR:...} in the body, which
+        # takes the dynamic branch and hid this.
+        store = ExpansionStore(
+            sections=["Letters"],
+            expansions=[Expansion("Letters", "sig", "{TPL:Signoff}")],
+            templates=[TemplateDef("Signoff", body="Regards, Don")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn(":sig::Regards, Don", output)
+        self.assertNotIn(":sig::{TPL:Signoff}", output)
+
+    def test_literal_template_resolves_alongside_surrounding_text(self) -> None:
+        store = ExpansionStore(
+            sections=["Letters"],
+            expansions=[Expansion("Letters", "sig", "Thanks. {TPL:Signoff}!")],
+            templates=[TemplateDef("Signoff", body="Regards, Don")],
+        )
+
+        self.assertIn(":sig::Thanks. Regards, Don!", render_ahk(store))
+
+    def test_nested_literal_templates_resolve(self) -> None:
+        store = ExpansionStore(
+            sections=["Letters"],
+            expansions=[Expansion("Letters", "sig", "{TPL:Outer}")],
+            templates=[
+                TemplateDef("Signoff", body="Regards, Don"),
+                TemplateDef("Outer", body="Well? {TPL:Signoff}"),
+            ],
+        )
+
+        self.assertIn(":sig::Well? Regards, Don", render_ahk(store))
+
+    def test_the_source_marker_keeps_the_unresolved_reference(self) -> None:
+        # Import reads the marker in preference to the hotstring, so resolving
+        # the emitted text must not flatten the template out of the round trip.
+        store = ExpansionStore(
+            sections=["Letters"],
+            expansions=[Expansion("Letters", "sig", "{TPL:Signoff}")],
+            templates=[TemplateDef("Signoff", body="Regards, Don")],
+        )
+
+        self.assertIn('"replacement":"{TPL:Signoff}"', render_ahk(store))
+
+    def test_a_template_that_resolves_to_nothing_is_skipped(self) -> None:
+        # "::" with nothing after it is read as an execute hotstring and the
+        # script fails to load, which the empty-replacement guard at the top of
+        # render_expansion cannot see through a template.
+        store = ExpansionStore(
+            sections=["Letters"],
+            expansions=[Expansion("Letters", "sig", "{TPL:Empty}")],
+            templates=[TemplateDef("Empty", body="")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertNotIn(":sig::\n", output)
+        self.assertIn('; Skipped "sig"', output)
 
     def test_circular_template_reference_is_rejected(self) -> None:
         store = ExpansionStore(
@@ -249,6 +314,69 @@ class VariableTemplateTests(unittest.TestCase):
                 TemplateDef("Follow Up", body="One"),
                 TemplateDef("Follow Up", body="Two"),
             ])
+
+    def test_a_name_the_generator_uses_is_accepted_and_works(self) -> None:
+        # These were rejected while the answer was copied into a local named by
+        # the user. It is a map key now, so there is nothing left to collide
+        # with and refusing them would only be turning away valid input.
+        for name in ("__tem_result", "__tem_vals", "__tem_fields", "__tem_parts"):
+            with self.subTest(name):
+                validate_variable(VariableDef(name, "text_input"))
+
+    def test_a_builtin_or_keyword_name_is_accepted_and_works(self) -> None:
+        for name in ("A_Now", "a_endchar", "if", "true", "loop", "SendText"):
+            with self.subTest(name):
+                validate_variable(VariableDef(name, "text_input"))
+
+    def test_such_a_name_reaches_the_script_only_as_a_key(self) -> None:
+        # The property that makes the above safe: never in identifier position.
+        store = ExpansionStore(
+            sections=["G"],
+            expansions=[Expansion("G", "x", "{VAR:A_Now}/{VAR:SendText}")],
+            variables=[
+                VariableDef("A_Now", "text_input", "P", "", [], ""),
+                VariableDef("SendText", "text_input", "P", "", [], ""),
+            ],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn('__tem_result .= __tem_vals["A_Now"]', output)
+        self.assertIn('__tem_result .= __tem_vals["SendText"]', output)
+        for name in ("A_Now", "SendText"):
+            self.assertIsNone(
+                re.search(rf"(?m)^\s*{name}\s*:=", output),
+                f"{name} was assigned as a local",
+            )
+
+    def test_names_differing_only_in_case_stay_distinct(self) -> None:
+        # AutoHotkey locals are case-insensitive, so two locals named Client and
+        # client were one variable and the second answer won both times. Map
+        # keys are case-sensitive, which is what keeps them apart.
+        store = ExpansionStore(
+            sections=["G"],
+            expansions=[Expansion("G", "x", "{VAR:Client}/{VAR:client}")],
+            variables=[
+                VariableDef("Client", "text_input", "Upper", "", [], ""),
+                VariableDef("client", "text_input", "Lower", "", [], ""),
+            ],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn('__tem_result .= __tem_vals["Client"]', output)
+        self.assertIn('__tem_result .= __tem_vals["client"]', output)
+
+    def test_an_invalid_identifier_is_still_rejected(self) -> None:
+        for name in ("has space", "1leading", "has-dash", ""):
+            with self.subTest(name):
+                with self.assertRaises(ValueError):
+                    validate_variable(VariableDef(name, "text_input"))
+
+    def test_ordinary_names_are_still_accepted(self) -> None:
+        for name in ("client_name", "this", "amount", "a", "_temp", "tem_plate"):
+            with self.subTest(name):
+                validate_variable(VariableDef(name, "text_input"))
 
     def test_literal_only_expansion_still_generates_simple_hotstring(self) -> None:
         store = ExpansionStore(

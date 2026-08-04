@@ -8,6 +8,7 @@ from PySide6.QtCore import QEvent
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget
 
 import app as app_module
+from ahk_manager import ImportConflicts
 from app import DateTimeDialog, ImportConflictDialog
 
 # A single QApplication must exist for the lifetime of the process.
@@ -23,7 +24,7 @@ class DialogChoiceTests(unittest.TestCase):
     """
 
     def test_import_conflict_dialog_reports_the_chosen_action(self) -> None:
-        dialog = ImportConflictDialog(None, 3)
+        dialog = ImportConflictDialog(None, ImportConflicts(triggers=3))
         try:
             dialog._rename.setChecked(True)
             dialog.accept()
@@ -33,7 +34,7 @@ class DialogChoiceTests(unittest.TestCase):
             dialog.deleteLater()
 
     def test_import_conflict_dialog_defaults_to_skipping(self) -> None:
-        dialog = ImportConflictDialog(None, 1)
+        dialog = ImportConflictDialog(None, ImportConflicts(triggers=1))
         try:
             dialog.accept()
 
@@ -42,7 +43,7 @@ class DialogChoiceTests(unittest.TestCase):
             dialog.deleteLater()
 
     def test_choice_is_unset_until_the_dialog_is_accepted(self) -> None:
-        dialog = ImportConflictDialog(None, 1)
+        dialog = ImportConflictDialog(None, ImportConflicts(triggers=1))
         try:
             self.assertIsNone(dialog.choice)
         finally:
@@ -50,7 +51,7 @@ class DialogChoiceTests(unittest.TestCase):
 
     def test_qdialog_result_is_still_callable(self) -> None:
         # The reason for the rename: this used to raise TypeError.
-        for dialog in (ImportConflictDialog(None, 1), DateTimeDialog(None)):
+        for dialog in (ImportConflictDialog(None, ImportConflicts(triggers=1)), DateTimeDialog(None)):
             try:
                 dialog.accept()
 

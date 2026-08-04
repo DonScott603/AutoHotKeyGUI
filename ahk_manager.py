@@ -5,7 +5,7 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict, cast
 
 
 DEFAULT_JSON = "expansions.json"
@@ -55,9 +55,30 @@ class AppSettings:
 
         try:
             with path.open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
+                parsed: object = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"Could not load {path.name}: {exc}") from exc
+
+        # Valid JSON that is not an object would reach .get and raise
+        # AttributeError, which callers do not catch. Refuse it as a load error
+        # so the caller's recovery path handles it like any other bad file.
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"Could not load {path.name}: expected a JSON object, "
+                f"found {type(parsed).__name__}."
+            )
+        # The isinstance check earns the dict; the key and value types are still
+        # whatever was on disk, which is what every read below assumes.
+        data = cast(dict[str, Any], parsed)
+
+        # Both fields become filesystem paths, so str() is worse here than it
+        # is for a record: an array does not fail, it becomes a directory named
+        # "['backups']" that start-up then creates and migrates backups into.
+        # Absent and null still fall back to the defaults below, which is how
+        # they have always been read.
+        problem = _record_problem(data, "settings")
+        if problem:
+            raise ValueError(f"Could not load {path.name}: {problem}.")
 
         configured_path = str(data.get("generated_ahk_path") or "").strip()
         backup_directory = str(data.get("backup_directory") or "").strip()
@@ -160,6 +181,152 @@ class TemplateDef:
         }
 
 
+def _collection_field(data: dict[str, Any], key: str, filename: str) -> list[Any]:
+    """The named collection, or a load error naming what was found instead.
+
+    save writes every one of these fields as a JSON array. Another type reaches
+    a for loop and raises TypeError, which -- unlike the ValueError the rest of
+    this loader raises -- no caller catches, so the window never opens at all.
+    The types that do iterate are worse than the crash: an object yields its
+    keys and a string yields one character at a time, both without complaint,
+    and the next autosave writes that result back over the original.
+    """
+    value = data.get(key, [])
+    if not isinstance(value, list):
+        raise ValueError(
+            f'Could not load {filename}: "{key}" must be a JSON array, '
+            f"found {type(value).__name__}."
+        )
+    return cast(list[Any], value)
+
+
+# What each record's fields have to be on disk. from_dict coerces whatever it
+# finds -- str() turns an object into its Python repr and bool() turns the
+# string "false" into True -- and the coerced value is what the next autosave
+# writes back, so the original is gone. Checked here instead, before from_dict
+# sees it.
+#
+# "text" tolerates null as a way of writing "not set", which is how from_dict
+# has always read it. "bool" does not: bool(None) is False, so a null enabled
+# would quietly disable an expansion. "text_list" also accepts a single string,
+# the newline-separated form VariableDef.from_dict already splits.
+_FIELD_TYPES = {
+    "settings": {
+        "generated_ahk_path": "text", "backup_directory": "text",
+    },
+    "expansions": {
+        "section": "text", "trigger": "text", "replacement": "text",
+        "enabled": "bool", "notes": "text",
+    },
+    "variables": {
+        "name": "text", "type": "text", "prompt_text": "text",
+        "default_value": "text", "list_options": "text_list", "notes": "text",
+    },
+    "templates": {
+        "name": "text", "description": "text", "body": "text", "notes": "text",
+    },
+}
+def _field_problem(value: Any, expected: str) -> str | None:
+    """What is wrong with this field, phrased to follow its name, or None."""
+    if expected == "text":
+        if value is None or isinstance(value, str):
+            return None
+        return f"must be a string, found {type(value).__name__}"
+    if expected == "bool":
+        # isinstance(1, bool) is False, so a JSON number is refused here even
+        # though Python would happily treat it as truthy.
+        if isinstance(value, bool):
+            return None
+        return f"must be true or false, found {type(value).__name__}"
+    if value is None or isinstance(value, str):
+        return None
+    if not isinstance(value, list):
+        return f"must be an array of strings, found {type(value).__name__}"
+    for position, item in enumerate(cast(list[Any], value)):
+        if not isinstance(item, str):
+            # Naming the position matters here: the field itself is the right
+            # type and only one of its entries is not.
+            return (
+                f"must be an array of strings, but entry {position + 1} is "
+                f"{type(item).__name__}"
+            )
+    return None
+
+
+def _entry_dicts(data: dict[str, Any], key: str, filename: str) -> list[dict[str, Any]]:
+    """The entries of a record collection, each confirmed to be a usable object.
+
+    A malformed entry is refused rather than skipped. Skipping keeps the file
+    open, but the entry is gone for good as soon as autosave rewrites the file
+    in the normalised schema, whereas a load error leaves the original on disk
+    and routes to the backup restore on the Help page.
+
+    Fields the schema does not name are ignored rather than refused, so a file
+    written by a later version opens. That is not forward compatibility, and
+    was described as such here until it was measured: the values are not
+    carried on the dataclasses and save rebuilds each record from the known
+    fields, so the first autosave drops them. Opening a newer library in an
+    older build and changing anything discards whatever the newer build added.
+
+    Left as it is deliberately. Preserving unknown values would mean carrying
+    them through every record, and refusing a newer file outright would lock
+    the user out of their own library over a field this build has no opinion
+    about. The behaviour is recorded here, and pinned by a test, rather than
+    claimed to be something it is not.
+    """
+    entries: list[dict[str, Any]] = []
+    for index, item in enumerate(_collection_field(data, key, filename)):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f'Could not load {filename}: "{key}" entry {index + 1} must be '
+                f"a JSON object, found {type(item).__name__}."
+            )
+        entry = cast(dict[str, Any], item)
+        problem = _record_problem(entry, key)
+        if problem:
+            raise ValueError(
+                f'Could not load {filename}: "{key}" entry {index + 1} {problem}.'
+            )
+        entries.append(entry)
+    return entries
+
+
+def _record_problem(entry: dict[str, Any], kind: str) -> str | None:
+    """The first field of this record that is not the type it is written as.
+
+    Shared with the marker importer: a record reaches the library from a JSON
+    collection or from a comment in a generated script, and both end up merged
+    and autosaved, so both have to be held to the same shape.
+    """
+    for field, expected in _FIELD_TYPES[kind].items():
+        if field not in entry:
+            continue
+        problem = _field_problem(entry[field], expected)
+        if problem:
+            return f'field "{field}" {problem}'
+    return None
+
+
+def _section_names(data: dict[str, Any], filename: str) -> list[str]:
+    """The section names, each confirmed to be a string.
+
+    str() accepts anything and coerces it into a plausible-looking name -- 4
+    becomes "4", an object becomes its Python repr -- so the wrong shape has to
+    be refused before the conversion rather than after it. Blank names are
+    still dropped: that is normalisation, not corruption.
+    """
+    names: list[str] = []
+    for index, item in enumerate(_collection_field(data, "sections", filename)):
+        if not isinstance(item, str):
+            raise ValueError(
+                f'Could not load {filename}: "sections" entry {index + 1} must '
+                f"be a string, found {type(item).__name__}."
+            )
+        if item.strip():
+            names.append(item.strip())
+    return names
+
+
 @dataclass
 class ExpansionStore:
     sections: list[str] = field(default_factory=lambda: ["General"])
@@ -174,25 +341,36 @@ class ExpansionStore:
 
         try:
             with path.open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
+                parsed: object = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"Could not load {path.name}: {exc}") from exc
 
-        sections = [str(item).strip() for item in data.get("sections", []) if str(item).strip()]
+        # See AppSettings.load: a JSON array, string, number or null parses
+        # cleanly and then blows up on .get with an AttributeError the caller
+        # does not expect. The app falls back to an empty store on ValueError,
+        # which is the behaviour a corrupt file should get.
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"Could not load {path.name}: expected a JSON object, "
+                f"found {type(parsed).__name__}."
+            )
+        data = cast(dict[str, Any], parsed)
+
+        # The isinstance check above earns the outer object; the collections
+        # inside it are still whatever was on disk, and each one is iterated
+        # directly below.
+        sections = _section_names(data, path.name)
         expansions = [
             Expansion.from_dict(item)
-            for item in data.get("expansions", [])
-            if isinstance(item, dict)
+            for item in _entry_dicts(data, "expansions", path.name)
         ]
         variables = [
             VariableDef.from_dict(item)
-            for item in data.get("variables", [])
-            if isinstance(item, dict)
+            for item in _entry_dicts(data, "variables", path.name)
         ]
         templates = [
             TemplateDef.from_dict(item)
-            for item in data.get("templates", [])
-            if isinstance(item, dict)
+            for item in _entry_dicts(data, "templates", path.name)
         ]
 
         for expansion in expansions:
@@ -287,10 +465,36 @@ class ImportMergeResult:
     conflicts: int = 0
     variables_added: int = 0
     templates_added: int = 0
+    # Variables and templates that already existed by name. Counted together
+    # because the choice is made once for both, and the caller reports them
+    # the same way.
+    definitions_overwritten: int = 0
+    definitions_renamed: int = 0
+    definitions_skipped: int = 0
 
     @property
     def total_changed(self) -> int:
         return self.added + self.overwritten + self.renamed
+
+
+@dataclass
+class ImportConflicts:
+    """What the imported file already has counterparts for here.
+
+    Split because the two read differently to someone deciding: a trigger
+    conflict affects that expansion, and a definition conflict can reach every
+    expansion already in the library that uses the name.
+    """
+
+    triggers: int = 0
+    definitions: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.triggers + self.definitions
+
+    def __bool__(self) -> bool:
+        return self.total > 0
 
 
 @dataclass
@@ -327,6 +531,11 @@ SOURCE_MARKER_RE = re.compile(r"^\s*;\s*@tem:\s*(?P<json>.*)$")
 # carry the definitions verbatim so they survive a generate -> import round trip.
 VAR_MARKER_RE = re.compile(r"^\s*;\s*@tem-var:\s*(?P<json>.*)$")
 TEMPLATE_MARKER_RE = re.compile(r"^\s*;\s*@tem-template:\s*(?P<json>.*)$")
+# An expansion that generates no hotstring at all has nothing for the source
+# marker above to attach to, so it carries its whole record instead -- section
+# and trigger included -- the same way the two markers above do. Without it a
+# skipped expansion was simply absent from a re-import and quietly lost.
+SKIPPED_MARKER_RE = re.compile(r"^\s*;\s*@tem-skipped:\s*(?P<json>.*)$")
 PLACEHOLDER_RE = re.compile(r"\{(AHK_EXPR|AHK_INPUT|AHK_SELECT|AHK_KEY|AHK_IMAGE|VAR|TPL):([^{}]*)\}")
 PLACEHOLDER_START_RE = re.compile(r"\{(?:AHK_(?:EXPR|INPUT|SELECT|KEY|IMAGE)|VAR|TPL):")
 VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -337,6 +546,39 @@ HOTSTRING_OPTIONS = "C"
 # (e.g. a leading/trailing "!" becomes Alt), corrupting the expansion.
 STATIC_HOTSTRING_OPTIONS = "CT"
 VARIABLE_TYPES = {"text_input", "list_selection", "date_time"}
+
+
+def _marker_record(
+    json_text: str, marker: str, path: Path, line_number: int, kind: str
+) -> dict[str, Any]:
+    """The record a marker line carries, or an import error placing the fault.
+
+    Refused rather than skipped or coerced. The markers used to go straight to
+    from_dict, which takes whatever it finds -- bool("false") is True and str()
+    turns an object into its Python repr -- while ExpansionStore.load checked
+    the same fields first. Both routes end with the record merged into the live
+    library and autosaved, so the lenient one decided what ended up on disk.
+    """
+    try:
+        data = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Could not import {path.name}: {marker} on line {line_number} is "
+            f"not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Could not import {path.name}: {marker} on line {line_number} "
+            f"must be a JSON object, found {type(data).__name__}."
+        )
+    record = cast(dict[str, Any], data)
+    problem = _record_problem(record, kind)
+    if problem:
+        raise ValueError(
+            f"Could not import {path.name}: {marker} on line {line_number} "
+            f"{problem}."
+        )
+    return record
 
 
 def import_ahk(path: Path) -> ExpansionStore:
@@ -359,31 +601,67 @@ def import_ahk(path: Path) -> ExpansionStore:
     for index, line in enumerate(lines):
         var_match = VAR_MARKER_RE.match(line)
         if var_match:
+            variable = VariableDef.from_dict(
+                _marker_record(
+                    var_match.group("json"), "@tem-var", path, index + 1, "variables"
+                )
+            )
             try:
-                data = json.loads(var_match.group("json"))
-            except json.JSONDecodeError:
-                data = None
-            if isinstance(data, dict):
-                variables.append(VariableDef.from_dict(data))
+                validate_variable(variable)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Could not import {path.name}: @tem-var on line "
+                    f"{index + 1}: {exc}"
+                ) from exc
+            variables.append(variable)
             continue
 
         template_match = TEMPLATE_MARKER_RE.match(line)
         if template_match:
+            template = TemplateDef.from_dict(
+                _marker_record(
+                    template_match.group("json"),
+                    "@tem-template",
+                    path,
+                    index + 1,
+                    "templates",
+                )
+            )
             try:
-                data = json.loads(template_match.group("json"))
-            except json.JSONDecodeError:
-                data = None
-            if isinstance(data, dict):
-                templates.append(TemplateDef.from_dict(data))
+                validate_template(template)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Could not import {path.name}: @tem-template on line "
+                    f"{index + 1}: {exc}"
+                ) from exc
+            templates.append(template)
+            continue
+
+        skipped_match = SKIPPED_MARKER_RE.match(line)
+        if skipped_match:
+            skipped = Expansion.from_dict(
+                _marker_record(
+                    skipped_match.group("json"),
+                    "@tem-skipped",
+                    path,
+                    index + 1,
+                    "expansions",
+                ),
+                current_section,
+            )
+            if skipped.trigger:
+                # The record carries its own section, so it lands where it
+                # started even though no "; === ... ===" header precedes it.
+                if skipped.section not in sections:
+                    sections.append(skipped.section)
+                expansions.append(skipped)
             continue
 
         marker_match = SOURCE_MARKER_RE.match(line)
         if marker_match:
-            try:
-                data = json.loads(marker_match.group("json"))
-            except json.JSONDecodeError:
-                data = None
-            pending_source = data if isinstance(data, dict) else None
+            pending_source = _marker_record(
+                marker_match.group("json"), "@tem", path, index + 1, "expansions"
+            )
             continue
 
         section_match = SECTION_RE.match(line)
@@ -445,12 +723,57 @@ def import_ahk(path: Path) -> ExpansionStore:
 
     if not sections:
         sections.append("General")
-    return ExpansionStore(
+    store = ExpansionStore(
         sections=sections,
         expansions=expansions,
         variables=variables,
         templates=templates,
     )
+    _validate_imported_store(store, path)
+    return store
+
+
+def _validate_imported_store(store: ExpansionStore, path: Path) -> None:
+    """Refuse a file that would leave the library unable to generate.
+
+    Deliberately stricter than ExpansionStore.load, because the two failures
+    cost different things. Refusing to open the library already on disk locks
+    the user out of the application they would use to repair it, so that path
+    stays lenient and leaves the complaint to generate time. Refusing an
+    import only declines a file: the library is untouched and still works, so
+    there is no reason to take on definitions that cannot generate, merge them
+    into the live store and autosave them -- which is what happened, with the
+    import reported as a success and the failure surfacing later with nothing
+    connecting it back.
+
+    References are the one thing not resolved here. A file may legitimately
+    use a variable or template the importing library already defines, and
+    resolving against the imported file alone would refuse it. Whether the
+    merged result resolves is settled at generate time, where the error names
+    the trigger.
+    """
+    try:
+        # Names, types, list options, and duplicates within the file.
+        validate_variables(store.variables)
+        validate_templates(store.templates)
+        # Placeholder syntax, which is the same answer wherever the text ends
+        # up. resolve_* is deliberately not called: see above.
+        for expansion in store.expansions:
+            try:
+                parse_replacement_template(expansion.replacement)
+            except ValueError as exc:
+                raise ValueError(
+                    f'Invalid placeholder in trigger "{expansion.trigger}": {exc}'
+                ) from exc
+        for template in store.templates:
+            try:
+                parse_replacement_template(template.body)
+            except ValueError as exc:
+                raise ValueError(
+                    f'Invalid placeholder in template "{template.name}": {exc}'
+                ) from exc
+    except ValueError as exc:
+        raise ValueError(f"Could not import {path.name}: {exc}") from exc
 
 
 _BLOCK_OPEN_RE = re.compile(r"^;?\s?\{\s*$")
@@ -479,13 +802,36 @@ _FORM_SELECT_FIELD_RE = re.compile(
 _FORM_FIELD_COUNT_RE = re.compile(r'Map\("name", ')
 
 
-def _parse_form_fields(line: str) -> dict[str, dict[str, Any]] | None:
+# A form field is one of two shapes discriminated by "kind": only inputs carry a
+# default and only selects carry options. Modelling them as a union rather than
+# one loose dict means reading the wrong key for the branch is a type error, and
+# narrowing on field["kind"] is what makes that check work.
+class FormInputField(TypedDict):
+    name: str
+    kind: Literal["input"]
+    label: str
+    title: str
+    default: str
+
+
+class FormSelectField(TypedDict):
+    name: str
+    kind: Literal["select"]
+    label: str
+    title: str
+    options: list[str]
+
+
+FormField = FormInputField | FormSelectField
+
+
+def _parse_form_fields(line: str) -> dict[str, FormField] | None:
     """Rebuild the field table from a generated ``__tem_fields`` line.
 
     Returns None if any entry fails to match, so a block that is not in the
     generated form is refused rather than silently reconstructed short a field.
     """
-    fields: dict[str, dict[str, Any]] = {}
+    fields: dict[str, FormField] = {}
     for match in _FORM_INPUT_FIELD_RE.finditer(line):
         name, label, title, default = (_unescape_ahk(g) for g in match.groups())
         fields[name] = {
@@ -511,7 +857,7 @@ def _parse_form_fields(line: str) -> dict[str, dict[str, Any]] | None:
     return fields
 
 
-def _form_field_placeholder(field: dict[str, Any]) -> str:
+def _form_field_placeholder(field: FormField) -> str:
     if field["kind"] == "select":
         options = "||".join(field["options"])
         return f"{{AHK_SELECT:{field['name']}|{field['label']}|{field['title']}|{options}}}"
@@ -568,7 +914,7 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
     # Populated when the block gathers its prompts through TEM_Form, in which
     # case the placeholders are rebuilt at the "__tem_result .= <var>" lines
     # rather than at the prompt call itself.
-    form_fields: dict[str, dict[str, Any]] = {}
+    form_fields: dict[str, FormField] = {}
     i = 0
     while i < len(body):
         line = body[i]
@@ -619,7 +965,11 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
             title = _unescape_ahk(quoted[1])
             default = _unescape_ahk(quoted[2]) if len(quoted) > 2 else ""
             parts.append(f"{{AHK_INPUT:{var}|{prompt}|{title}|{default}}}")
-            i += 5
+            # Advance one line and let the rules below absorb the rest of the
+            # block. A fixed count cannot span both shapes: the block used to
+            # be five lines and is four now that the answer is not copied into
+            # a local first, and files generated before that are still read.
+            i += 1
             continue
         # List selection: 5 lines.
         selection = re.match(r"__tem_select_(\w+) := TEM_Select\(", line)
@@ -636,7 +986,7 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
             title = _unescape_ahk(quoted[1])
             options = [_unescape_ahk(option) for option in quoted[2:]]
             parts.append(f"{{AHK_SELECT:{var}|{prompt}|{title}|{'||'.join(options)}}}")
-            i += 5
+            i += 1
             continue
         # Key press: SendEvent("{Tab}") followed by Sleep(...).
         key = re.fullmatch(r'SendEvent\("\{(\w+)\}"\)', line)
@@ -653,6 +1003,20 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
             i += 1
             if i < len(body) and body[i] == "return":
                 i += 1
+            continue
+        # Form field read straight from the values map. This is where the
+        # placeholder belongs, and a variable used twice correctly yields two.
+        form_read = re.fullmatch(r'__tem_result \.= __tem_vals\["(\w+)"\]', line)
+        if form_read:
+            if form_read.group(1) not in form_fields:
+                return None
+            parts.append(_form_field_placeholder(form_fields[form_read.group(1)]))
+            i += 1
+            continue
+        # The tail of an input/select block whose placeholder is already
+        # emitted, in the shape that reads the prefixed local directly.
+        if re.fullmatch(r"__tem_result \.= __tem_(input|select)_\w+\.\w+", line):
+            i += 1
             continue
         # AHK expression: __tem_result .= <expr>
         expr = re.fullmatch(r"__tem_result \.= (.+)", line)
@@ -686,11 +1050,170 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
     return "".join(parts) if parts else None
 
 
-def count_import_conflicts(target: ExpansionStore, imported: ExpansionStore) -> int:
-    return sum(
-        1
-        for expansion in imported.expansions
-        if _find_expansion(target, expansion.section, expansion.trigger) is not None
+def count_import_conflicts(
+    target: ExpansionStore, imported: ExpansionStore
+) -> ImportConflicts:
+    """What the imported store already has counterparts for here.
+
+    A definition matching the one already here is not counted: it needs no
+    decision, because skipping and overwriting both leave the library exactly
+    as it is. That keeps the question quiet on the common round trip of
+    re-importing a file this app generated from this same library, where every
+    definition collides by name and none of them differ.
+
+    Renaming still renames those matching definitions -- see
+    merge_imported_store -- but only once something else has prompted the
+    question.
+    """
+    return ImportConflicts(
+        triggers=sum(
+            1
+            for expansion in imported.expansions
+            if _find_expansion(target, expansion.section, expansion.trigger) is not None
+        ),
+        definitions=(
+            sum(
+                1
+                for variable in imported.variables
+                if _differs(target.variable_by_name(variable.name), variable)
+            )
+            + sum(
+                1
+                for template in imported.templates
+                if _differs(target.template_by_name(template.name), template)
+            )
+        ),
+    )
+
+
+def _differs(existing: VariableDef | TemplateDef | None, imported: VariableDef | TemplateDef) -> bool:
+    """Whether a same-name definition already here holds something else."""
+    if not imported.name or existing is None:
+        return False
+    return existing.to_dict() != imported.to_dict()
+
+
+def _renamed_definition(taken: set[str], name: str) -> str:
+    """A free name for an imported definition, in the shape triggers use."""
+    base = f"{name}_imported"
+    candidate = base
+    suffix = 2
+    while candidate in taken:
+        candidate = f"{base}{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _definition_renames(
+    target: ExpansionStore, imported: ExpansionStore, conflict_action: str
+) -> dict[tuple[str, str], str]:
+    """New names for the imported definitions that collide, keyed by kind.
+
+    Decided up front, before anything is copied. Renaming a definition without
+    also rewriting the references to it would leave the imported expansions
+    pointing at the definition already here -- which is the very thing that
+    made the collision worth asking about.
+
+    Two things keep the mappings independent of each other. A name is only
+    generated for a definition that collides with the target as it stands, so
+    a name introduced here can never itself need renaming. And every name in
+    use on either side is reserved before any is generated, so a generated
+    name cannot land on one that some other definition already answers to --
+    which is what turned an imported "v" and "v_imported" into two references
+    to the same thing.
+    """
+    if conflict_action != "rename":
+        return {}
+    renames: dict[tuple[str, str], str] = {}
+    taken = {variable.name for variable in target.variables}
+    taken |= {variable.name for variable in imported.variables}
+    for variable in imported.variables:
+        if variable.name and target.variable_by_name(variable.name) is not None:
+            renames["VAR", variable.name] = _renamed_definition(taken, variable.name)
+            taken.add(renames["VAR", variable.name])
+    taken = {template.name for template in target.templates}
+    taken |= {template.name for template in imported.templates}
+    for template in imported.templates:
+        if template.name and target.template_by_name(template.name) is not None:
+            renames["TPL", template.name] = _renamed_definition(taken, template.name)
+            taken.add(renames["TPL", template.name])
+    return renames
+
+
+def _merge_definitions(
+    target: ExpansionStore,
+    imported: ExpansionStore,
+    conflict_action: str,
+    renames: dict[tuple[str, str], str],
+    result: ImportMergeResult,
+) -> None:
+    """Apply the chosen action to the imported variables and templates.
+
+    Matched by name alone, with no comparison of contents. Whether two
+    definitions happen to agree today decides whether the question is worth
+    asking, not what the answer does: renaming a definition that currently
+    matches still keeps the imported expansions on their own copy, which is
+    what "keep both" means and stays true after either copy is edited.
+    """
+    for imported_variable in imported.variables:
+        name = imported_variable.name
+        if not name:
+            continue
+        copy = VariableDef.from_dict(imported_variable.to_dict())
+        existing_variable = target.variable_by_name(name)
+        if existing_variable is None:
+            target.variables.append(copy)
+            result.variables_added += 1
+        elif conflict_action == "skip":
+            result.definitions_skipped += 1
+        elif conflict_action == "overwrite":
+            existing_variable.type = copy.type
+            existing_variable.prompt_text = copy.prompt_text
+            existing_variable.default_value = copy.default_value
+            existing_variable.list_options = copy.list_options
+            existing_variable.notes = copy.notes
+            result.definitions_overwritten += 1
+        else:
+            copy.name = renames["VAR", name]
+            target.variables.append(copy)
+            result.definitions_renamed += 1
+
+    for imported_template in imported.templates:
+        name = imported_template.name
+        if not name:
+            continue
+        copy = TemplateDef.from_dict(imported_template.to_dict())
+        # Even a template that is only being added can reference a definition
+        # that was renamed, so every body copied across is rewritten.
+        copy.body = _apply_renames(copy.body, renames)
+        existing_template = target.template_by_name(name)
+        if existing_template is None:
+            target.templates.append(copy)
+            result.templates_added += 1
+        elif conflict_action == "skip":
+            result.definitions_skipped += 1
+        elif conflict_action == "overwrite":
+            existing_template.description = copy.description
+            existing_template.body = copy.body
+            existing_template.notes = copy.notes
+            result.definitions_overwritten += 1
+        else:
+            copy.name = renames["TPL", name]
+            target.templates.append(copy)
+            result.definitions_renamed += 1
+
+
+def copy_store(store: ExpansionStore) -> ExpansionStore:
+    """An independent copy, sharing no records with the original.
+
+    Lets a merge be carried out and inspected before anything is committed to
+    the library the window is showing.
+    """
+    return ExpansionStore(
+        sections=list(store.sections),
+        expansions=[Expansion.from_dict(item.to_dict()) for item in store.expansions],
+        variables=[VariableDef.from_dict(item.to_dict()) for item in store.variables],
+        templates=[TemplateDef.from_dict(item.to_dict()) for item in store.templates],
     )
 
 
@@ -707,9 +1230,16 @@ def merge_imported_store(
         if section not in target.sections:
             target.sections.append(section)
 
+    # Definitions are settled first. A rename among them rewrites the
+    # references in the imported text, and that has to happen before any of it
+    # is copied across.
+    renames = _definition_renames(target, imported, conflict_action)
+    _merge_definitions(target, imported, conflict_action, renames, result)
+
     for imported_expansion in imported.expansions:
         existing = _find_expansion(target, imported_expansion.section, imported_expansion.trigger)
         expansion = Expansion.from_dict(imported_expansion.to_dict())
+        expansion.replacement = _apply_renames(expansion.replacement, renames)
         if existing is None:
             target.expansions.append(expansion)
             result.added += 1
@@ -727,23 +1257,6 @@ def merge_imported_store(
             expansion.trigger = _renamed_trigger(target, expansion.section, expansion.trigger)
             target.expansions.append(expansion)
             result.renamed += 1
-
-    # Variables and templates form a shared, name-keyed library rather than
-    # section-scoped entries. Add any the target lacks; leave existing
-    # definitions of the same name untouched so a merge never clobbers them.
-    existing_variable_names = {variable.name for variable in target.variables}
-    for imported_variable in imported.variables:
-        if imported_variable.name and imported_variable.name not in existing_variable_names:
-            target.variables.append(VariableDef.from_dict(imported_variable.to_dict()))
-            existing_variable_names.add(imported_variable.name)
-            result.variables_added += 1
-
-    existing_template_names = {template.name for template in target.templates}
-    for imported_template in imported.templates:
-        if imported_template.name and imported_template.name not in existing_template_names:
-            target.templates.append(TemplateDef.from_dict(imported_template.to_dict()))
-            existing_template_names.add(imported_template.name)
-            result.templates_added += 1
 
     return result
 
@@ -974,14 +1487,14 @@ def render_ahk(store: ExpansionStore, theme: str = DEFAULT_THEME) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _form_fields(segments: list[Any]) -> list[dict[str, Any]]:
+def _form_fields(segments: list[str | TemplatePlaceholder]) -> list[FormField]:
     """Collect the prompted placeholders into one ordered list of form fields.
 
     A variable used more than once yields a single field -- the first occurrence
     defines its prompt, default and options -- so the form asks once and every
     occurrence receives the same answer.
     """
-    fields: list[dict[str, Any]] = []
+    fields: list[FormField] = []
     seen: set[str] = set()
     for segment in segments:
         if isinstance(segment, str) or segment.kind not in ("AHK_INPUT", "AHK_SELECT"):
@@ -1015,7 +1528,7 @@ def _form_fields(segments: list[Any]) -> list[dict[str, Any]]:
     return fields
 
 
-def _use_form(fields: list[dict[str, Any]]) -> bool:
+def _use_form(fields: list[FormField]) -> bool:
     """Whether to gather these fields in one form dialog.
 
     An expansion whose only prompt is a single dropdown keeps the lighter
@@ -1028,7 +1541,7 @@ def _use_form(fields: list[dict[str, Any]]) -> bool:
     return not (len(fields) == 1 and fields[0]["kind"] == "select")
 
 
-def _form_fields_literal(fields: list[dict[str, Any]]) -> str:
+def _form_fields_literal(fields: list[FormField]) -> str:
     """Emit the fields array TEM_Form builds its controls from.
 
     The title is emitted even though the dialog titles itself with the trigger
@@ -1038,7 +1551,7 @@ def _form_fields_literal(fields: list[dict[str, Any]]) -> str:
 
     Key order is fixed because the reconstruction regexes match on it.
     """
-    items = []
+    items: list[str] = []
     for field in fields:
         head = (
             f'Map("name", {_ahk_string(field["name"])}, '
@@ -1055,7 +1568,7 @@ def _form_fields_literal(fields: list[dict[str, Any]]) -> str:
     return "[" + ", ".join(items) + "]"
 
 
-def _form_parts_literal(segments: list[Any]) -> str:
+def _form_parts_literal(segments: list[str | TemplatePlaceholder]) -> str:
     """Emit the parts array TEM_Form assembles its live preview from.
 
     Literals become strings and prompted placeholders become {var} references
@@ -1064,7 +1577,7 @@ def _form_parts_literal(segments: list[Any]) -> str:
     than the expression. Key presses and images have no text form, so they show
     as a bracketed chip standing in for the action.
     """
-    items = []
+    items: list[str] = []
     for segment in segments:
         if isinstance(segment, str):
             if segment:
@@ -1090,7 +1603,7 @@ def render_expansion(
         # "::", which AutoHotkey reads as the start of an execute hotstring and
         # then errors ("hotstring is missing its opening brace"). Emit an inert
         # comment instead so the generated script always runs.
-        return RenderedExpansion([f'; Skipped "{expansion.trigger}": empty replacement.'])
+        return _skipped(expansion, "empty replacement.")
 
     segments = resolve_template_segments(
         parse_replacement_template(expansion.replacement),
@@ -1108,17 +1621,39 @@ def render_expansion(
     )
 
     if not dynamic:
-        if use_paste:
+        # Every segment is literal on this branch, but expansion.replacement is
+        # still the unresolved source. Emitting it verbatim sends the raw
+        # {TPL:Name} text for any template whose body holds no placeholder of
+        # its own -- so templates appeared to work only while something in them
+        # stayed dynamic. The source marker keeps the unresolved text for
+        # import; the hotstring gets the resolved text.
+        resolved = "".join(cast(str, segment) for segment in segments)
+        if resolved == "":
+            # As above: "::" with nothing after it is read as an execute
+            # hotstring and fails to load. Reachable through a template whose
+            # body is empty, which the check at the top of the function cannot
+            # see -- and an empty body is easy to arrive at, since a template
+            # can be created before it is written.
+            return _skipped(expansion, "replacement resolves to nothing.")
+        # A static hotstring's replacement runs to the end of its own line, so
+        # a line break cannot survive there -- _single_line_replacement folds
+        # each one to a space. Replacement text is written in a multiline box,
+        # so that silently rewrote anything typed across two lines, and only
+        # when the text happened to hold no placeholder: the same paragraph
+        # kept its breaks as soon as a variable was added to it. Text with
+        # breaks takes the block form instead, where _ahk_string encodes them.
+        if use_paste or _is_multiline(resolved):
+            send = "TEM_Paste" if use_paste else "SendText"
             lines = [f":{HOTSTRING_OPTIONS}:{expansion.trigger}::", "{"]
-            lines.append(f"    TEM_Paste({_ahk_string(expansion.replacement)})")
+            lines.append(f"    {send}({_ahk_string(resolved)})")
             lines.extend(_end_char_lines())
             lines.append("}")
         else:
             lines = [
-                f":{STATIC_HOTSTRING_OPTIONS}:{expansion.trigger}::{_single_line_replacement(expansion.replacement)}"
+                f":{STATIC_HOTSTRING_OPTIONS}:{expansion.trigger}::{_single_line_replacement(resolved)}"
             ]
         if expansion.notes:
-            lines.append(f"; Notes: {expansion.notes}")
+            lines.extend(_notes_lines(expansion.notes))
         body = [_source_marker(expansion), *_maybe_disable_lines(lines, expansion.enabled)]
         return RenderedExpansion(body, needs_paste_helper=use_paste)
 
@@ -1140,10 +1675,13 @@ def render_expansion(
         )
         lines.append("    if (!IsObject(__tem_vals))")
         lines.append("        return")
-        for field in fields:
-            lines.append(
-                f'    {field["name"]} := __tem_vals[{_ahk_string(field["name"])}]'
-            )
+        # No "<name> := __tem_vals[...]" line per field any more. Copying the
+        # answers into locals named by the user put user-chosen text into
+        # identifier position, where it collided with whatever already had that
+        # name: the generator's own locals, AutoHotkey's built-ins, and the
+        # functions the block goes on to call. Read from the map instead --
+        # the answers are keyed by name and the keys are case-sensitive, which
+        # also keeps "Client" and "client" apart where two locals could not be.
 
     def flush_result() -> None:
         lines.append("    if (__tem_result != \"\") {")
@@ -1160,18 +1698,25 @@ def render_expansion(
         if segment.kind == "AHK_EXPR":
             lines.append(f"    __tem_result .= {segment.value}")
         elif segment.kind == "AHK_INPUT":
-            # The form already assigned the variable, including for a repeat
-            # occurrence, so the value is only appended here.
+            # The form gathered every answer up front, including for a repeat
+            # occurrence, so each occurrence only reads its key back.
             variable, prompt, title, default = segment.args
-            if not use_form:
+            if use_form:
+                lines.append(f"    __tem_result .= __tem_vals[{_ahk_string(variable)}]")
+            else:
+                # Unreachable as it stands: _use_form takes the form for any
+                # text input, so only a lone dropdown gets here. Kept in the
+                # same shape as the branch below so it cannot become a trap if
+                # that rule is ever relaxed.
                 lines.append(f"    __tem_input_{variable} := InputBox({_ahk_string(prompt)}, {_ahk_string(title)}, , {_ahk_string(default)})")
                 lines.append(f"    if (__tem_input_{variable}.Result = \"Cancel\")")
                 lines.append("        return")
-                lines.append(f"    {variable} := __tem_input_{variable}.Value")
-            lines.append(f"    __tem_result .= {variable}")
+                lines.append(f"    __tem_result .= __tem_input_{variable}.Value")
         elif segment.kind == "AHK_SELECT":
             variable, prompt, title, *options = segment.args
-            if not use_form:
+            if use_form:
+                lines.append(f"    __tem_result .= __tem_vals[{_ahk_string(variable)}]")
+            else:
                 option_list = ", ".join(_ahk_string(option) for option in options)
                 window_title = _ahk_string(_prompt_title(expansion.trigger))
                 lines.append(
@@ -1180,9 +1725,10 @@ def render_expansion(
                 )
                 lines.append(f"    if (!__tem_select_{variable}.ok)")
                 lines.append("        return")
-                lines.append(f"    {variable} := __tem_select_{variable}.value")
+                # Read off the prefixed local rather than copying it to one
+                # named by the user, for the reason above.
+                lines.append(f"    __tem_result .= __tem_select_{variable}.value")
                 needs_select_helper = True
-            lines.append(f"    __tem_result .= {variable}")
         elif segment.kind == "AHK_KEY":
             key_name = segment.value
             flush_result()
@@ -1200,7 +1746,7 @@ def render_expansion(
         lines.extend(_end_char_lines())
     lines.append("}")
     if expansion.notes:
-        lines.append(f"; Notes: {expansion.notes}")
+        lines.extend(_notes_lines(expansion.notes))
     body = [_source_marker(expansion), *_maybe_disable_lines(lines, expansion.enabled)]
     return RenderedExpansion(
         body,
@@ -1440,9 +1986,28 @@ def placeholder_to_text(placeholder: TemplatePlaceholder) -> str:
     return f"{{{placeholder.kind}:{placeholder.value}}}"
 
 
-def validate_store_placeholders(store: ExpansionStore) -> None:
-    validate_variables(store.variables)
-    validate_templates(store.templates)
+def placeholder_problems(store: ExpansionStore) -> dict[str, str]:
+    """Everything stopping this store generating, keyed by what it belongs to.
+
+    All of them, not the first: comparing two stores by whether each has "a
+    problem" cannot tell a fault the import introduced from one that was
+    already there, and collapses to "already broken, allow anything" as soon
+    as the library has a single fault of its own.
+
+    The keys identify a record rather than a position, so they survive
+    everything moving around them. Both the key and the message are compared,
+    so a record that was already broken and is now broken differently counts
+    as a new fault.
+    """
+    problems: dict[str, str] = {}
+    try:
+        validate_variables(store.variables)
+    except ValueError as exc:
+        problems["variables"] = str(exc)
+    try:
+        validate_templates(store.templates)
+    except ValueError as exc:
+        problems["templates"] = str(exc)
     for expansion in store.expansions:
         try:
             segments = resolve_template_segments(
@@ -1451,7 +2016,9 @@ def validate_store_placeholders(store: ExpansionStore) -> None:
             )
             resolve_variable_segments(segments, store.variables)
         except ValueError as exc:
-            raise ValueError(f'Invalid placeholder in trigger "{expansion.trigger}": {exc}') from exc
+            problems[f"expansion {expansion.section}\0{expansion.trigger}"] = (
+                f'Invalid placeholder in trigger "{expansion.trigger}": {exc}'
+            )
     for template in store.templates:
         try:
             segments = resolve_template_segments(
@@ -1461,7 +2028,20 @@ def validate_store_placeholders(store: ExpansionStore) -> None:
             )
             resolve_variable_segments(segments, store.variables)
         except ValueError as exc:
-            raise ValueError(f'Invalid placeholder in template "{template.name}": {exc}') from exc
+            problems[f"template {template.name}"] = (
+                f'Invalid placeholder in template "{template.name}": {exc}'
+            )
+    return problems
+
+
+def validate_store_placeholders(store: ExpansionStore) -> None:
+    """Raise on the first thing stopping this store generating.
+
+    The collector above decides the order, which is the order this function
+    used to check in: definitions, then expansions, then template bodies.
+    """
+    for message in placeholder_problems(store).values():
+        raise ValueError(message)
 
 
 def parse_replacement_template(text: str) -> list[str | TemplatePlaceholder]:
@@ -1657,6 +2237,112 @@ def validate_templates(templates: list[TemplateDef]) -> None:
 def validate_template(template: TemplateDef) -> None:
     if not template.name:
         raise ValueError("Template name cannot be blank.")
+    # A reference is written {TPL:name}, and the placeholder pattern reads the
+    # name as everything up to the next brace. So a name holding one cannot be
+    # referred to: "Bad}Name" yields "{TPL:Bad}Name}", which parses as a
+    # reference to a template called "Bad" followed by the text "Name}", and
+    # "Bad{Name" does not parse at all. Refused here rather than at generate
+    # time, because a rename cascades the broken reference through every
+    # expansion that used the old name first.
+    #
+    # Only braces. Pipes, colons, quotes, semicolons and the rest were each
+    # checked and round-trip exactly, so there is nothing to gain by refusing
+    # them.
+    if "{" in template.name or "}" in template.name:
+        raise ValueError(
+            f'Template name "{template.name}" cannot contain "{{" or "}}": '
+            "a template is referred to as {TPL:name}, so a name holding a "
+            "brace cannot be written as a reference."
+        )
+
+
+# Which library item a reference points at: a variable or another template.
+ReferenceKind = Literal["VAR", "TPL"]
+
+
+def _text_references(text: str, kind: ReferenceKind, name: str) -> bool:
+    """Whether text uses {VAR:name} or {TPL:name}.
+
+    Matched with the placeholder pattern rather than parsed, because the
+    callers ask this while deciding whether a rename or a delete is safe --
+    exactly when a library is most likely to be half-broken elsewhere, and a
+    parse error somewhere unrelated must not hide a real reference here.
+    """
+    return any(
+        match.group(1) == kind and match.group(2).strip() == name
+        for match in PLACEHOLDER_RE.finditer(text)
+    )
+
+
+def find_references(store: ExpansionStore, kind: ReferenceKind, name: str) -> list[str]:
+    """Everything in the library that uses this variable or template.
+
+    Labelled for a dialog rather than returned as objects: the callers only
+    need to tell the user what would break.
+    """
+    labels = [
+        f'expansion "{expansion.trigger}"'
+        for expansion in store.expansions
+        if _text_references(expansion.replacement, kind, name)
+    ]
+    labels += [
+        f'template "{template.name}"'
+        for template in store.templates
+        if _text_references(template.body, kind, name)
+    ]
+    return labels
+
+
+def _apply_renames(text: str, renames: dict[tuple[str, str], str]) -> str:
+    """Point every renamed reference in text at its new name, in one pass.
+
+    One pass rather than one call per mapping: applied in turn, an earlier
+    substitution's output is still there to be matched by a later one, so a
+    mapping onto a name that another mapping renames would carry the first
+    reference along with it.
+
+    Substituted over the matched spans so everything else in the text -- other
+    placeholders, spacing, the surrounding prose -- is returned byte for byte.
+    Rebuilding the string from parsed segments would reformat placeholders the
+    user never touched.
+    """
+    if not renames:
+        return text
+
+    def swap(match: re.Match[str]) -> str:
+        # Keyed on what the text says, never on what a substitution produced.
+        new = renames.get((match.group(1), match.group(2).strip()))
+        return match.group(0) if new is None else f"{{{match.group(1)}:{new}}}"
+
+    return PLACEHOLDER_RE.sub(swap, text)
+
+
+def rename_in_text(text: str, kind: ReferenceKind, old: str, new: str) -> str:
+    """Point every {VAR:old} / {TPL:old} in text at new."""
+    return _apply_renames(text, {(kind, old): new})
+
+
+def rename_references(
+    store: ExpansionStore, kind: ReferenceKind, old: str, new: str
+) -> int:
+    """Point the whole library at the new name. Returns how many texts changed.
+
+    Renaming a variable or template used to leave every reference to it
+    dangling: the library still autosaved, and only generation failed, well
+    after the rename that caused it.
+    """
+    changed = 0
+    for expansion in store.expansions:
+        updated = rename_in_text(expansion.replacement, kind, old, new)
+        if updated != expansion.replacement:
+            expansion.replacement = updated
+            changed += 1
+    for template in store.templates:
+        updated = rename_in_text(template.body, kind, old, new)
+        if updated != template.body:
+            template.body = updated
+            changed += 1
+    return changed
 
 
 def _validate_unmatched_placeholders(text: str, matched_starts: set[int]) -> None:
@@ -1670,8 +2356,46 @@ def _validate_unmatched_placeholders(text: str, matched_starts: set[int]) -> Non
 
 
 def _validate_variable_name(value: str, placeholder_name: str) -> None:
+    # No reserved-name rules any more. They existed because the answer was
+    # copied into a local named by the user, which collided with the
+    # generator's own locals, AutoHotkey's built-ins and its keywords. Answers
+    # are read out of a map now, so the name reaches the script only as a
+    # string key -- and a list of names that no longer break anything would
+    # just be refusing valid input.
+    # "<caller> name" rather than "<caller> variable": the caller for a saved
+    # definition is "Variable", which read as "Variable variable must be...".
     if not VARIABLE_RE.match(value):
-        raise ValueError(f"{placeholder_name} variable must be a valid AutoHotkey identifier.")
+        raise ValueError(
+            f'{placeholder_name} name "{value}" must be a valid AutoHotkey identifier.'
+        )
+
+
+def _skipped_marker(expansion: Expansion) -> str:
+    """The whole record for an expansion that generates no hotstring.
+
+    _source_marker carries only what the hotstring line cannot -- the trigger,
+    the enabled state and the section come from the line and the header. A
+    skipped expansion emits neither, so nothing tied the marker to an
+    expansion and a re-import dropped it. This carries the full record, as the
+    variable and template markers already do.
+    """
+    return "; @tem-skipped: " + json.dumps(
+        expansion.to_dict(), ensure_ascii=False, separators=(",", ":")
+    )
+
+
+def _skipped(expansion: Expansion, reason: str) -> RenderedExpansion:
+    """An expansion that emits no hotstring, plus the record to get it back.
+
+    The comment is for whoever reads the generated file; the marker above it is
+    what import reads.
+    """
+    return RenderedExpansion(
+        [
+            _skipped_marker(expansion),
+            f'; Skipped "{expansion.trigger}": {reason}',
+        ]
+    )
 
 
 def _source_marker(expansion: Expansion) -> str:
@@ -1691,6 +2415,37 @@ def _template_marker(template: TemplateDef) -> str:
     return "; @tem-template: " + json.dumps(
         template.to_dict(), ensure_ascii=False, separators=(",", ":")
     )
+
+
+def _notes_lines(notes: str) -> list[str]:
+    """The human-readable notes comment, one comment marker per physical line.
+
+    Notes are written in a multiline box, so the value arrives with the line
+    breaks the user typed. Emitted as a single "; Notes: <value>" string, only
+    the first physical line is commented -- every line after it is written to
+    the script at column zero, in code position, where AutoHotkey parses it. A
+    stray brace or an unbalanced bracket fails the load outright; a line that
+    happens to be valid syntax runs, and a line that happens to look like a
+    hotstring silently defines a second one.
+
+    Returning a line per element rather than one embedded-newline string also
+    covers the disabled case, since _maybe_disable_lines prefixes each element
+    and cannot see inside one.
+
+    The label repeats on every line instead of indenting the continuations to
+    align under it, which would read better but is not safe: this file is also
+    parsed by import_ahk, and a comment marker followed by only whitespace is
+    exactly the prefix HOTSTRING_RE accepts for a disabled hotstring and
+    SECTION_RE for a section header. An aligned note line beginning ":CT:..."
+    would come back as a real (disabled) expansion and one reading "=== x ==="
+    would open a new section. "Notes: " is non-blank, so neither pattern can
+    reach past it.
+
+    The source marker above carries the notes as JSON on a single line and is
+    what import reads back, so this comment exists purely for someone reading
+    the generated file.
+    """
+    return [f"; Notes: {line}" for line in notes.splitlines() or [""]]
 
 
 def _maybe_disable_lines(lines: list[str], enabled: bool) -> list[str]:
@@ -1980,7 +2735,16 @@ def _end_char_lines() -> list[str]:
     ]
 
 
+def _is_multiline(text: str) -> bool:
+    return "\n" in text or "\r" in text
+
+
 def _single_line_replacement(text: str) -> str:
+    # render_expansion routes text with line breaks to the block form, so the
+    # collapse below should no longer have anything to do. It stays as a guard
+    # rather than an assertion because the failure it prevents is the worse
+    # one: a raw newline here would end the hotstring and leave the rest of the
+    # replacement sitting in code position, where AutoHotkey tries to run it.
     collapsed = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
     # A static replacement runs to the end of the line, where AHK still reads a
     # backtick as its escape character and opens a comment at a semicolon that

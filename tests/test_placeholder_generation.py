@@ -7,6 +7,7 @@ from ahk_manager import (
     AHK_THEME_COLORS,
     Expansion,
     ExpansionStore,
+    TemplateDef,
     TemplatePlaceholder,
     generate_ahk,
     parse_replacement_template,
@@ -25,6 +26,115 @@ class PlaceholderGenerationTests(unittest.TestCase):
 
         self.assertIn(":CT:brb::Be right back", output)
         self.assertNotIn("SendText(__tem_result)", output)
+
+    def _rendered(self, replacement: str, templates: list[TemplateDef] | None = None) -> str:
+        return render_ahk(
+            ExpansionStore(
+                sections=["Common"],
+                expansions=[Expansion("Common", "sig", replacement)],
+                templates=templates or [],
+            )
+        )
+
+    def test_a_line_break_in_literal_text_survives(self) -> None:
+        # A static hotstring ends at its own line break, so this text used to be
+        # folded to "first second" with nothing said about it.
+        output = self._rendered("first\nsecond")
+
+        self.assertIn('SendText("first`nsecond")', output)
+        self.assertNotIn("first second", output)
+
+    def test_a_crlf_line_break_survives(self) -> None:
+        self.assertIn('SendText("first`r`nsecond")', self._rendered("first\r\nsecond"))
+
+    def test_a_template_supplied_line_break_survives(self) -> None:
+        output = self._rendered("{TPL:Signoff}", [TemplateDef("Signoff", body="Regards,\nDon")])
+
+        self.assertIn('SendText("Regards,`nDon")', output)
+
+    def test_multiline_text_needing_paste_still_pastes(self) -> None:
+        # The dash rule picks the delivery method; the line break only decides
+        # that this cannot be a static hotstring.
+        output = self._rendered("A -- B\nnext")
+
+        self.assertIn('TEM_Paste("A -- B`nnext")', output)
+        self.assertNotIn("SendText(\"A", output)
+
+    def test_single_line_text_is_still_a_static_hotstring(self) -> None:
+        # The block form costs a helper and a code path, so text that does not
+        # need it must not get it.
+        output = self._rendered("Regards, Don")
+
+        self.assertIn(":CT:sig::Regards, Don", output)
+        self.assertNotIn("SendText", output)
+
+    def test_the_source_marker_keeps_the_original_line_breaks(self) -> None:
+        # The marker is what import reads back, so the stored replacement has
+        # to survive the trip unchanged.
+        self.assertIn(r'"replacement":"first\nsecond"', self._rendered("first\nsecond"))
+
+    def _with_notes(self, notes: str, enabled: bool = True, replacement: str = "x") -> str:
+        return render_ahk(
+            ExpansionStore(
+                sections=["Common"],
+                expansions=[Expansion("Common", "sig", replacement, enabled, notes)],
+            )
+        )
+
+    def test_every_line_of_a_multiline_note_is_commented(self) -> None:
+        # Only the first line used to get a marker; the rest were written at
+        # column zero, where AutoHotkey parses them as code.
+        output = self._with_notes("Used for clients\nUpdated July 2026")
+
+        self.assertIn("; Notes: Used for clients", output)
+        self.assertIn("; Notes: Updated July 2026", output)
+        for line in output.splitlines():
+            if "Updated July 2026" in line:
+                self.assertTrue(line.startswith(";"), line)
+
+    def test_a_note_cannot_introduce_a_statement(self) -> None:
+        output = self._with_notes('one\nMsgBox("unexpected")')
+
+        self.assertNotIn('\nMsgBox("unexpected")', output)
+
+    def test_a_note_cannot_introduce_a_second_hotstring(self) -> None:
+        # This one is the quiet failure: it is valid AutoHotkey, so the script
+        # loads and the extra trigger is simply live.
+        output = self._with_notes("one\n:CT:;evil::pwned")
+
+        self.assertNotIn("\n:CT:;evil::pwned", output)
+
+    def test_a_disabled_expansion_comments_every_note_line_too(self) -> None:
+        # _maybe_disable_lines prefixes each list element and cannot see inside
+        # one, so an embedded newline escaped it as well.
+        output = self._with_notes("one\nMsgBox(1)", enabled=False)
+
+        for line in output.splitlines():
+            if "MsgBox(1)" in line:
+                self.assertTrue(line.startswith(";"), line)
+
+    def test_notes_on_a_dynamic_expansion_are_commented_per_line(self) -> None:
+        output = self._with_notes("one\nMsgBox(1)", replacement="hi {AHK_INPUT:n|Name|T|}")
+
+        self.assertIn("; Notes: MsgBox(1)", output)
+        self.assertNotIn("\nMsgBox(1)", output)
+
+    def test_the_label_repeats_rather_than_aligning(self) -> None:
+        # A comment marker followed by only whitespace is the prefix
+        # HOTSTRING_RE reads as a disabled hotstring, so aligned continuations
+        # would be safe from AutoHotkey but not from our own importer.
+        output = self._with_notes("one\ntwo")
+
+        self.assertNotIn(";        two", output)
+        self.assertEqual(output.count("; Notes: "), 2)
+
+    def test_a_single_line_note_is_unchanged(self) -> None:
+        self.assertIn("; Notes: just one", self._with_notes("just one"))
+
+    def test_the_source_marker_still_carries_the_whole_note(self) -> None:
+        # The marker is what import reads back, so the line breaks have to
+        # survive there even though the comment splits them.
+        self.assertIn(r'"notes":"one\ntwo"', self._with_notes("one\ntwo"))
 
     def test_empty_replacement_is_skipped_not_broken(self) -> None:
         # A ":opts:trigger::" line with nothing after "::" makes AutoHotkey expect
@@ -98,8 +208,10 @@ class PlaceholderGenerationTests(unittest.TestCase):
             "__tem_fields, __tem_parts)",
             output,
         )
-        self.assertIn('client_name := __tem_vals["client_name"]', output)
-        self.assertIn("__tem_result .= client_name", output)
+        # Read from the values map rather than copied into a local named by
+        # the user, which is what used to collide with built-ins and functions.
+        self.assertIn('__tem_result .= __tem_vals["client_name"]', output)
+        self.assertNotIn('client_name := __tem_vals', output)
         self.assertNotIn("InputBox(", output)
 
     def test_form_preview_parts_carry_literals_and_field_references(self) -> None:
@@ -139,8 +251,7 @@ class PlaceholderGenerationTests(unittest.TestCase):
         output = render_ahk(store)
 
         self.assertEqual(output.count('Map("name", "amount"'), 1)
-        self.assertEqual(output.count('amount := __tem_vals["amount"]'), 1)
-        self.assertEqual(output.count("__tem_result .= amount"), 2)
+        self.assertEqual(output.count('__tem_result .= __tem_vals["amount"]'), 2)
 
     def test_prompts_are_positioned_on_the_typed_on_monitor(self) -> None:
         # Both prompts anchor to where the trigger was typed. The shared helper
@@ -207,7 +318,10 @@ class PlaceholderGenerationTests(unittest.TestCase):
             '["Pending", "Approved", "Rejected"], "Text Expansion Manager - status")',
             output,
         )
-        self.assertIn("status := __tem_select_status.value", output)
+        # The prefixed local is read directly; the answer is never copied to
+        # a local named "status".
+        self.assertIn("__tem_result .= __tem_select_status.value", output)
+        self.assertNotIn("status := __tem_select_status.value", output)
 
     def test_malformed_placeholder_raises_clear_error(self) -> None:
         store = ExpansionStore(
