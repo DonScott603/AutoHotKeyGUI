@@ -59,6 +59,70 @@ class LoadValidationTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     AppSettings.load(self.path, Path("unused"))
 
+    def test_a_settings_field_must_be_a_string(self) -> None:
+        # These become filesystem paths, so coercing is worse here than for a
+        # record: ["backups"] became a directory named "['backups']" that
+        # start-up created and migrated backups into.
+        for label, payload in (
+            ("array path", {"generated_ahk_path": ["out.ahk"]}),
+            ("object backup dir", {"backup_directory": {"path": "backups"}}),
+            ("number path", {"generated_ahk_path": 42}),
+            ("boolean backup dir", {"backup_directory": True}),
+        ):
+            with self.subTest(label):
+                self.path.write_text(json.dumps(payload), encoding="utf-8")
+
+                with self.assertRaises(ValueError):
+                    AppSettings.load(self.path, Path("unused"))
+
+    def test_the_settings_message_names_the_field_and_the_type(self) -> None:
+        self.path.write_text(
+            json.dumps({"generated_ahk_path": ["out.ahk"]}), encoding="utf-8"
+        )
+
+        with self.assertRaises(ValueError) as caught:
+            AppSettings.load(self.path, Path("unused"))
+
+        message = str(caught.exception)
+        self.assertIn("expansions.json", message)  # the temp file's name
+        self.assertIn('"generated_ahk_path"', message)
+        self.assertIn("list", message)
+
+    def test_absent_and_null_settings_keep_their_defaults(self) -> None:
+        # Long-standing behaviour, and not corruption: both mean "not set".
+        for label, payload in (
+            ("absent", {}),
+            ("null", {"generated_ahk_path": None, "backup_directory": None}),
+        ):
+            with self.subTest(label):
+                self.path.write_text(json.dumps(payload), encoding="utf-8")
+
+                settings = AppSettings.load(self.path, Path("fallback.ahk"))
+
+                self.assertEqual(settings.generated_ahk_path, "fallback.ahk")
+                self.assertEqual(settings.backup_directory, "")
+
+    def test_valid_settings_still_load(self) -> None:
+        self.path.write_text(
+            json.dumps({"generated_ahk_path": "out.ahk", "backup_directory": "b"}),
+            encoding="utf-8",
+        )
+
+        settings = AppSettings.load(self.path, Path("unused"))
+
+        self.assertEqual(settings.generated_ahk_path, "out.ahk")
+        self.assertEqual(settings.backup_directory, "b")
+
+    def test_an_unknown_settings_field_is_left_alone(self) -> None:
+        self.path.write_text(
+            json.dumps({"generated_ahk_path": "out.ahk", "later_field": [1]}),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            AppSettings.load(self.path, Path("unused")).generated_ahk_path, "out.ahk"
+        )
+
     def test_the_message_names_the_file_and_what_was_found(self) -> None:
         # It goes straight into a dialog, so it has to say which file and why.
         self.path.write_text("[]", encoding="utf-8")

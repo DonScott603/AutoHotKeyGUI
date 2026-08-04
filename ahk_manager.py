@@ -71,6 +71,15 @@ class AppSettings:
         # whatever was on disk, which is what every read below assumes.
         data = cast(dict[str, Any], parsed)
 
+        # Both fields become filesystem paths, so str() is worse here than it
+        # is for a record: an array does not fail, it becomes a directory named
+        # "['backups']" that start-up then creates and migrates backups into.
+        # Absent and null still fall back to the defaults below, which is how
+        # they have always been read.
+        problem = _record_problem(data, "settings")
+        if problem:
+            raise ValueError(f"Could not load {path.name}: {problem}.")
+
         configured_path = str(data.get("generated_ahk_path") or "").strip()
         backup_directory = str(data.get("backup_directory") or "").strip()
         return cls(configured_path or str(default_ahk_path), backup_directory)
@@ -202,6 +211,9 @@ def _collection_field(data: dict[str, Any], key: str, filename: str) -> list[Any
 # would quietly disable an expansion. "text_list" also accepts a single string,
 # the newline-separated form VariableDef.from_dict already splits.
 _FIELD_TYPES = {
+    "settings": {
+        "generated_ahk_path": "text", "backup_directory": "text",
+    },
     "expansions": {
         "section": "text", "trigger": "text", "replacement": "text",
         "enabled": "bool", "notes": "text",
