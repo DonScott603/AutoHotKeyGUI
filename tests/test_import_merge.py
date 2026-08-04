@@ -9,10 +9,12 @@ from ahk_manager import (
     TemplateDef,
     VariableDef,
     _apply_renames,
+    copy_store,
     count_import_conflicts,
     generate_ahk,
     import_ahk,
     merge_imported_store,
+    placeholder_problem,
     render_ahk,
 )
 
@@ -145,6 +147,51 @@ class MarkerValidationTests(unittest.TestCase):
         self.assertEqual(len(imported.expansions), 2)
         self.assertEqual(len(imported.variables), 1)
         self.assertEqual(len(imported.templates), 2)
+
+
+class CandidateHelperTests(unittest.TestCase):
+    """The pieces the caller needs to try a merge before committing it."""
+
+    def test_a_copy_shares_nothing_with_the_original(self) -> None:
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";a", "text")],
+            variables=[VariableDef("v", "list_selection", "P", "", ["one"], "")],
+            templates=[TemplateDef("T", body="body")],
+        )
+
+        copy = copy_store(store)
+        copy.sections.append("Added")
+        copy.expansions[0].replacement = "changed"
+        copy.variables[0].list_options.append("two")
+        copy.templates[0].body = "changed"
+        copy.expansions.append(Expansion("Work", ";b", "new"))
+
+        self.assertEqual(store.sections, ["Work"])
+        self.assertEqual(store.expansions[0].replacement, "text")
+        self.assertEqual(store.variables[0].list_options, ["one"])
+        self.assertEqual(store.templates[0].body, "body")
+        self.assertEqual(len(store.expansions), 1)
+
+    def test_a_store_that_generates_has_no_problem(self) -> None:
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";a", "Dear {VAR:v}")],
+            variables=[VariableDef("v", "text_input", "P", "", [], "")],
+        )
+
+        self.assertIsNone(placeholder_problem(store))
+
+    def test_a_store_that_cannot_generate_says_why(self) -> None:
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";a", "{VAR:missing}")],
+        )
+
+        problem = placeholder_problem(store)
+
+        self.assertIsNotNone(problem)
+        self.assertIn('Undefined variable "missing"', str(problem))
 
 
 class ImportedStoreValidationTests(unittest.TestCase):

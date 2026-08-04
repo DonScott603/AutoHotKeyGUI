@@ -62,6 +62,7 @@ from ahk_manager import (
     VARIABLE_TYPES,
     backup_file,
     backup_timestamp,
+    copy_store,
     count_import_conflicts,
     find_references,
     generate_ahk,
@@ -71,6 +72,7 @@ from ahk_manager import (
     migrate_backups,
     restore_backup,
     parse_replacement_template,
+    placeholder_problem,
     rename_in_text,
     rename_references,
     resolve_expansion_preview,
@@ -2699,9 +2701,33 @@ class ExpansionApp(QMainWindow):
             if conflict_action is None:
                 return
 
-        result = merge_imported_store(self.store, imported, conflict_action)
+        # Merged into a copy first. Whether the result can generate depends on
+        # both libraries and on the action just chosen, so it cannot be settled
+        # any earlier: a reference the imported file leaves open may be one this
+        # library supplies, and two templates that are each fine alone can close
+        # a cycle once they are together. Leaving it to generate time was not an
+        # answer either, because the merge writes straight into the live store
+        # and autosaves.
+        candidate = copy_store(self.store)
+        result = merge_imported_store(candidate, imported, conflict_action)
+        problem = placeholder_problem(candidate)
+        # Refused only if the import is what breaks it. A library already unable
+        # to generate is the user's to fix, and blaming an import for it would
+        # bar them from importing at all until they had.
+        if problem and placeholder_problem(self.store) is None:
+            show_error(
+                self,
+                "Import error",
+                f"{Path(file_path).name} was not imported: {problem}\n\n"
+                "Nothing in your library has changed.",
+            )
+            return
+
+        self.store = candidate
         self.selected_section = imported.sections[0] if imported.sections else self.store.sections[0]
         self.current_expansion = None
+        self.current_variable = None
+        self.current_template = None
         self.refresh_sections()
         self.refresh_expansions()
         self.refresh_variables()

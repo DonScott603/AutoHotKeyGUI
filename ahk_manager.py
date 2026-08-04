@@ -1181,6 +1181,33 @@ def _merge_definitions(
             result.definitions_renamed += 1
 
 
+def copy_store(store: ExpansionStore) -> ExpansionStore:
+    """An independent copy, sharing no records with the original.
+
+    Lets a merge be carried out and inspected before anything is committed to
+    the library the window is showing.
+    """
+    return ExpansionStore(
+        sections=list(store.sections),
+        expansions=[Expansion.from_dict(item.to_dict()) for item in store.expansions],
+        variables=[VariableDef.from_dict(item.to_dict()) for item in store.variables],
+        templates=[TemplateDef.from_dict(item.to_dict()) for item in store.templates],
+    )
+
+
+def placeholder_problem(store: ExpansionStore) -> str | None:
+    """Why this store could not generate, or None if it could.
+
+    The question validate_store_placeholders answers by raising, phrased so a
+    caller can ask it of two stores and compare the answers.
+    """
+    try:
+        validate_store_placeholders(store)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
 def merge_imported_store(
     target: ExpansionStore,
     imported: ExpansionStore,
