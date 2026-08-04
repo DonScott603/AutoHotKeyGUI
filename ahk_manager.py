@@ -546,6 +546,9 @@ HOTSTRING_OPTIONS = "C"
 # (e.g. a leading/trailing "!" becomes Alt), corrupting the expansion.
 STATIC_HOTSTRING_OPTIONS = "CT"
 VARIABLE_TYPES = {"text_input", "list_selection", "date_time"}
+# What a date_time variable formats with when its format is left blank. Shared
+# so the preview cannot claim one thing and the generator emit another.
+DEFAULT_DATE_FORMAT = "yyyy-MM-dd"
 
 
 def _marker_record(
@@ -1794,27 +1797,37 @@ def resolve_variable_preview(variable: VariableDef) -> PreviewResult:
     placeholder = variable_to_placeholder(variable)
     resolved = placeholder_to_text(placeholder)
     dynamic = "Yes" if placeholder.kind in {"AHK_INPUT", "AHK_SELECT", "AHK_EXPR"} else "No"
-    options = "\n".join(f"- {option}" for option in variable.list_options) or "(none)"
-    content = "\n".join(
-        [
-            "Variable Preview",
-            "================",
-            "",
-            f"Name: {variable.name}",
-            f"Type: {variable.type}",
-            f"Prompt text: {variable.prompt_text or '(none)'}",
-            f"Default value: {variable.default_value or '(none)'}",
+    # Only the fields this type reads, the same ones its form shows. Listing
+    # the rest as "(none)" reads as missing information rather than as fields
+    # the type has no use for.
+    lines = [
+        "Variable Preview",
+        "================",
+        "",
+        f"Name: {variable.name}",
+        f"Type: {variable.type}",
+    ]
+    if variable.type == "date_time":
+        lines.append(f"Format: {variable.default_value or DEFAULT_DATE_FORMAT}")
+    else:
+        lines.append(f"Prompt text: {variable.prompt_text or '(none)'}")
+    if variable.type == "text_input":
+        lines.append(f"Default value: {variable.default_value or '(none)'}")
+    if variable.type == "list_selection":
+        lines += [
             "",
             "List Options",
             "------------",
-            options,
-            "",
-            f"Example placeholder: {{VAR:{variable.name}}}",
-            f"Resolved placeholder form: {resolved}",
-            f"Requires dynamic runtime generation: {dynamic}",
+            "\n".join(f"- {option}" for option in variable.list_options) or "(none)",
+            "The first option is the default.",
         ]
-    )
-    return PreviewResult(f"Variable: {variable.name}", content)
+    lines += [
+        "",
+        f"Example placeholder: {{VAR:{variable.name}}}",
+        f"Resolved placeholder form: {resolved}",
+        f"Requires dynamic runtime generation: {dynamic}",
+    ]
+    return PreviewResult(f"Variable: {variable.name}", "\n".join(lines))
 
 
 def resolve_template_preview(template: TemplateDef, store: ExpansionStore) -> PreviewResult:
@@ -2195,7 +2208,7 @@ def variable_to_placeholder(variable: VariableDef) -> TemplatePlaceholder:
             [variable.name, prompt, title, *variable.list_options],
         )
     if variable.type == "date_time":
-        date_format = variable.default_value or "yyyy-MM-dd"
+        date_format = variable.default_value or DEFAULT_DATE_FORMAT
         return TemplatePlaceholder(
             "AHK_EXPR",
             f'FormatTime(A_Now, "{date_format}")',

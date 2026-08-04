@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
 
 from ahk_manager import (
     DEFAULT_AHK,
+    DEFAULT_DATE_FORMAT,
     DEFAULT_JSON,
     BACKUP_RETENTION_LIMIT,
     DEFAULT_SETTINGS,
@@ -209,6 +210,28 @@ IMAGE_FILE_FILTER = (
 )
 AHK_FILE_FILTER = "AutoHotkey files (*.ahk);;All files (*.*)"
 AHK_PROCESS_NAMES = {"autohotkey.exe", "autohotkey64.exe", "autohotkey32.exe"}
+
+# Each variable type uses some of the value fields and ignores the rest, so the
+# Variables form shows only the ones that apply and puts one of these notes
+# where the box it dropped used to be. A fixed example date keeps the codes
+# concrete without the reference looking out of date next year.
+TEXT_INPUT_DEFAULT_NOTE = (
+    "Default is optional. Leave it blank and the box opens empty."
+)
+LIST_SELECTION_DEFAULT_NOTE = (
+    "The first list option below is the default. Put one option per line."
+)
+DATE_FORMAT_NOTE = (
+    "Codes, shown for Tuesday 4 August 2026 at 2:30 PM:\n"
+    "yyyy / yy  —  2026, 26\n"
+    "MMMM / MMM / MM / M  —  August, Aug, 08, 8\n"
+    "dddd / ddd / dd / d  —  Tuesday, Tue, 04, 4\n"
+    "HH / hh  —  14, 02\n"
+    "mm / ss / tt  —  30, 00, PM\n"
+    "Punctuation and spaces pass through, so yyyy-MM-dd h:mm tt gives "
+    "2026-08-04 2:30 PM.\n"
+    f"Blank uses {DEFAULT_DATE_FORMAT}. Braces and double quotes are rejected."
+)
 
 
 def has_reserved_placeholder_chars(value: str) -> bool:
@@ -1342,20 +1365,37 @@ class ExpansionApp(QMainWindow):
         self.variable_name_edit = QLineEdit()
         self.variable_type_combo = QComboBox()
         self.variable_type_combo.addItems(sorted(VARIABLE_TYPES))
+        # Alphabetical order puts date_time first; an empty form should open on
+        # the same type New gives you, not on the one that hides the most.
+        self.variable_type_combo.setCurrentText("text_input")
         self.variable_prompt_edit = QLineEdit()
         self.variable_default_edit = QLineEdit()
         form_layout.addWidget(QLabel("Name"), 0, 0)
         form_layout.addWidget(self.variable_name_edit, 0, 1)
         form_layout.addWidget(QLabel("Type"), 1, 0)
         form_layout.addWidget(self.variable_type_combo, 1, 1)
-        form_layout.addWidget(QLabel("Prompt text"), 2, 0)
+        self.variable_prompt_label = QLabel("Prompt text")
+        form_layout.addWidget(self.variable_prompt_label, 2, 0)
         form_layout.addWidget(self.variable_prompt_edit, 2, 1)
-        form_layout.addWidget(QLabel("Default/format"), 3, 0)
-        form_layout.addWidget(self.variable_default_edit, 3, 1)
-        form_layout.addWidget(QLabel("List options"), 4, 0, Qt.AlignmentFlag.AlignTop)
+        # The field and the note that stands in for it share a row, in a box of
+        # their own so hiding either one cannot leave the other overlapping it.
+        self.variable_default_label = QLabel("Default")
+        form_layout.addWidget(self.variable_default_label, 3, 0)
+        self.variable_default_note = self._form_note()
+        form_layout.addWidget(
+            self._stacked_field(self.variable_default_edit, self.variable_default_note), 3, 1
+        )
+        self.variable_options_label = QLabel("List options")
+        form_layout.addWidget(self.variable_options_label, 4, 0, Qt.AlignmentFlag.AlignTop)
         self.variable_options_text = QPlainTextEdit()
         self.variable_options_text.setMaximumHeight(120)
-        form_layout.addWidget(self.variable_options_text, 4, 1)
+        self.variable_options_note = self._form_note()
+        form_layout.addWidget(
+            self._stacked_field(self.variable_options_text, self.variable_options_note), 4, 1
+        )
+        self.variable_type_combo.currentTextChanged.connect(
+            lambda _type: self.sync_variable_form_to_type()
+        )
         form_layout.addWidget(QLabel("Notes"), 5, 0, Qt.AlignmentFlag.AlignTop)
         self.variable_notes_text = QPlainTextEdit()
         form_layout.addWidget(self.variable_notes_text, 5, 1)
@@ -1371,6 +1411,7 @@ class ExpansionApp(QMainWindow):
         form_layout.addLayout(variable_actions, 6, 1)
         form_layout.setRowStretch(5, 1)
         form_layout.setColumnStretch(1, 1)
+        self.sync_variable_form_to_type()
 
         splitter.addWidget(left)
         splitter.addWidget(form)
@@ -1379,6 +1420,52 @@ class ExpansionApp(QMainWindow):
         splitter.setSizes([360, 620])
         outer.addWidget(splitter)
         return page
+
+    @staticmethod
+    def _form_note() -> QLabel:
+        """A muted explanation that stands in for a field the type never uses."""
+        note = QLabel()
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        note.setVisible(False)
+        return note
+
+    @staticmethod
+    def _stacked_field(field: QWidget, note: QLabel) -> QWidget:
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(field)
+        layout.addWidget(note)
+        return box
+
+    def sync_variable_form_to_type(self) -> None:
+        """Show only the value fields the selected variable type reads.
+
+        Each type ignores the others' fields entirely, so leaving them on
+        screen invited values that nothing would ever read -- a format typed
+        into a list_selection, options listed against a text_input.
+        """
+        kind = self.variable_type_combo.currentText().strip()
+        is_date = kind == "date_time"
+        is_list = kind == "list_selection"
+
+        # date_time asks nothing: it formats the clock as the expansion fires.
+        self.variable_prompt_label.setVisible(not is_date)
+        self.variable_prompt_edit.setVisible(not is_date)
+
+        self.variable_default_label.setText("Format" if is_date else "Default")
+        self.variable_default_edit.setVisible(not is_list)
+        self.variable_default_note.setText(LIST_SELECTION_DEFAULT_NOTE)
+        self.variable_default_note.setVisible(is_list)
+
+        self.variable_options_label.setVisible(is_list)
+        self.variable_options_text.setVisible(is_list)
+        self.variable_options_note.setText(
+            DATE_FORMAT_NOTE if is_date else TEXT_INPUT_DEFAULT_NOTE
+        )
+        self.variable_options_note.setVisible(not is_list)
 
     def _build_templates_page(self) -> QWidget:
         page = QWidget()
@@ -1685,16 +1772,23 @@ class ExpansionApp(QMainWindow):
         self.template_notes_text.clear()
 
     def read_variable_form(self) -> VariableDef:
+        kind = self.variable_type_combo.currentText().strip()
+        # Only what this type reads is saved. A field the type ignores is
+        # hidden, so carrying its old contents through would store something
+        # the user can no longer see, to surface again on a later type change.
+        options = [
+            line.strip()
+            for line in self.variable_options_text.toPlainText().splitlines()
+            if line.strip()
+        ]
         variable = VariableDef(
             name=self.variable_name_edit.text().strip(),
-            type=self.variable_type_combo.currentText().strip(),
-            prompt_text=self.variable_prompt_edit.text().strip(),
-            default_value=self.variable_default_edit.text().strip(),
-            list_options=[
-                line.strip()
-                for line in self.variable_options_text.toPlainText().splitlines()
-                if line.strip()
-            ],
+            type=kind,
+            prompt_text="" if kind == "date_time" else self.variable_prompt_edit.text().strip(),
+            default_value=(
+                "" if kind == "list_selection" else self.variable_default_edit.text().strip()
+            ),
+            list_options=options if kind == "list_selection" else [],
             notes=self.variable_notes_text.toPlainText().strip(),
         )
         validate_variable(variable)
