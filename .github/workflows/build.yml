@@ -1,6 +1,7 @@
 name: Build Windows exe
 
 on:
+  pull_request:
   release:
     types: [published]
   workflow_dispatch:
@@ -8,9 +9,20 @@ on:
 permissions:
   contents: write
 
+# A branch under review usually gets several pushes in a row, each superseding
+# the last. Without this they queue and every stale commit is built in turn.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
+    # The GUI tests fail as hangs rather than failures when they go wrong: a
+    # modal dialog blocks a headless run, and building many windows in one test
+    # exhausts the process. Both have happened. A runner sitting on one until
+    # the six-hour default is worse than a red build.
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository
