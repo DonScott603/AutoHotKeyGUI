@@ -3,10 +3,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from ahk_manager import (
+    PLACEHOLDER_RE,
     Expansion,
     ExpansionStore,
     TemplateDef,
     VariableDef,
+    _apply_renames,
     count_import_conflicts,
     generate_ahk,
     import_ahk,
@@ -281,6 +283,106 @@ class DefinitionConflictTests(unittest.TestCase):
 
         self.assertEqual(
             [t.name for t in target.templates], ["Sig", "Sig_imported", "Sig_imported2"]
+        )
+
+    def test_a_generated_name_does_not_land_on_an_imported_one(self) -> None:
+        # The imported store already had a "v_imported", so allocating that
+        # name for its "v" merged the two: both references ended up on one
+        # definition and the other renamed copy was orphaned.
+        target = ExpansionStore(
+            sections=["Work"],
+            variables=[VariableDef("v", "text_input", "TARGET", "", [], "")],
+        )
+        imported = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";new", "{VAR:v}/{VAR:v_imported}")],
+            variables=[
+                VariableDef("v", "text_input", "IMPORTED v", "", [], ""),
+                VariableDef("v_imported", "text_input", "IMPORTED v_imported", "", [], ""),
+            ],
+        )
+
+        merge_imported_store(target, imported, "rename")
+
+        self.assertEqual(
+            target.expansions[0].replacement, "{VAR:v_imported2}/{VAR:v_imported}"
+        )
+        self.assertEqual(
+            [v.name for v in target.variables], ["v", "v_imported2", "v_imported"]
+        )
+
+    def test_the_same_holds_for_templates(self) -> None:
+        target = ExpansionStore(
+            sections=["Work"], templates=[TemplateDef("Sig", body="TARGET")]
+        )
+        imported = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";new", "{TPL:Sig}/{TPL:Sig_imported}")],
+            templates=[
+                TemplateDef("Sig", body="IMPORTED Sig"),
+                TemplateDef("Sig_imported", body="IMPORTED Sig_imported"),
+            ],
+        )
+
+        merge_imported_store(target, imported, "rename")
+
+        self.assertEqual(
+            target.expansions[0].replacement, "{TPL:Sig_imported2}/{TPL:Sig_imported}"
+        )
+        output = render_ahk(target)
+        self.assertIn("IMPORTED Sig", output)
+        self.assertIn("IMPORTED Sig_imported", output)
+
+    def test_no_renamed_definition_is_left_unreferenced(self) -> None:
+        # What "keep both" means: each imported definition still answers to
+        # whatever imported it.
+        target = ExpansionStore(
+            sections=["Work"],
+            variables=[VariableDef("v", "text_input", "TARGET", "", [], "")],
+        )
+        imported = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";new", "{VAR:v}/{VAR:v_imported}")],
+            variables=[
+                VariableDef("v", "text_input", "IMPORTED v", "", [], ""),
+                VariableDef("v_imported", "text_input", "IMPORTED v_imported", "", [], ""),
+            ],
+        )
+
+        merge_imported_store(target, imported, "rename")
+
+        referenced = {
+            match.group(2)
+            for expansion in target.expansions
+            for match in PLACEHOLDER_RE.finditer(expansion.replacement)
+        }
+        # "v" is the target's own and was never referenced here; everything the
+        # import brought must be.
+        self.assertEqual({v.name for v in target.variables} - referenced, {"v"})
+
+    def test_a_definition_that_does_not_collide_is_not_renamed(self) -> None:
+        # Only a clash with the target earns a new name. Renaming anything else
+        # is what let one generated name chain into another.
+        target = ExpansionStore(
+            sections=["Work"],
+            variables=[VariableDef("v", "text_input", "TARGET", "", [], "")],
+        )
+        imported = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";new", "{VAR:other}")],
+            variables=[VariableDef("other", "text_input", "P", "", [], "")],
+        )
+
+        merge_imported_store(target, imported, "rename")
+
+        self.assertEqual(target.expansions[0].replacement, "{VAR:other}")
+
+    def test_references_are_rewritten_in_one_pass(self) -> None:
+        # Applied one mapping at a time, an earlier substitution's output is
+        # still there for a later one to match.
+        self.assertEqual(
+            _apply_renames("{VAR:a}/{VAR:b}", {("VAR", "a"): "b", ("VAR", "b"): "c"}),
+            "{VAR:b}/{VAR:c}",
         )
 
     def test_a_definition_with_no_counterpart_is_still_just_added(self) -> None:

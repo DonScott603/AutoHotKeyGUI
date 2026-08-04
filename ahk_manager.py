@@ -1034,27 +1034,31 @@ def _definition_renames(
     also rewriting the references to it would leave the imported expansions
     pointing at the definition already here -- which is the very thing that
     made the collision worth asking about.
+
+    Two things keep the mappings independent of each other. A name is only
+    generated for a definition that collides with the target as it stands, so
+    a name introduced here can never itself need renaming. And every name in
+    use on either side is reserved before any is generated, so a generated
+    name cannot land on one that some other definition already answers to --
+    which is what turned an imported "v" and "v_imported" into two references
+    to the same thing.
     """
     if conflict_action != "rename":
         return {}
     renames: dict[tuple[str, str], str] = {}
     taken = {variable.name for variable in target.variables}
+    taken |= {variable.name for variable in imported.variables}
     for variable in imported.variables:
-        if variable.name and variable.name in taken:
+        if variable.name and target.variable_by_name(variable.name) is not None:
             renames["VAR", variable.name] = _renamed_definition(taken, variable.name)
             taken.add(renames["VAR", variable.name])
     taken = {template.name for template in target.templates}
+    taken |= {template.name for template in imported.templates}
     for template in imported.templates:
-        if template.name and template.name in taken:
+        if template.name and target.template_by_name(template.name) is not None:
             renames["TPL", template.name] = _renamed_definition(taken, template.name)
             taken.add(renames["TPL", template.name])
     return renames
-
-
-def _apply_renames(text: str, renames: dict[tuple[str, str], str]) -> str:
-    for (kind, old), new in renames.items():
-        text = rename_in_text(text, cast(ReferenceKind, kind), old, new)
-    return text
 
 
 def _merge_definitions(
@@ -2162,21 +2166,33 @@ def find_references(store: ExpansionStore, kind: ReferenceKind, name: str) -> li
     return labels
 
 
-def rename_in_text(text: str, kind: ReferenceKind, old: str, new: str) -> str:
-    """Point every {VAR:old} / {TPL:old} in text at new.
+def _apply_renames(text: str, renames: dict[tuple[str, str], str]) -> str:
+    """Point every renamed reference in text at its new name, in one pass.
+
+    One pass rather than one call per mapping: applied in turn, an earlier
+    substitution's output is still there to be matched by a later one, so a
+    mapping onto a name that another mapping renames would carry the first
+    reference along with it.
 
     Substituted over the matched spans so everything else in the text -- other
     placeholders, spacing, the surrounding prose -- is returned byte for byte.
     Rebuilding the string from parsed segments would reformat placeholders the
     user never touched.
     """
+    if not renames:
+        return text
 
     def swap(match: re.Match[str]) -> str:
-        if match.group(1) != kind or match.group(2).strip() != old:
-            return match.group(0)
-        return f"{{{kind}:{new}}}"
+        # Keyed on what the text says, never on what a substitution produced.
+        new = renames.get((match.group(1), match.group(2).strip()))
+        return match.group(0) if new is None else f"{{{match.group(1)}:{new}}}"
 
     return PLACEHOLDER_RE.sub(swap, text)
+
+
+def rename_in_text(text: str, kind: ReferenceKind, old: str, new: str) -> str:
+    """Point every {VAR:old} / {TPL:old} in text at new."""
+    return _apply_renames(text, {(kind, old): new})
 
 
 def rename_references(
