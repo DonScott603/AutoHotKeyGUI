@@ -1932,7 +1932,6 @@ class ExpansionApp(QMainWindow):
         self.refresh_expansions()
         self.clear_form()
         self._persist_reporting(f'Deleted section "{section}".')
-        self.set_status(f'Deleted section "{section}".')
 
     def new_expansion(self) -> None:
         self.current_expansion = None
