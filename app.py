@@ -55,6 +55,7 @@ from ahk_manager import (
     AppSettings,
     Expansion,
     ExpansionStore,
+    ImportConflicts,
     ReferenceKind,
     TemplateDef,
     VariableDef,
@@ -580,25 +581,44 @@ def confirm(parent: QWidget | None, title: str, message: str) -> bool:
 # ---------------------------------------------------------------------------
 
 class ImportConflictDialog(QDialog):
-    def __init__(self, parent, conflict_count: int) -> None:
+    def __init__(self, parent, conflicts: ImportConflicts) -> None:
         super().__init__(parent)
         self.setWindowTitle("Import conflicts")
         self.choice: str | None = None
 
         layout = QVBoxLayout(self)
+        # Counted separately because they read differently: a trigger clash
+        # affects that one expansion, a definition clash can reach every
+        # expansion already here that uses the name.
+        described = []
+        if conflicts.triggers:
+            described.append(f"{conflicts.triggers} trigger(s) in the same section")
+        if conflicts.definitions:
+            described.append(f"{conflicts.definitions} variable(s) or template(s)")
         label = QLabel(
-            f"{conflict_count} imported trigger(s) already exist in the same section. "
-            "Choose how to handle all conflicts."
+            f"The imported file has {' and '.join(described)} that already "
+            "exist here. Choose how to handle all of them."
         )
         label.setWordWrap(True)
         layout.addWidget(label)
 
-        self._skip = QRadioButton("Skip duplicate triggers")
-        self._overwrite = QRadioButton("Overwrite existing expansions")
-        self._rename = QRadioButton("Keep both with renamed trigger")
+        self._skip = QRadioButton("Skip them, keeping what is already here")
+        self._overwrite = QRadioButton("Overwrite with the imported versions")
+        self._rename = QRadioButton("Keep both, renaming what is imported")
         self._skip.setChecked(True)
         for widget in (self._skip, self._overwrite, self._rename):
             layout.addWidget(widget)
+
+        if conflicts.definitions:
+            # The one consequence that is not obvious from the choice itself.
+            note = QLabel(
+                "Overwriting a variable or template also changes every "
+                "expansion already here that uses it. Renaming rewrites the "
+                "imported expansions to use the renamed copies."
+            )
+            note.setObjectName("Muted")
+            note.setWordWrap(True)
+            layout.addWidget(note)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -2656,10 +2676,10 @@ class ExpansionApp(QMainWindow):
             show_error(self, "Import error", str(exc))
             return
 
-        conflict_count = count_import_conflicts(self.store, imported)
+        conflicts = count_import_conflicts(self.store, imported)
         conflict_action = "skip"
-        if conflict_count:
-            dialog = ImportConflictDialog(self, conflict_count)
+        if conflicts:
+            dialog = ImportConflictDialog(self, conflicts)
             if not dialog.exec():
                 return
             conflict_action = dialog.choice
@@ -2684,6 +2704,16 @@ class ExpansionApp(QMainWindow):
             status += (
                 f" Added {result.variables_added} variable(s), "
                 f"{result.templates_added} template(s)."
+            )
+        if (
+            result.definitions_overwritten
+            or result.definitions_renamed
+            or result.definitions_skipped
+        ):
+            status += (
+                f" Existing definitions: {result.definitions_overwritten} "
+                f"overwritten, {result.definitions_renamed} renamed, "
+                f"{result.definitions_skipped} skipped."
             )
         self._persist_reporting(status)
 

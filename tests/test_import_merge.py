@@ -7,6 +7,7 @@ from ahk_manager import (
     ExpansionStore,
     TemplateDef,
     VariableDef,
+    count_import_conflicts,
     generate_ahk,
     import_ahk,
     merge_imported_store,
@@ -142,6 +143,154 @@ class MarkerValidationTests(unittest.TestCase):
         self.assertEqual(len(imported.expansions), 2)
         self.assertEqual(len(imported.variables), 1)
         self.assertEqual(len(imported.templates), 2)
+
+
+class DefinitionConflictTests(unittest.TestCase):
+    """A same-name variable or template is a conflict, not a silent keep.
+
+    Definitions were merged by name with the existing one always winning, and
+    the conflict count only looked at triggers. So an import reported no
+    conflict, added nothing, and left the imported expansions bound to
+    definitions they did not ship with -- generating something other than the
+    script they came from, with nothing said.
+    """
+
+    def _stores(self) -> tuple[ExpansionStore, ExpansionStore]:
+        target = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";old", "uses {TPL:Sig} and {VAR:v}")],
+            variables=[VariableDef("v", "text_input", "EXISTING", "", [], "")],
+            templates=[TemplateDef("Sig", body="EXISTING")],
+        )
+        imported = ExpansionStore(
+            sections=["Work"],
+            expansions=[Expansion("Work", ";new", "uses {TPL:Sig} and {VAR:v}")],
+            variables=[VariableDef("v", "text_input", "IMPORTED", "", [], "")],
+            templates=[TemplateDef("Sig", body="IMPORTED")],
+        )
+        return target, imported
+
+    def test_a_differing_definition_counts_as_a_conflict(self) -> None:
+        target, imported = self._stores()
+
+        conflicts = count_import_conflicts(target, imported)
+
+        self.assertEqual(conflicts.triggers, 0)
+        self.assertEqual(conflicts.definitions, 2)
+        self.assertTrue(conflicts)
+
+    def test_a_matching_definition_is_not_a_conflict(self) -> None:
+        # Re-importing a file generated from this same library collides on
+        # every name and differs in none, and must not raise the question.
+        target, imported = self._stores()
+        imported.variables[0].prompt_text = "EXISTING"
+        imported.templates[0].body = "EXISTING"
+
+        conflicts = count_import_conflicts(target, imported)
+
+        self.assertEqual(conflicts.definitions, 0)
+        self.assertFalse(conflicts)
+
+    def test_skip_keeps_the_definitions_already_here(self) -> None:
+        target, imported = self._stores()
+
+        result = merge_imported_store(target, imported, "skip")
+
+        self.assertEqual(target.templates[0].body, "EXISTING")
+        self.assertEqual(target.variables[0].prompt_text, "EXISTING")
+        self.assertEqual(result.definitions_skipped, 2)
+
+    def test_overwrite_replaces_them(self) -> None:
+        target, imported = self._stores()
+
+        result = merge_imported_store(target, imported, "overwrite")
+
+        self.assertEqual(target.templates[0].body, "IMPORTED")
+        self.assertEqual(target.variables[0].prompt_text, "IMPORTED")
+        self.assertEqual(result.definitions_overwritten, 2)
+
+    def test_overwrite_also_changes_the_expansions_already_here(self) -> None:
+        # The consequence the dialog has to spell out: this reaches expansions
+        # that were never part of the import.
+        target, imported = self._stores()
+
+        merge_imported_store(target, imported, "overwrite")
+
+        self.assertIn("IMPORTED", render_ahk(target))
+
+    def test_rename_keeps_both_and_repoints_the_imported_expansions(self) -> None:
+        # Renaming the definition alone would leave the imported expansion
+        # saying {TPL:Sig}, so it would bind to the copy already here -- the
+        # exact behaviour the choice exists to avoid.
+        target, imported = self._stores()
+
+        result = merge_imported_store(target, imported, "rename")
+
+        by_trigger = {e.trigger: e.replacement for e in target.expansions}
+        self.assertEqual(by_trigger[";old"], "uses {TPL:Sig} and {VAR:v}")
+        self.assertEqual(
+            by_trigger[";new"], "uses {TPL:Sig_imported} and {VAR:v_imported}"
+        )
+        self.assertEqual(result.definitions_renamed, 2)
+        self.assertEqual([t.name for t in target.templates], ["Sig", "Sig_imported"])
+        self.assertEqual([v.name for v in target.variables], ["v", "v_imported"])
+
+    def test_rename_leaves_a_library_that_still_generates(self) -> None:
+        target, imported = self._stores()
+
+        merge_imported_store(target, imported, "rename")
+
+        output = render_ahk(target)
+        self.assertIn("EXISTING", output)
+        self.assertIn("IMPORTED", output)
+
+    def test_rename_rewrites_bodies_of_definitions_it_only_adds(self) -> None:
+        # A template with no name clash still has to follow a renamed variable.
+        target, imported = self._stores()
+        imported.templates.append(TemplateDef("Fresh", body="new {VAR:v}"))
+
+        merge_imported_store(target, imported, "rename")
+
+        fresh = next(t for t in target.templates if t.name == "Fresh")
+        self.assertEqual(fresh.body, "new {VAR:v_imported}")
+
+    def test_rename_renames_a_matching_definition_too(self) -> None:
+        # Matching contents decide whether to ask, not what the answer does:
+        # keeping both means the imported expansions keep their own copy, which
+        # stays true after either copy is edited.
+        target, imported = self._stores()
+        imported.templates[0].body = "EXISTING"
+
+        merge_imported_store(target, imported, "rename")
+
+        self.assertEqual([t.name for t in target.templates], ["Sig", "Sig_imported"])
+
+    def test_renaming_does_not_disturb_the_imported_store(self) -> None:
+        target, imported = self._stores()
+
+        merge_imported_store(target, imported, "rename")
+
+        self.assertEqual(imported.expansions[0].replacement, "uses {TPL:Sig} and {VAR:v}")
+        self.assertEqual(imported.templates[0].name, "Sig")
+
+    def test_a_second_rename_does_not_collide(self) -> None:
+        target, imported = self._stores()
+        target.templates.append(TemplateDef("Sig_imported", body="ALREADY TAKEN"))
+
+        merge_imported_store(target, imported, "rename")
+
+        self.assertEqual(
+            [t.name for t in target.templates], ["Sig", "Sig_imported", "Sig_imported2"]
+        )
+
+    def test_a_definition_with_no_counterpart_is_still_just_added(self) -> None:
+        target, imported = self._stores()
+        imported.variables.append(VariableDef("brand_new", "text_input", "P", "", [], ""))
+
+        result = merge_imported_store(target, imported, "skip")
+
+        self.assertEqual(result.variables_added, 1)
+        self.assertIn("brand_new", [v.name for v in target.variables])
 
 
 class ImportMergeTests(unittest.TestCase):

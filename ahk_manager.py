@@ -443,10 +443,36 @@ class ImportMergeResult:
     conflicts: int = 0
     variables_added: int = 0
     templates_added: int = 0
+    # Variables and templates that already existed by name. Counted together
+    # because the choice is made once for both, and the caller reports them
+    # the same way.
+    definitions_overwritten: int = 0
+    definitions_renamed: int = 0
+    definitions_skipped: int = 0
 
     @property
     def total_changed(self) -> int:
         return self.added + self.overwritten + self.renamed
+
+
+@dataclass
+class ImportConflicts:
+    """What the imported file already has counterparts for here.
+
+    Split because the two read differently to someone deciding: a trigger
+    conflict affects that expansion, and a definition conflict can reach every
+    expansion already in the library that uses the name.
+    """
+
+    triggers: int = 0
+    definitions: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.triggers + self.definitions
+
+    def __bool__(self) -> bool:
+        return self.total > 0
 
 
 @dataclass
@@ -945,12 +971,153 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
     return "".join(parts) if parts else None
 
 
-def count_import_conflicts(target: ExpansionStore, imported: ExpansionStore) -> int:
-    return sum(
-        1
-        for expansion in imported.expansions
-        if _find_expansion(target, expansion.section, expansion.trigger) is not None
+def count_import_conflicts(
+    target: ExpansionStore, imported: ExpansionStore
+) -> ImportConflicts:
+    """What the imported store already has counterparts for here.
+
+    A definition matching the one already here is not counted: it needs no
+    decision, because skipping and overwriting both leave the library exactly
+    as it is. That keeps the question quiet on the common round trip of
+    re-importing a file this app generated from this same library, where every
+    definition collides by name and none of them differ.
+
+    Renaming still renames those matching definitions -- see
+    merge_imported_store -- but only once something else has prompted the
+    question.
+    """
+    return ImportConflicts(
+        triggers=sum(
+            1
+            for expansion in imported.expansions
+            if _find_expansion(target, expansion.section, expansion.trigger) is not None
+        ),
+        definitions=(
+            sum(
+                1
+                for variable in imported.variables
+                if _differs(target.variable_by_name(variable.name), variable)
+            )
+            + sum(
+                1
+                for template in imported.templates
+                if _differs(target.template_by_name(template.name), template)
+            )
+        ),
     )
+
+
+def _differs(existing: VariableDef | TemplateDef | None, imported: VariableDef | TemplateDef) -> bool:
+    """Whether a same-name definition already here holds something else."""
+    if not imported.name or existing is None:
+        return False
+    return existing.to_dict() != imported.to_dict()
+
+
+def _renamed_definition(taken: set[str], name: str) -> str:
+    """A free name for an imported definition, in the shape triggers use."""
+    base = f"{name}_imported"
+    candidate = base
+    suffix = 2
+    while candidate in taken:
+        candidate = f"{base}{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _definition_renames(
+    target: ExpansionStore, imported: ExpansionStore, conflict_action: str
+) -> dict[tuple[str, str], str]:
+    """New names for the imported definitions that collide, keyed by kind.
+
+    Decided up front, before anything is copied. Renaming a definition without
+    also rewriting the references to it would leave the imported expansions
+    pointing at the definition already here -- which is the very thing that
+    made the collision worth asking about.
+    """
+    if conflict_action != "rename":
+        return {}
+    renames: dict[tuple[str, str], str] = {}
+    taken = {variable.name for variable in target.variables}
+    for variable in imported.variables:
+        if variable.name and variable.name in taken:
+            renames["VAR", variable.name] = _renamed_definition(taken, variable.name)
+            taken.add(renames["VAR", variable.name])
+    taken = {template.name for template in target.templates}
+    for template in imported.templates:
+        if template.name and template.name in taken:
+            renames["TPL", template.name] = _renamed_definition(taken, template.name)
+            taken.add(renames["TPL", template.name])
+    return renames
+
+
+def _apply_renames(text: str, renames: dict[tuple[str, str], str]) -> str:
+    for (kind, old), new in renames.items():
+        text = rename_in_text(text, cast(ReferenceKind, kind), old, new)
+    return text
+
+
+def _merge_definitions(
+    target: ExpansionStore,
+    imported: ExpansionStore,
+    conflict_action: str,
+    renames: dict[tuple[str, str], str],
+    result: ImportMergeResult,
+) -> None:
+    """Apply the chosen action to the imported variables and templates.
+
+    Matched by name alone, with no comparison of contents. Whether two
+    definitions happen to agree today decides whether the question is worth
+    asking, not what the answer does: renaming a definition that currently
+    matches still keeps the imported expansions on their own copy, which is
+    what "keep both" means and stays true after either copy is edited.
+    """
+    for imported_variable in imported.variables:
+        name = imported_variable.name
+        if not name:
+            continue
+        copy = VariableDef.from_dict(imported_variable.to_dict())
+        existing_variable = target.variable_by_name(name)
+        if existing_variable is None:
+            target.variables.append(copy)
+            result.variables_added += 1
+        elif conflict_action == "skip":
+            result.definitions_skipped += 1
+        elif conflict_action == "overwrite":
+            existing_variable.type = copy.type
+            existing_variable.prompt_text = copy.prompt_text
+            existing_variable.default_value = copy.default_value
+            existing_variable.list_options = copy.list_options
+            existing_variable.notes = copy.notes
+            result.definitions_overwritten += 1
+        else:
+            copy.name = renames["VAR", name]
+            target.variables.append(copy)
+            result.definitions_renamed += 1
+
+    for imported_template in imported.templates:
+        name = imported_template.name
+        if not name:
+            continue
+        copy = TemplateDef.from_dict(imported_template.to_dict())
+        # Even a template that is only being added can reference a definition
+        # that was renamed, so every body copied across is rewritten.
+        copy.body = _apply_renames(copy.body, renames)
+        existing_template = target.template_by_name(name)
+        if existing_template is None:
+            target.templates.append(copy)
+            result.templates_added += 1
+        elif conflict_action == "skip":
+            result.definitions_skipped += 1
+        elif conflict_action == "overwrite":
+            existing_template.description = copy.description
+            existing_template.body = copy.body
+            existing_template.notes = copy.notes
+            result.definitions_overwritten += 1
+        else:
+            copy.name = renames["TPL", name]
+            target.templates.append(copy)
+            result.definitions_renamed += 1
 
 
 def merge_imported_store(
@@ -966,9 +1133,16 @@ def merge_imported_store(
         if section not in target.sections:
             target.sections.append(section)
 
+    # Definitions are settled first. A rename among them rewrites the
+    # references in the imported text, and that has to happen before any of it
+    # is copied across.
+    renames = _definition_renames(target, imported, conflict_action)
+    _merge_definitions(target, imported, conflict_action, renames, result)
+
     for imported_expansion in imported.expansions:
         existing = _find_expansion(target, imported_expansion.section, imported_expansion.trigger)
         expansion = Expansion.from_dict(imported_expansion.to_dict())
+        expansion.replacement = _apply_renames(expansion.replacement, renames)
         if existing is None:
             target.expansions.append(expansion)
             result.added += 1
@@ -986,23 +1160,6 @@ def merge_imported_store(
             expansion.trigger = _renamed_trigger(target, expansion.section, expansion.trigger)
             target.expansions.append(expansion)
             result.renamed += 1
-
-    # Variables and templates form a shared, name-keyed library rather than
-    # section-scoped entries. Add any the target lacks; leave existing
-    # definitions of the same name untouched so a merge never clobbers them.
-    existing_variable_names = {variable.name for variable in target.variables}
-    for imported_variable in imported.variables:
-        if imported_variable.name and imported_variable.name not in existing_variable_names:
-            target.variables.append(VariableDef.from_dict(imported_variable.to_dict()))
-            existing_variable_names.add(imported_variable.name)
-            result.variables_added += 1
-
-    existing_template_names = {template.name for template in target.templates}
-    for imported_template in imported.templates:
-        if imported_template.name and imported_template.name not in existing_template_names:
-            target.templates.append(TemplateDef.from_dict(imported_template.to_dict()))
-            existing_template_names.add(imported_template.name)
-            result.templates_added += 1
 
     return result
 
