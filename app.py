@@ -515,11 +515,24 @@ def detect_system_theme() -> str:
 
 
 def load_theme_pref() -> str | None:
+    """The saved theme, or None to fall back to the system setting.
+
+    Every unreadable shape gives the same answer rather than an error. This
+    runs before the window exists -- so an exception here is a crash box with
+    nothing behind it -- and unlike the library there is nothing here worth
+    recovering: the file holds one preference, and the next theme toggle
+    rewrites it. Losing it costs the user a click.
+
+    A JSON array, string, number or null parses cleanly and then raises
+    AttributeError on .get, which is what took the window down.
+    """
     try:
-        data = json.loads(UI_PREFS_PATH.read_text(encoding="utf-8"))
+        parsed = json.loads(UI_PREFS_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    theme = data.get("theme")
+    if not isinstance(parsed, dict):
+        return None
+    theme = parsed.get("theme")
     return theme if theme in ("light", "dark") else None
 
 
