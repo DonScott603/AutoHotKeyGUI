@@ -141,7 +141,7 @@ Sections are only for organising the list; they do not affect behaviour.</p>
 <li>A trigger cannot contain spaces or <code>::</code>.</li>
 <li>Triggers are case sensitive, and a leading character such as
 <code>;</code> makes accidental firing much less likely.</li>
-<li>Clear the <b>Enabled</b> box to keep an expansion but leave it out of the
+<li>Clear the <b>On</b> box to keep an expansion but leave it out of the
 generated script.</li>
 <li>Duplicate triggers are flagged, and the last one generated wins.</li>
 </ul>
@@ -1227,7 +1227,7 @@ class ExpansionApp(QMainWindow):
             ("New", self.new_expansion),
             ("Edit", self.load_selected_expansion),
             ("Delete", self.delete_expansion),
-            ("Toggle Enabled", self.toggle_enabled),
+            ("Toggle On/Off", self.toggle_enabled),
         ):
             button = QPushButton(text)
             button.clicked.connect(slot)
@@ -1265,7 +1265,7 @@ class ExpansionApp(QMainWindow):
         self.notes_text.setMaximumHeight(90)
         layout.addWidget(self.notes_text)
 
-        self.enabled_check = QCheckBox("Enabled")
+        self.enabled_check = QCheckBox("On")
         self.enabled_check.setChecked(True)
         layout.addWidget(self.enabled_check)
 
@@ -2065,6 +2065,9 @@ class ExpansionApp(QMainWindow):
         # first happened to survive a refusal only because persist overwrote
         # it, which is the wrong way round to depend on.
         self._persist_reporting(outcome)
+        # The applied expansion now lives in the list, so the form goes back to
+        # a blank new-expansion state rather than holding a stale copy of it.
+        self.new_expansion()
         self.warn_if_duplicate(expansion.trigger)
 
     def preview_expansion(self) -> None:
