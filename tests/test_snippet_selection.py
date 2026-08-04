@@ -189,6 +189,81 @@ class SnippetSelectionTests(unittest.TestCase):
 
         self.assertEqual(self.triggers(), [";one", ";two", ";three"])
 
+    def test_deleting_another_row_leaves_the_open_edits_alone(self) -> None:
+        # Now that selecting a row does not load it, the row being deleted and
+        # the expansion in the editor are two different things. Clearing the
+        # form either way threw away edits nobody asked to discard.
+        self.select_rows(0)
+        self.app.load_selected_expansion()
+        self.app.replacement_text.setPlainText("half typed")
+        self.select_rows(2)
+
+        with mock.patch.object(app_module, "confirm", return_value=True):
+            self.app.delete_expansion()
+
+        self.assertEqual(self.triggers(), [";one", ";two"])
+        self.assertEqual(self.app.trigger_edit.text(), ";one")
+        self.assertEqual(self.app.replacement_text.toPlainText(), "half typed")
+        self.assertIs(self.app.current_expansion, self.app.store.expansions[0])
+
+    def test_deleting_the_open_row_blanks_the_editor(self) -> None:
+        self.select_rows(0)
+        self.app.load_selected_expansion()
+
+        with mock.patch.object(app_module, "confirm", return_value=True):
+            self.app.delete_expansion()
+
+        self.assertEqual(self.app.trigger_edit.text(), "")
+        self.assertIsNone(self.app.current_expansion)
+
+    def test_an_equal_looking_row_is_not_mistaken_for_the_open_one(self) -> None:
+        # Duplicate triggers are allowed, so two records can compare equal
+        # while being different rows. Only the one actually open should count.
+        twin = Expansion("Work", ";one", "first")
+        self.app.store.expansions.append(twin)
+        self.app.refresh_expansions()
+        self.select_rows(0)
+        self.app.load_selected_expansion()
+        self.select_rows(3)  # the twin
+
+        with mock.patch.object(app_module, "confirm", return_value=True):
+            self.app.delete_expansion()
+
+        self.assertEqual(self.app.trigger_edit.text(), ";one")
+        self.assertIs(self.app.current_expansion, self.app.store.expansions[0])
+
+    def test_deleting_a_section_forgets_only_its_own_expansions(self) -> None:
+        # The store drops the section's expansions, so an editor left pointing
+        # at one would apply edits to a record no longer in the library.
+        self.app.store.add_section("Spare")
+        self.app.store.expansions.append(Expansion("Spare", ";spare", "spare text"))
+        self.app.refresh_sections()
+        self.select_rows(0)
+        self.app.load_selected_expansion()
+        self.app.replacement_text.setPlainText("half typed")
+        self.app.selected_section = "Spare"
+
+        with mock.patch.object(app_module, "confirm", return_value=True):
+            self.app.delete_section()
+
+        self.assertEqual(self.triggers(), [";one", ";two", ";three"])
+        self.assertEqual(self.app.replacement_text.toPlainText(), "half typed")
+        self.assertIs(self.app.current_expansion, self.app.store.expansions[0])
+
+    def test_deleting_the_open_expansions_section_blanks_the_editor(self) -> None:
+        self.app.store.add_section("Spare")
+        self.app.refresh_sections()
+        self.select_rows(0)
+        self.app.load_selected_expansion()
+        self.app.selected_section = "Work"
+
+        with mock.patch.object(app_module, "confirm", return_value=True):
+            self.app.delete_section()
+
+        self.assertEqual(self.triggers(), [])
+        self.assertIsNone(self.app.current_expansion)
+        self.assertEqual(self.app.trigger_edit.text(), "")
+
     def test_deleting_nothing_says_so(self) -> None:
         self.app.tree.clearSelection()
 

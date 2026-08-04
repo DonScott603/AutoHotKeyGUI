@@ -2085,14 +2085,20 @@ class ExpansionApp(QMainWindow):
 
     def delete_section(self) -> None:
         section = self.selected_section
-        count = sum(1 for expansion in self.store.expansions if expansion.section == section)
-        if not confirm(self, "Delete section", f'Delete "{section}" and {count} expansion(s)?'):
+        # Held on to because the store drops them, and the editor has to know
+        # whether what it is holding was one of them. Clearing it either way
+        # left it pointing at an expansion no longer in the library, which
+        # Apply would then edit and persist into nothing.
+        doomed = [expansion for expansion in self.store.expansions if expansion.section == section]
+        if not confirm(
+            self, "Delete section", f'Delete "{section}" and {len(doomed)} expansion(s)?'
+        ):
             return
         self.store.delete_section(section)
         self.selected_section = self.store.sections[0]
         self.refresh_sections()
         self.refresh_expansions()
-        self.clear_form()
+        self._forget_deleted_expansion(doomed)
         self._persist_reporting(f'Deleted section "{section}".')
 
     def new_expansion(self) -> None:
@@ -2231,6 +2237,20 @@ class ExpansionApp(QMainWindow):
 
         return Expansion(section, trigger, replacement, self.enabled_check.isChecked(), notes)
 
+    def _forget_deleted_expansion(self, deleted: list[Expansion]) -> None:
+        """Blank the editor only if what it holds is one of the deleted rows.
+
+        Selecting a row no longer loads it, so the selection and the open
+        expansion are now two different things: clearing regardless threw away
+        unapplied edits to an expansion nobody asked to delete. Identity, not
+        ==, because duplicate triggers are allowed and two records that compare
+        equal are still different rows.
+        """
+        if not any(expansion is self.current_expansion for expansion in deleted):
+            return
+        self.current_expansion = None
+        self.clear_form(keep_section=True)
+
     def delete_expansion(self) -> None:
         indexes = self.selected_expansion_indexes()
         if not indexes:
@@ -2250,9 +2270,8 @@ class ExpansionApp(QMainWindow):
         # Highest index first, so each removal leaves the lower ones in place.
         for index in reversed(indexes):
             del self.store.expansions[index]
-        self.current_expansion = None
+        self._forget_deleted_expansion(expansions)
         self.refresh_expansions()
-        self.clear_form(keep_section=True)
         self._persist_reporting(outcome)
 
     def toggle_enabled(self) -> None:
