@@ -113,7 +113,9 @@ class LoadValidationTests(unittest.TestCase):
         self.assertEqual(settings.generated_ahk_path, "out.ahk")
         self.assertEqual(settings.backup_directory, "b")
 
-    def test_an_unknown_settings_field_is_left_alone(self) -> None:
+    def test_an_unknown_settings_field_does_not_stop_the_file_loading(self) -> None:
+        # Ignored, not preserved: settings are rewritten from the known fields
+        # too. See _entry_dicts for why that is left as it is.
         self.path.write_text(
             json.dumps({"generated_ahk_path": "out.ahk", "later_field": [1]}),
             encoding="utf-8",
@@ -278,11 +280,29 @@ class LoadValidationTests(unittest.TestCase):
 
         self.assertEqual(ExpansionStore.load(self.path).variables[0].list_options, ["a", "b"])
 
-    def test_an_unknown_field_is_left_alone(self) -> None:
-        # A file written by a later version has to keep loading here.
+    def test_an_unknown_field_does_not_stop_the_file_loading(self) -> None:
         self._write({"expansions": [{"trigger": ";a", "replacement": "x", "later": {"z": 1}}]})
 
         self.assertEqual(ExpansionStore.load(self.path).expansions[0].trigger, ";a")
+
+    def test_an_unknown_field_is_dropped_when_the_file_is_written_back(self) -> None:
+        # Pinning what actually happens rather than what it looks like. A newer
+        # file opens, but nothing carries the values it added, so the first
+        # autosave rewrites the record without them. This is documented on
+        # _entry_dicts; the test is here so it cannot quietly become untrue in
+        # either direction.
+        self._write({
+            "sections": ["Work"],
+            "expansions": [{"trigger": ";a", "replacement": "x", "later": {"z": 1}}],
+            "later_collection": {"kept": True},
+        })
+
+        ExpansionStore.load(self.path).save(self.path)
+        written = json.loads(self.path.read_text(encoding="utf-8"))
+
+        self.assertNotIn("later_collection", written)
+        self.assertNotIn("later", written["expansions"][0])
+        self.assertEqual(written["expansions"][0]["trigger"], ";a")
 
     def test_a_missing_file_is_not_an_error(self) -> None:
         self.assertEqual(ExpansionStore.load(self.dir / "absent.json").expansions, [])

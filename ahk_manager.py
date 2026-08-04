@@ -261,8 +261,18 @@ def _entry_dicts(data: dict[str, Any], key: str, filename: str) -> list[dict[str
     in the normalised schema, whereas a load error leaves the original on disk
     and routes to the backup restore on the Help page.
 
-    Fields the schema does not name are left alone, so a file written by a
-    later version still loads here.
+    Fields the schema does not name are ignored rather than refused, so a file
+    written by a later version opens. That is not forward compatibility, and
+    was described as such here until it was measured: the values are not
+    carried on the dataclasses and save rebuilds each record from the known
+    fields, so the first autosave drops them. Opening a newer library in an
+    older build and changing anything discards whatever the newer build added.
+
+    Left as it is deliberately. Preserving unknown values would mean carrying
+    them through every record, and refusing a newer file outright would lock
+    the user out of their own library over a field this build has no opinion
+    about. The behaviour is recorded here, and pinned by a test, rather than
+    claimed to be something it is not.
     """
     entries: list[dict[str, Any]] = []
     for index, item in enumerate(_collection_field(data, key, filename)):
