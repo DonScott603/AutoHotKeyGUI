@@ -152,6 +152,61 @@ class VariableTypeFormTests(unittest.TestCase):
         self.assertEqual(saved.default_value, "h:mm tt")
         self.assertEqual(saved.prompt_text, "")
 
+    def test_apply_empties_the_box_the_type_dropped(self) -> None:
+        # Hiding a field does not empty it, so after Apply the form has to be
+        # put back in step with what was saved -- otherwise the dropped value
+        # is still sitting there, out of sight.
+        self.app.variable_tree.selectRow(0)  # client, default "Acme"
+        self.choose("list_selection")
+        self.app.variable_options_text.setPlainText("New\nDone")
+
+        self.app.apply_variable()
+
+        self.assertEqual(self.app.store.variables[0].default_value, "")
+        self.assertEqual(self.app.variable_default_edit.text(), "")
+
+    def test_a_dropped_default_does_not_come_back_on_a_type_change(self) -> None:
+        self.app.variable_tree.selectRow(0)  # client, default "Acme"
+        self.choose("list_selection")
+        self.app.variable_options_text.setPlainText("New\nDone")
+        self.app.apply_variable()
+
+        # Back to the original type without reselecting the row.
+        self.choose("text_input")
+        self.app.apply_variable()
+
+        saved = self.app.store.variables[0]
+        self.assertEqual(saved.type, "text_input")
+        self.assertEqual(saved.default_value, "", "the dropped default came back")
+        self.assertEqual(saved.list_options, [])
+
+    def test_a_dropped_prompt_does_not_come_back_on_a_type_change(self) -> None:
+        self.app.variable_tree.selectRow(0)  # client, prompt "Client"
+        self.choose("date_time")
+        self.app.variable_default_edit.setText("yyyy-MM-dd")
+        self.app.apply_variable()
+        self.assertEqual(self.app.variable_prompt_edit.text(), "")
+
+        self.choose("text_input")
+        self.app.apply_variable()
+
+        self.assertEqual(
+            self.app.store.variables[0].prompt_text, "", "the dropped prompt came back"
+        )
+
+    def test_apply_leaves_the_form_showing_what_was_saved(self) -> None:
+        self.app.variable_tree.selectRow(1)  # status, a list_selection
+        self.app.variable_options_text.setPlainText("New\nDone\nBlocked")
+
+        self.app.apply_variable()
+
+        saved = self.app.store.variables[1]
+        self.assertIs(self.app.current_variable, saved)
+        self.assertEqual(self.app.variable_name_edit.text(), saved.name)
+        self.assertEqual(
+            self.app.variable_options_text.toPlainText(), "\n".join(saved.list_options)
+        )
+
     # -- preview -----------------------------------------------------------
     def test_the_preview_shows_only_the_fields_the_type_reads(self) -> None:
         from ahk_manager import resolve_variable_preview

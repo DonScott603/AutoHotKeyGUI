@@ -1766,7 +1766,16 @@ class ExpansionApp(QMainWindow):
         index = self._table_selected_store_index(self.variable_tree)
         if index is None:
             return
-        variable = self.store.variables[index]
+        self.load_variable(self.store.variables[index])
+
+    def load_variable(self, variable: VariableDef) -> None:
+        """Fill the form from a stored variable, every box of it.
+
+        Used after Apply as well as on selection: a type change hides the
+        fields the new type ignores without emptying them, so a form left as
+        typed still held the dropped value out of sight, ready to come back the
+        moment the type was changed back.
+        """
         self.current_variable = variable
         self.variable_name_edit.setText(variable.name)
         self.variable_type_combo.setCurrentText(variable.type)
@@ -1897,6 +1906,10 @@ class ExpansionApp(QMainWindow):
             self.current_variable.notes = variable.notes
         self.refresh_variables()
         self._persist_reporting(f'Saved variable "{variable.name}".')
+        # Show what was actually saved. The fields this type ignores were
+        # dropped on the way in, and the boxes still holding them are hidden,
+        # so leaving the form as typed kept a dropped value alive off screen.
+        self.load_variable(self.current_variable)
 
     def preview_variable(self) -> None:
         try:
