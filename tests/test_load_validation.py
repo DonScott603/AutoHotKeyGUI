@@ -340,6 +340,10 @@ class UnreadableStoreWriteTests(_RedirectedPaths, unittest.TestCase):
         self.addCleanup(close_window, window)
         return window
 
+    def _backups(self) -> list[Path]:
+        folder = Path(self._temp.name) / "backups"
+        return sorted(folder.glob("*")) if folder.exists() else []
+
     def test_declining_leaves_the_file_untouched(self) -> None:
         window = self._window()
 
@@ -349,6 +353,61 @@ class UnreadableStoreWriteTests(_RedirectedPaths, unittest.TestCase):
         self.assertFalse(saved)
         self.assertTrue(asked.called, "the file was replaced without asking")
         self.assertEqual(self.json_path.read_text(encoding="utf-8"), RECOVERABLE)
+
+    def test_a_failed_backup_stops_the_replacement(self) -> None:
+        # The dialog says the file is backed up first. If that copy cannot be
+        # made, the promise is broken and the file is the only thing left, so
+        # the write has to stop rather than warn and continue.
+        window = self._window()
+
+        with mock.patch.object(app_module, "backup_file", side_effect=OSError("disk full")):
+            with mock.patch.object(app_module, "show_error") as reported:
+                with mock.patch.object(app_module, "confirm", return_value=True):
+                    saved = window.persist()
+
+        self.assertFalse(saved)
+        self.assertTrue(reported.called, "the refusal was silent")
+        self.assertEqual(self.json_path.read_text(encoding="utf-8"), RECOVERABLE)
+        self.assertEqual(self._backups(), [])
+
+    def test_a_failed_backup_keeps_the_file_protected(self) -> None:
+        # The flag has to survive, or the next edit would save straight over
+        # the file without asking again.
+        window = self._window()
+
+        with mock.patch.object(app_module, "backup_file", side_effect=OSError("nope")):
+            with mock.patch.object(app_module, "show_error"):
+                with mock.patch.object(app_module, "confirm", return_value=True):
+                    window.persist()
+
+        self.assertTrue(window._store_unreadable)
+        self.assertTrue(window._unsaved_changes)
+        self.assertEqual(window.unsaved_label.text(), "Unsaved changes")
+
+    def test_the_write_succeeds_once_the_backup_can_be_taken(self) -> None:
+        window = self._window()
+        with mock.patch.object(app_module, "backup_file", side_effect=OSError("nope")):
+            with mock.patch.object(app_module, "show_error"):
+                with mock.patch.object(app_module, "confirm", return_value=True):
+                    window.persist()
+
+        with mock.patch.object(app_module, "confirm", return_value=True) as asked:
+            saved = window.persist()
+
+        self.assertTrue(saved)
+        self.assertTrue(asked.called, "it stopped asking after the failure")
+        self.assertNotEqual(self.json_path.read_text(encoding="utf-8"), RECOVERABLE)
+
+    def test_the_mandatory_backup_is_not_taken_twice(self) -> None:
+        # It counts as the session's backup, so _backup_once has nothing left
+        # to do and cannot add a second copy.
+        window = self._window()
+
+        with mock.patch.object(app_module, "confirm", return_value=True):
+            window.persist()
+            window.persist()
+
+        self.assertEqual(len(self._backups()), 1)
 
     def test_confirming_writes_and_backs_the_original_up(self) -> None:
         window = self._window()
@@ -397,6 +456,32 @@ class UnreadableStoreWriteTests(_RedirectedPaths, unittest.TestCase):
             self.assertTrue(window.persist())
 
         self.assertFalse(asked.called)
+
+
+class OrdinaryBackupTests(_RedirectedPaths, unittest.TestCase):
+    """A readable store keeps saving when its backup cannot be taken.
+
+    The mandatory copy before replacing an unreadable file is the exception,
+    not a new rule for every write: here the file on disk is a known good
+    earlier state, so refusing to save would cost the user their edit to
+    protect something they are not about to lose.
+    """
+
+    def test_a_failed_backup_still_saves_a_readable_store(self) -> None:
+        ExpansionStore(
+            sections=["Work"], expansions=[Expansion("Work", ";a", "first")]
+        ).save(self.json_path)
+        window = ExpansionApp()
+        self.addCleanup(close_window, window)
+        window.store.expansions.append(Expansion("Work", ";b", "second"))
+
+        with mock.patch.object(app_module, "backup_file", side_effect=OSError("nope")):
+            with mock.patch.object(app_module, "show_warning") as warned:
+                saved = window.persist()
+
+        self.assertTrue(saved)
+        self.assertTrue(warned.called, "the failed backup was not mentioned")
+        self.assertIn(";b", self.json_path.read_text(encoding="utf-8"))
 
 
 class FailedSaveReportingTests(_RedirectedPaths, unittest.TestCase):

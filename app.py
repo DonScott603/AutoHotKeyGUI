@@ -2387,7 +2387,42 @@ class ExpansionApp(QMainWindow):
             "Replace it? The current file is backed up first.",
         ):
             return False
+        # The flag is cleared only once the copy exists. _backup_once will not
+        # do: it treats a failed copy as a warning and lets the write proceed,
+        # which is right for a readable file whose contents are already known
+        # good, and wrong for this one -- here the copy is the only remaining
+        # route back to whatever the file held.
+        if not self._back_up_before_replacing():
+            return False
         self._store_unreadable = False
+        return True
+
+    def _back_up_before_replacing(self) -> bool:
+        """Copy the unreadable file aside, or refuse to replace it.
+
+        The dialog above says the file is backed up first, so a failure here
+        has to stop the write rather than warn and carry on. The flag stays
+        set, so the next edit asks again and can succeed once whatever stopped
+        the copy is resolved.
+        """
+        try:
+            backup_file(JSON_PATH, self.current_backup_dir())
+        except OSError as exc:
+            show_error(
+                self,
+                "Replace unreadable library",
+                f"Could not back up {JSON_PATH.name}: {exc}\n\n"
+                f"{JSON_PATH.name} has been left as it is. Replacing it "
+                "without a copy is the one way to lose what it holds for "
+                "good, so nothing was written.",
+            )
+            return False
+        # A missing file returns None and is not a failure: there is nothing to
+        # copy and nothing to lose.
+        #
+        # This copy is also this session's backup, so _backup_once has nothing
+        # left to do and cannot take a second one.
+        self._session_backed_up = True
         return True
 
     def _set_unsaved(self, unsaved: bool) -> None:
