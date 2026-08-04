@@ -15,6 +15,8 @@ from unittest import mock
 # Run Qt without a real display so the GUI tests work headlessly (e.g. in CI).
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QItemSelectionModel, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QTableWidgetSelectionRange
 
 import app as app_module
@@ -59,14 +61,23 @@ class SnippetSelectionTests(unittest.TestCase):
         ) = self._saved_paths
         self._temp.cleanup()
 
-    def select_rows(self, *rows: int) -> None:
-        """Select rows the way a Ctrl-click does, adding to the selection."""
+    def select_rows(self, *rows: int, focus: int | None = None) -> None:
+        """Select rows the way a Ctrl-click does, adding to the selection.
+
+        `focus` is the row wearing the focus rectangle -- Qt's current row,
+        which a click leaves on the row last pointed at. Left out, no row is
+        focused, as after a refresh rebuilds the table.
+        """
         table = self.app.tree
         table.clearSelection()
         last_column = table.columnCount() - 1
         for row in rows:
             table.setRangeSelected(
                 QTableWidgetSelectionRange(row, 0, row, last_column), True
+            )
+        if focus is not None:
+            table.selectionModel().setCurrentIndex(
+                table.model().index(focus, 0), QItemSelectionModel.SelectionFlag.NoUpdate
             )
 
     def triggers(self) -> list[str]:
@@ -87,12 +98,78 @@ class SnippetSelectionTests(unittest.TestCase):
         self.assertEqual(self.app.trigger_edit.text(), ";two")
         self.assertEqual(self.app.replacement_text.toPlainText(), "second")
 
-    def test_edit_opens_the_first_row_of_a_multi_row_selection(self) -> None:
+    def test_edit_opens_the_focused_row_of_a_multi_row_selection(self) -> None:
+        # Ctrl-clicking down the list leaves the focus rectangle on the last
+        # row clicked; opening the topmost instead opened a row the user was
+        # not pointing at.
+        self.select_rows(0, 2, focus=2)
+
+        self.app.load_selected_expansion()
+
+        self.assertEqual(self.app.trigger_edit.text(), ";three")
+
+    def test_edit_falls_back_to_the_topmost_when_no_row_is_focused(self) -> None:
         self.select_rows(2, 1)
 
         self.app.load_selected_expansion()
 
         self.assertEqual(self.app.trigger_edit.text(), ";two")
+
+    def test_edit_ignores_a_focus_outside_the_selection(self) -> None:
+        self.select_rows(0, 2, focus=1)
+
+        self.app.load_selected_expansion()
+
+        self.assertEqual(self.app.trigger_edit.text(), ";one")
+
+    def test_double_clicking_opens_the_row_under_the_pointer(self) -> None:
+        # A real double click, because the bug lived in Qt's press handling:
+        # pressing a row that is already selected defers collapsing the
+        # selection, so the double click arrives with every row still selected.
+        self.app.resize(1180, 760)
+        self.app.show()
+        table = self.app.tree
+
+        def centre(row: int):
+            return table.visualRect(table.model().index(row, 1)).center()
+
+        QTest.mouseClick(
+            table.viewport(), Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier, centre(0),
+        )
+        QTest.mouseClick(
+            table.viewport(), Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.ControlModifier, centre(2),
+        )
+        self.assertEqual(
+            self.app.selected_expansion_indexes(), [0, 2], "the selection was not built"
+        )
+
+        QTest.mouseDClick(
+            table.viewport(), Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier, centre(2),
+        )
+
+        self.assertEqual(self.app.trigger_edit.text(), ";three")
+        self.assertIs(self.app.current_expansion, self.app.store.expansions[2])
+
+    def test_a_double_click_opens_its_own_row_not_the_selection(self) -> None:
+        # Isolates the double-click path from the selection: the handler is
+        # told which row was clicked and must use it, rather than asking the
+        # selection and hoping the two agree.
+        self.select_rows(0, focus=0)
+
+        self.app.tree.cellDoubleClicked.emit(2, 1)
+
+        self.assertEqual(self.app.trigger_edit.text(), ";three")
+        self.assertIs(self.app.current_expansion, self.app.store.expansions[2])
+
+    def test_double_clicking_an_empty_row_opens_nothing(self) -> None:
+        with mock.patch.object(app_module, "show_info") as reported:
+            self.app.load_double_clicked_expansion(99)
+
+        self.assertEqual(self.app.trigger_edit.text(), "")
+        self.assertFalse(reported.called, "a stray double click should stay quiet")
 
     def test_edit_with_nothing_selected_says_so(self) -> None:
         self.app.tree.clearSelection()
@@ -160,6 +237,22 @@ class SnippetSelectionTests(unittest.TestCase):
         self.app.toggle_enabled()
 
         self.assertEqual(self.app.selected_expansion_indexes(), [0, 2])
+
+    def test_the_focused_row_survives_a_toggle(self) -> None:
+        # A rebuilt table has no current row, which would silently move what
+        # Edit opens from the row being pointed at to the topmost selected.
+        self.select_rows(0, 2, focus=2)
+
+        self.app.toggle_enabled()
+
+        self.assertEqual(self.app.selected_expansion_index(), 2)
+
+    def test_a_toggle_leaves_a_focus_behind_when_there_was_none(self) -> None:
+        self.select_rows(1, 2)
+
+        self.app.toggle_enabled()
+
+        self.assertEqual(self.app.tree.currentRow(), 1)
 
     def test_toggling_nothing_says_so(self) -> None:
         self.app.tree.clearSelection()

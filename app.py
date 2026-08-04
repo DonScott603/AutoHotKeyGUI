@@ -7,7 +7,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt
+from PySide6.QtCore import QEvent, QItemSelectionModel, QObject, QRect, QSize, Qt
 from PySide6.QtGui import (
     QCloseEvent,
     QColor,
@@ -1250,7 +1250,9 @@ class ExpansionApp(QMainWindow):
         header.setStretchLastSection(True)
         # Selecting a row no longer loads it: that would fight with building a
         # multi-row selection, and it overwrote the form on a stray click.
-        self.tree.cellDoubleClicked.connect(lambda _r, _c: self.load_selected_expansion())
+        self.tree.cellDoubleClicked.connect(
+            lambda row, _column: self.load_double_clicked_expansion(row)
+        )
         layout.addWidget(self.tree, 1)
 
         actions = QHBoxLayout()
@@ -1623,34 +1625,63 @@ class ExpansionApp(QMainWindow):
         return indexes[0] if indexes else None
 
     @staticmethod
+    def _table_store_index(table: QTableWidget, row: int) -> int | None:
+        """The store index a table row stands for, or None if there is no row."""
+        if row < 0:
+            return None
+        item = table.item(row, 0)
+        if item is None:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    @staticmethod
     def _table_selected_store_indexes(table: QTableWidget) -> list[int]:
         """Every selected row's index into the store, in store order."""
         indexes: list[int] = []
         for row in table.selectionModel().selectedRows():
-            item = table.item(row.row(), 0)
-            if item is None:
-                continue
-            stored = item.data(Qt.ItemDataRole.UserRole)
+            stored = ExpansionApp._table_store_index(table, row.row())
             if stored is not None:
                 indexes.append(stored)
         return sorted(indexes)
 
     @staticmethod
-    def _select_store_indexes(table: QTableWidget, indexes: list[int]) -> None:
+    def _table_rows_by_store_index(table: QTableWidget) -> dict[int, int]:
+        rows: dict[int, int] = {}
+        for row in range(table.rowCount()):
+            stored = ExpansionApp._table_store_index(table, row)
+            if stored is not None:
+                rows[stored] = row
+        return rows
+
+    @staticmethod
+    def _select_store_indexes(
+        table: QTableWidget, indexes: list[int], focus: int | None = None
+    ) -> None:
         """Reselect rows by store index, after a refresh rebuilt the table.
 
         setRangeSelected adds to the selection; selectRow would clear what the
-        previous row just selected.
+        previous row just selected. The focus rectangle has to be put back by
+        hand as well -- a rebuilt table has no current row, and Edit reads the
+        current row to decide which of several selected rows to open.
         """
-        wanted = set(indexes)
+        rows = ExpansionApp._table_rows_by_store_index(table)
         table.clearSelection()
         last_column = table.columnCount() - 1
-        for row in range(table.rowCount()):
-            item = table.item(row, 0)
-            if item is not None and item.data(Qt.ItemDataRole.UserRole) in wanted:
+        for index in indexes:
+            row = rows.get(index)
+            if row is not None:
                 table.setRangeSelected(
                     QTableWidgetSelectionRange(row, 0, row, last_column), True
                 )
+        wanted = focus if focus in rows else (indexes[0] if indexes else None)
+        focus_row = rows.get(wanted) if wanted is not None else None
+        if focus_row is not None:
+            # NoUpdate: move the focus rectangle without touching the selection
+            # that was just rebuilt.
+            table.selectionModel().setCurrentIndex(
+                table.model().index(focus_row, 0),
+                QItemSelectionModel.SelectionFlag.NoUpdate,
+            )
 
     # -- refresh -----------------------------------------------------------
     def refresh_sections(self) -> None:
@@ -2047,7 +2078,19 @@ class ExpansionApp(QMainWindow):
         self.clear_form(keep_section=True)
 
     def selected_expansion_index(self) -> int | None:
-        return self._table_selected_store_index(self.tree)
+        """The one row Edit opens: the focused row, when it is selected.
+
+        Ctrl-clicking down the list leaves the focus rectangle on the last row
+        clicked, so always opening the topmost selected row opened something
+        the user was not pointing at. Falls back to the topmost when nothing is
+        focused -- a refresh rebuilds the rows and clears the current row --
+        or when the focus sits on a row outside the selection.
+        """
+        indexes = self.selected_expansion_indexes()
+        if not indexes:
+            return None
+        focused = self._table_store_index(self.tree, self.tree.currentRow())
+        return focused if focused in indexes else indexes[0]
 
     def selected_expansion_indexes(self) -> list[int]:
         return self._table_selected_store_indexes(self.tree)
@@ -2113,6 +2156,23 @@ class ExpansionApp(QMainWindow):
             # at all would look like the button was broken.
             show_info(self, "Edit expansion", "Select an expansion first.")
             return
+        self.load_expansion(index)
+
+    def load_double_clicked_expansion(self, row: int) -> None:
+        """Open the row that was double-clicked, whatever else is selected.
+
+        Pressing a row that is already part of a multi-row selection does not
+        collapse that selection: Qt defers that to the mouse release so the
+        selection can be dragged. The double click therefore arrives with
+        several rows still selected, and reading the selection instead of the
+        row under the pointer opened a different expansion from the one being
+        double-clicked.
+        """
+        index = self._table_store_index(self.tree, row)
+        if index is not None:
+            self.load_expansion(index)
+
+    def load_expansion(self, index: int) -> None:
         expansion = self.store.expansions[index]
         self.current_expansion = expansion
         self.section_combo.setCurrentText(expansion.section)
@@ -2280,6 +2340,7 @@ class ExpansionApp(QMainWindow):
             show_info(self, "Toggle On/Off", "Select an expansion first.")
             return
         expansions = [self.store.expansions[index] for index in indexes]
+        focused = self._table_store_index(self.tree, self.tree.currentRow())
         # One state for the whole selection rather than flipping each row in
         # place, so a mixed selection comes out consistent instead of merely
         # inverted. A single row still just flips.
@@ -2287,9 +2348,9 @@ class ExpansionApp(QMainWindow):
         for expansion in expansions:
             expansion.enabled = enabled
         self.refresh_expansions()
-        # The refresh rebuilt the rows, so put the selection back for a second
-        # press.
-        self._select_store_indexes(self.tree, indexes)
+        # The refresh rebuilt the rows, so put the selection and the focus back
+        # for a second press.
+        self._select_store_indexes(self.tree, indexes, focused)
         state = "Enabled" if enabled else "Disabled"
         if len(expansions) == 1:
             outcome = f'{state} "{expansions[0].trigger}".'
