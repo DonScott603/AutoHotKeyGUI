@@ -579,28 +579,40 @@ def import_ahk(path: Path) -> ExpansionStore:
     for index, line in enumerate(lines):
         var_match = VAR_MARKER_RE.match(line)
         if var_match:
-            variables.append(
-                VariableDef.from_dict(
-                    _marker_record(
-                        var_match.group("json"), "@tem-var", path, index + 1, "variables"
-                    )
+            variable = VariableDef.from_dict(
+                _marker_record(
+                    var_match.group("json"), "@tem-var", path, index + 1, "variables"
                 )
             )
+            try:
+                validate_variable(variable)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Could not import {path.name}: @tem-var on line "
+                    f"{index + 1}: {exc}"
+                ) from exc
+            variables.append(variable)
             continue
 
         template_match = TEMPLATE_MARKER_RE.match(line)
         if template_match:
-            templates.append(
-                TemplateDef.from_dict(
-                    _marker_record(
-                        template_match.group("json"),
-                        "@tem-template",
-                        path,
-                        index + 1,
-                        "templates",
-                    )
+            template = TemplateDef.from_dict(
+                _marker_record(
+                    template_match.group("json"),
+                    "@tem-template",
+                    path,
+                    index + 1,
+                    "templates",
                 )
             )
+            try:
+                validate_template(template)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Could not import {path.name}: @tem-template on line "
+                    f"{index + 1}: {exc}"
+                ) from exc
+            templates.append(template)
             continue
 
         skipped_match = SKIPPED_MARKER_RE.match(line)
@@ -689,12 +701,57 @@ def import_ahk(path: Path) -> ExpansionStore:
 
     if not sections:
         sections.append("General")
-    return ExpansionStore(
+    store = ExpansionStore(
         sections=sections,
         expansions=expansions,
         variables=variables,
         templates=templates,
     )
+    _validate_imported_store(store, path)
+    return store
+
+
+def _validate_imported_store(store: ExpansionStore, path: Path) -> None:
+    """Refuse a file that would leave the library unable to generate.
+
+    Deliberately stricter than ExpansionStore.load, because the two failures
+    cost different things. Refusing to open the library already on disk locks
+    the user out of the application they would use to repair it, so that path
+    stays lenient and leaves the complaint to generate time. Refusing an
+    import only declines a file: the library is untouched and still works, so
+    there is no reason to take on definitions that cannot generate, merge them
+    into the live store and autosave them -- which is what happened, with the
+    import reported as a success and the failure surfacing later with nothing
+    connecting it back.
+
+    References are the one thing not resolved here. A file may legitimately
+    use a variable or template the importing library already defines, and
+    resolving against the imported file alone would refuse it. Whether the
+    merged result resolves is settled at generate time, where the error names
+    the trigger.
+    """
+    try:
+        # Names, types, list options, and duplicates within the file.
+        validate_variables(store.variables)
+        validate_templates(store.templates)
+        # Placeholder syntax, which is the same answer wherever the text ends
+        # up. resolve_* is deliberately not called: see above.
+        for expansion in store.expansions:
+            try:
+                parse_replacement_template(expansion.replacement)
+            except ValueError as exc:
+                raise ValueError(
+                    f'Invalid placeholder in trigger "{expansion.trigger}": {exc}'
+                ) from exc
+        for template in store.templates:
+            try:
+                parse_replacement_template(template.body)
+            except ValueError as exc:
+                raise ValueError(
+                    f'Invalid placeholder in template "{template.name}": {exc}'
+                ) from exc
+    except ValueError as exc:
+        raise ValueError(f"Could not import {path.name}: {exc}") from exc
 
 
 _BLOCK_OPEN_RE = re.compile(r"^;?\s?\{\s*$")
@@ -2235,8 +2292,12 @@ def _validate_variable_name(value: str, placeholder_name: str) -> None:
     # are read out of a map now, so the name reaches the script only as a
     # string key -- and a list of names that no longer break anything would
     # just be refusing valid input.
+    # "<caller> name" rather than "<caller> variable": the caller for a saved
+    # definition is "Variable", which read as "Variable variable must be...".
     if not VARIABLE_RE.match(value):
-        raise ValueError(f"{placeholder_name} variable must be a valid AutoHotkey identifier.")
+        raise ValueError(
+            f'{placeholder_name} name "{value}" must be a valid AutoHotkey identifier.'
+        )
 
 
 def _skipped_marker(expansion: Expansion) -> str:

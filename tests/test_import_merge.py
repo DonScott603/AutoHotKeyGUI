@@ -147,6 +147,110 @@ class MarkerValidationTests(unittest.TestCase):
         self.assertEqual(len(imported.templates), 2)
 
 
+class ImportedStoreValidationTests(unittest.TestCase):
+    """An import that cannot generate is refused, not merged and autosaved.
+
+    Field types were checked but the rules the editors and the generator apply
+    were not, so a brace-bearing template name, an unsupported variable type or
+    a duplicate definition imported cleanly, was reported as a success, and
+    broke generation later with nothing connecting it back to the import.
+
+    Stricter than ExpansionStore.load on purpose: refusing to open the library
+    already on disk would lock the user out of repairing it, while refusing an
+    import only declines a file.
+    """
+
+    def _import(self, body: str) -> ExpansionStore:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "gen.ahk"
+            path.write_text(
+                "#Requires AutoHotkey v2.0\n\n" + body + "\n", encoding="utf-8"
+            )
+            return import_ahk(path)
+
+    def test_a_definition_that_breaks_its_own_rules_is_refused(self) -> None:
+        for label, marker in (
+            ("brace in a template name", '; @tem-template: {"name":"Bad}Name","body":"x"}'),
+            ("unsupported variable type", '; @tem-var: {"name":"v","type":"nonsense"}'),
+            (
+                "list variable with no options",
+                '; @tem-var: {"name":"v","type":"list_selection","list_options":[]}',
+            ),
+            ("name that is not an identifier", '; @tem-var: {"name":"has space"}'),
+        ):
+            with self.subTest(label):
+                with self.assertRaises(ValueError):
+                    self._import(marker)
+
+    def test_the_message_places_the_marker(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            self._import('; @tem-template: {"name":"Bad}Name","body":"x"}')
+
+        message = str(caught.exception)
+        self.assertIn("gen.ahk", message)
+        self.assertIn("@tem-template", message)
+        self.assertIn("line 3", message)
+        self.assertIn("brace", message)
+
+    def test_duplicate_definitions_are_refused(self) -> None:
+        for label, body in (
+            (
+                "variables",
+                '; @tem-var: {"name":"v"}\n; @tem-var: {"name":"v"}',
+            ),
+            (
+                "templates",
+                '; @tem-template: {"name":"T","body":"a"}\n'
+                '; @tem-template: {"name":"T","body":"b"}',
+            ),
+        ):
+            with self.subTest(label):
+                with self.assertRaisesRegex(ValueError, "Duplicate"):
+                    self._import(body)
+
+    def test_malformed_placeholder_text_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, 'trigger ";x"'):
+            self._import('; @tem: {"replacement":"{VAR:}"}\n:CT:;x::text')
+
+    def test_a_reference_the_importing_library_supplies_still_imports(self) -> None:
+        # The deliberate exception. A file may legitimately use a definition
+        # the target already has, so references are left to generate time --
+        # resolving against the imported file alone would refuse this.
+        imported = self._import('; @tem: {"replacement":"{VAR:elsewhere}"}\n:C:;x::')
+
+        self.assertEqual(imported.expansions[0].replacement, "{VAR:elsewhere}")
+
+    def test_a_generated_file_still_imports(self) -> None:
+        # The guard must not reject what this application writes.
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion("Work", ";a", "Dear {VAR:v}{TPL:Sig}"),
+                Expansion("Work", ";empty", "{TPL:Empty}"),
+            ],
+            variables=[
+                VariableDef("v", "text_input", "Name", "", [], ""),
+                VariableDef("pick", "list_selection", "Pick", "", ["a", "b"], ""),
+            ],
+            templates=[TemplateDef("Sig", body="Regards"), TemplateDef("Empty", body="")],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "gen.ahk"
+            generate_ahk(store, path, backup=False)
+            imported = import_ahk(path)
+
+        self.assertEqual(len(imported.expansions), 2)
+        self.assertEqual(len(imported.variables), 2)
+        self.assertEqual(len(imported.templates), 2)
+
+    def test_a_plain_hotstring_file_still_imports(self) -> None:
+        # Nothing here defines anything, and it must stay importable.
+        imported = self._import(":*:btw::by the way")
+
+        self.assertEqual(imported.expansions[0].replacement, "by the way")
+
+
 class DefinitionConflictTests(unittest.TestCase):
     """A same-name variable or template is a conflict, not a silent keep.
 
