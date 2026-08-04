@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTableWidgetSelectionRange,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -143,6 +144,9 @@ Sections are only for organising the list; they do not affect behaviour.</p>
 <code>;</code> makes accidental firing much less likely.</li>
 <li>Clear the <b>On</b> box to keep an expansion but leave it out of the
 generated script.</li>
+<li>Double-click a row, or select it and press <b>Edit</b>, to open it in the
+editor on the right. Ctrl-click and Shift-click select several rows at once,
+which <b>Delete</b> and <b>Toggle On/Off</b> then act on together.</li>
 <li>Duplicate triggers are flagged, and the last one generated wins.</li>
 </ul>
 
@@ -1213,12 +1217,16 @@ class ExpansionApp(QMainWindow):
         self.tree = QTableWidget(0, 4)
         self.tree.setHorizontalHeaderLabels(["On", "Trigger", "Replacement", "Notes"])
         self._configure_table(self.tree)
+        # Delete and Toggle On/Off act on the whole selection, so Ctrl and
+        # Shift pick out more than one row here.
+        self.tree.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         header = self.tree.horizontalHeader()
         self.tree.setColumnWidth(0, 44)
         self.tree.setColumnWidth(1, 130)
         self.tree.setColumnWidth(2, 300)
         header.setStretchLastSection(True)
-        self.tree.itemSelectionChanged.connect(self.on_expansion_select)
+        # Selecting a row no longer loads it: that would fight with building a
+        # multi-row selection, and it overwrote the form on a stray click.
         self.tree.cellDoubleClicked.connect(lambda _r, _c: self.load_selected_expansion())
         layout.addWidget(self.tree, 1)
 
@@ -1524,13 +1532,38 @@ class ExpansionApp(QMainWindow):
     # -- table helpers -----------------------------------------------------
     @staticmethod
     def _table_selected_store_index(table: QTableWidget) -> int | None:
-        rows = table.selectionModel().selectedRows()
-        if not rows:
-            return None
-        item = table.item(rows[0].row(), 0)
-        if item is None:
-            return None
-        return item.data(Qt.ItemDataRole.UserRole)
+        indexes = ExpansionApp._table_selected_store_indexes(table)
+        return indexes[0] if indexes else None
+
+    @staticmethod
+    def _table_selected_store_indexes(table: QTableWidget) -> list[int]:
+        """Every selected row's index into the store, in store order."""
+        indexes: list[int] = []
+        for row in table.selectionModel().selectedRows():
+            item = table.item(row.row(), 0)
+            if item is None:
+                continue
+            stored = item.data(Qt.ItemDataRole.UserRole)
+            if stored is not None:
+                indexes.append(stored)
+        return sorted(indexes)
+
+    @staticmethod
+    def _select_store_indexes(table: QTableWidget, indexes: list[int]) -> None:
+        """Reselect rows by store index, after a refresh rebuilt the table.
+
+        setRangeSelected adds to the selection; selectRow would clear what the
+        previous row just selected.
+        """
+        wanted = set(indexes)
+        table.clearSelection()
+        last_column = table.columnCount() - 1
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) in wanted:
+                table.setRangeSelected(
+                    QTableWidgetSelectionRange(row, 0, row, last_column), True
+                )
 
     # -- refresh -----------------------------------------------------------
     def refresh_sections(self) -> None:
@@ -1919,11 +1952,11 @@ class ExpansionApp(QMainWindow):
         self.refresh_expansions()
         self.clear_form(keep_section=True)
 
-    def on_expansion_select(self) -> None:
-        self.load_selected_expansion()
-
     def selected_expansion_index(self) -> int | None:
         return self._table_selected_store_index(self.tree)
+
+    def selected_expansion_indexes(self) -> list[int]:
+        return self._table_selected_store_indexes(self.tree)
 
     def add_section(self) -> None:
         name, ok = QInputDialog.getText(self, "Add section", "Section name:")
@@ -1976,6 +2009,9 @@ class ExpansionApp(QMainWindow):
     def load_selected_expansion(self) -> None:
         index = self.selected_expansion_index()
         if index is None:
+            # Selecting a row no longer fills the form, so Edit doing nothing
+            # at all would look like the button was broken.
+            show_info(self, "Edit expansion", "Select an expansion first.")
             return
         expansion = self.store.expansions[index]
         self.current_expansion = expansion
@@ -2102,30 +2138,51 @@ class ExpansionApp(QMainWindow):
         return Expansion(section, trigger, replacement, self.enabled_check.isChecked(), notes)
 
     def delete_expansion(self) -> None:
-        index = self.selected_expansion_index()
-        if index is None:
+        indexes = self.selected_expansion_indexes()
+        if not indexes:
             show_info(self, "Delete expansion", "Select an expansion first.")
             return
-        expansion = self.store.expansions[index]
-        if not confirm(self, "Delete expansion", f'Delete trigger "{expansion.trigger}"?'):
+        expansions = [self.store.expansions[index] for index in indexes]
+        if len(expansions) == 1:
+            title = "Delete expansion"
+            question = f'Delete trigger "{expansions[0].trigger}"?'
+            outcome = f'Deleted trigger "{expansions[0].trigger}".'
+        else:
+            title = "Delete expansions"
+            question = f"Delete {len(expansions)} selected expansions?"
+            outcome = f"Deleted {len(expansions)} expansions."
+        if not confirm(self, title, question):
             return
-        del self.store.expansions[index]
+        # Highest index first, so each removal leaves the lower ones in place.
+        for index in reversed(indexes):
+            del self.store.expansions[index]
         self.current_expansion = None
         self.refresh_expansions()
         self.clear_form(keep_section=True)
-        self._persist_reporting(f'Deleted trigger "{expansion.trigger}".')
+        self._persist_reporting(outcome)
 
     def toggle_enabled(self) -> None:
-        index = self.selected_expansion_index()
-        if index is None:
-            show_info(self, "Toggle enabled", "Select an expansion first.")
+        indexes = self.selected_expansion_indexes()
+        if not indexes:
+            show_info(self, "Toggle On/Off", "Select an expansion first.")
             return
-        expansion = self.store.expansions[index]
-        expansion.enabled = not expansion.enabled
+        expansions = [self.store.expansions[index] for index in indexes]
+        # One state for the whole selection rather than flipping each row in
+        # place, so a mixed selection comes out consistent instead of merely
+        # inverted. A single row still just flips.
+        enabled = not all(expansion.enabled for expansion in expansions)
+        for expansion in expansions:
+            expansion.enabled = enabled
         self.refresh_expansions()
-        self._persist_reporting(
-            f'{"Enabled" if expansion.enabled else "Disabled"} "{expansion.trigger}".'
-        )
+        # The refresh rebuilt the rows, so put the selection back for a second
+        # press.
+        self._select_store_indexes(self.tree, indexes)
+        state = "Enabled" if enabled else "Disabled"
+        if len(expansions) == 1:
+            outcome = f'{state} "{expansions[0].trigger}".'
+        else:
+            outcome = f"{state} {len(expansions)} expansions."
+        self._persist_reporting(outcome)
 
     # -- AHK path / settings ----------------------------------------------
     def current_ahk_path(self) -> Path:
