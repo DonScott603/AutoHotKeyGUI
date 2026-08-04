@@ -59,6 +59,91 @@ class NotesRoundTripTests(unittest.TestCase):
         self.assertEqual(imported.variables, [])
 
 
+class MarkerValidationTests(unittest.TestCase):
+    """A marker record is held to the same shape as one read from JSON.
+
+    The markers went straight to from_dict, which coerces whatever it finds,
+    while ExpansionStore.load checked the same fields first. Both routes end
+    with the record merged into the live library and autosaved, so the lenient
+    one decided what ended up on disk.
+    """
+
+    def _import(self, marker: str) -> ExpansionStore:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "gen.ahk"
+            path.write_text(
+                "#Requires AutoHotkey v2.0\n\n" + marker + "\n", encoding="utf-8"
+            )
+            return import_ahk(path)
+
+    def test_a_field_of_the_wrong_type_is_refused(self) -> None:
+        for label, marker in (
+            (
+                "@tem-skipped enabled",
+                '; @tem-skipped: {"trigger":"x","replacement":"ok","enabled":"false"}',
+            ),
+            ("@tem-var prompt", '; @tem-var: {"name":"v","prompt_text":{"a":1}}'),
+            ("@tem-var options", '; @tem-var: {"name":"v","list_options":[{"k":2}]}'),
+            ("@tem-template body", '; @tem-template: {"name":"T","body":7}'),
+            ("@tem replacement", '; @tem: {"replacement":["a"]}'),
+        ):
+            with self.subTest(label):
+                with self.assertRaises(ValueError):
+                    self._import(marker)
+
+    def test_the_message_places_the_fault(self) -> None:
+        # It goes straight into the Import error dialog, so it has to say which
+        # marker, which line and what was wrong.
+        with self.assertRaises(ValueError) as caught:
+            self._import('; @tem-var: {"name":"v","prompt_text":{"a":1}}')
+
+        message = str(caught.exception)
+        self.assertIn("gen.ahk", message)
+        self.assertIn("@tem-var", message)
+        self.assertIn("line 3", message)
+        self.assertIn('"prompt_text"', message)
+        self.assertIn("dict", message)
+
+    def test_a_marker_that_is_not_json_is_refused(self) -> None:
+        # Previously skipped in silence, which lost the definition and left the
+        # expansions that referenced it undefined.
+        with self.assertRaisesRegex(ValueError, "not valid JSON"):
+            self._import('; @tem-var: {"name": ')
+
+    def test_a_marker_that_is_not_an_object_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be a JSON object"):
+            self._import("; @tem-var: [1, 2]")
+
+    def test_a_well_formed_marker_still_imports(self) -> None:
+        imported = self._import(
+            '; @tem-var: {"name":"v","type":"text_input","prompt_text":"P"}'
+        )
+
+        self.assertEqual(imported.variables[0].name, "v")
+        self.assertEqual(imported.variables[0].prompt_text, "P")
+
+    def test_a_generated_file_round_trips_through_the_stricter_check(self) -> None:
+        # The guard must not reject what the generator itself writes.
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion("Work", ";a", "{VAR:v}", False, "note"),
+                Expansion("Work", ";empty", "{TPL:Empty}"),
+            ],
+            variables=[VariableDef("v", "text_input", "Prompt", "", [], "")],
+            templates=[TemplateDef("Empty", body=""), TemplateDef("T", body="x")],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "gen.ahk"
+            generate_ahk(store, path, backup=False)
+            imported = import_ahk(path)
+
+        self.assertEqual(len(imported.expansions), 2)
+        self.assertEqual(len(imported.variables), 1)
+        self.assertEqual(len(imported.templates), 2)
+
+
 class ImportMergeTests(unittest.TestCase):
     def test_imported_sections_and_expansions_are_merged(self) -> None:
         target = ExpansionStore(

@@ -252,7 +252,6 @@ def _entry_dicts(data: dict[str, Any], key: str, filename: str) -> list[dict[str
     Fields the schema does not name are left alone, so a file written by a
     later version still loads here.
     """
-    expected_types = _FIELD_TYPES[key]
     entries: list[dict[str, Any]] = []
     for index, item in enumerate(_collection_field(data, key, filename)):
         if not isinstance(item, dict):
@@ -261,17 +260,29 @@ def _entry_dicts(data: dict[str, Any], key: str, filename: str) -> list[dict[str
                 f"a JSON object, found {type(item).__name__}."
             )
         entry = cast(dict[str, Any], item)
-        for field, expected in expected_types.items():
-            if field not in entry:
-                continue
-            problem = _field_problem(entry[field], expected)
-            if problem:
-                raise ValueError(
-                    f'Could not load {filename}: "{key}" entry {index + 1} '
-                    f'field "{field}" {problem}.'
-                )
+        problem = _record_problem(entry, key)
+        if problem:
+            raise ValueError(
+                f'Could not load {filename}: "{key}" entry {index + 1} {problem}.'
+            )
         entries.append(entry)
     return entries
+
+
+def _record_problem(entry: dict[str, Any], kind: str) -> str | None:
+    """The first field of this record that is not the type it is written as.
+
+    Shared with the marker importer: a record reaches the library from a JSON
+    collection or from a comment in a generated script, and both end up merged
+    and autosaved, so both have to be held to the same shape.
+    """
+    for field, expected in _FIELD_TYPES[kind].items():
+        if field not in entry:
+            continue
+        problem = _field_problem(entry[field], expected)
+        if problem:
+            return f'field "{field}" {problem}'
+    return None
 
 
 def _section_names(data: dict[str, Any], filename: str) -> list[str]:
@@ -489,6 +500,39 @@ STATIC_HOTSTRING_OPTIONS = "CT"
 VARIABLE_TYPES = {"text_input", "list_selection", "date_time"}
 
 
+def _marker_record(
+    json_text: str, marker: str, path: Path, line_number: int, kind: str
+) -> dict[str, Any]:
+    """The record a marker line carries, or an import error placing the fault.
+
+    Refused rather than skipped or coerced. The markers used to go straight to
+    from_dict, which takes whatever it finds -- bool("false") is True and str()
+    turns an object into its Python repr -- while ExpansionStore.load checked
+    the same fields first. Both routes end with the record merged into the live
+    library and autosaved, so the lenient one decided what ended up on disk.
+    """
+    try:
+        data = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Could not import {path.name}: {marker} on line {line_number} is "
+            f"not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Could not import {path.name}: {marker} on line {line_number} "
+            f"must be a JSON object, found {type(data).__name__}."
+        )
+    record = cast(dict[str, Any], data)
+    problem = _record_problem(record, kind)
+    if problem:
+        raise ValueError(
+            f"Could not import {path.name}: {marker} on line {line_number} "
+            f"{problem}."
+        )
+    return record
+
+
 def import_ahk(path: Path) -> ExpansionStore:
     if not path.exists():
         raise ValueError(f"{path} does not exist.")
@@ -509,47 +553,55 @@ def import_ahk(path: Path) -> ExpansionStore:
     for index, line in enumerate(lines):
         var_match = VAR_MARKER_RE.match(line)
         if var_match:
-            try:
-                data = json.loads(var_match.group("json"))
-            except json.JSONDecodeError:
-                data = None
-            if isinstance(data, dict):
-                variables.append(VariableDef.from_dict(data))
+            variables.append(
+                VariableDef.from_dict(
+                    _marker_record(
+                        var_match.group("json"), "@tem-var", path, index + 1, "variables"
+                    )
+                )
+            )
             continue
 
         template_match = TEMPLATE_MARKER_RE.match(line)
         if template_match:
-            try:
-                data = json.loads(template_match.group("json"))
-            except json.JSONDecodeError:
-                data = None
-            if isinstance(data, dict):
-                templates.append(TemplateDef.from_dict(data))
+            templates.append(
+                TemplateDef.from_dict(
+                    _marker_record(
+                        template_match.group("json"),
+                        "@tem-template",
+                        path,
+                        index + 1,
+                        "templates",
+                    )
+                )
+            )
             continue
 
         skipped_match = SKIPPED_MARKER_RE.match(line)
         if skipped_match:
-            try:
-                data = json.loads(skipped_match.group("json"))
-            except json.JSONDecodeError:
-                data = None
-            if isinstance(data, dict):
-                skipped = Expansion.from_dict(data, current_section)
-                if skipped.trigger:
-                    # The record carries its own section, so it lands where it
-                    # started even though no "; === ... ===" header precedes it.
-                    if skipped.section not in sections:
-                        sections.append(skipped.section)
-                    expansions.append(skipped)
+            skipped = Expansion.from_dict(
+                _marker_record(
+                    skipped_match.group("json"),
+                    "@tem-skipped",
+                    path,
+                    index + 1,
+                    "expansions",
+                ),
+                current_section,
+            )
+            if skipped.trigger:
+                # The record carries its own section, so it lands where it
+                # started even though no "; === ... ===" header precedes it.
+                if skipped.section not in sections:
+                    sections.append(skipped.section)
+                expansions.append(skipped)
             continue
 
         marker_match = SOURCE_MARKER_RE.match(line)
         if marker_match:
-            try:
-                data = json.loads(marker_match.group("json"))
-            except json.JSONDecodeError:
-                data = None
-            pending_source = data if isinstance(data, dict) else None
+            pending_source = _marker_record(
+                marker_match.group("json"), "@tem", path, index + 1, "expansions"
+            )
             continue
 
         section_match = SECTION_RE.match(line)
