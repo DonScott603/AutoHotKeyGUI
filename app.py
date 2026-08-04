@@ -72,7 +72,7 @@ from ahk_manager import (
     migrate_backups,
     restore_backup,
     parse_replacement_template,
-    placeholder_problem,
+    placeholder_problems,
     rename_in_text,
     rename_references,
     resolve_expansion_preview,
@@ -2710,15 +2710,25 @@ class ExpansionApp(QMainWindow):
         # and autosaves.
         candidate = copy_store(self.store)
         result = merge_imported_store(candidate, imported, conflict_action)
-        problem = placeholder_problem(candidate)
-        # Refused only if the import is what breaks it. A library already unable
-        # to generate is the user's to fix, and blaming an import for it would
-        # bar them from importing at all until they had.
-        if problem and placeholder_problem(self.store) is None:
+        # Refused only for what the import breaks. A library already unable to
+        # generate is the user's to fix, and blaming an import for it would bar
+        # them from importing at all until they had.
+        #
+        # Compared record by record, not "does either store have a problem":
+        # that reading switched the check off entirely once the library had a
+        # single fault of its own, so any number of further broken records
+        # could be imported on top of it.
+        before = placeholder_problems(self.store)
+        introduced = [
+            message
+            for key, message in placeholder_problems(candidate).items()
+            if before.get(key) != message
+        ]
+        if introduced:
             show_error(
                 self,
                 "Import error",
-                f"{Path(file_path).name} was not imported: {problem}\n\n"
+                f"{Path(file_path).name} was not imported: {introduced[0]}\n\n"
                 "Nothing in your library has changed.",
             )
             return

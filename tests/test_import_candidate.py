@@ -165,6 +165,45 @@ class ImportCandidateTests(unittest.TestCase):
         self.assertEqual([e.trigger for e in window.store.expansions], [";btw"])
         self.assertIn("Imported", window.status_label.text())
 
+    def test_an_already_broken_library_does_not_switch_the_check_off(self) -> None:
+        # Comparing "does either store have a problem" made these two stores
+        # indistinguishable, so once the library had one fault of its own any
+        # number of further broken records could be imported on top of it.
+        window = self._window(
+            ExpansionStore(
+                sections=["Work"],
+                expansions=[Expansion("Work", ";old", "{VAR:old_missing}")],
+            )
+        )
+
+        error = self._import(
+            window, '; @tem: {"replacement":"{VAR:new_missing}"}\n:C:;new::'
+        )
+
+        self.assertIn("new_missing", error)
+        self.assertEqual([e.trigger for e in window.store.expansions], [";old"])
+
+    def test_breaking_an_already_broken_record_differently_is_refused(self) -> None:
+        # The record was already failing, so its key is not new -- but it fails
+        # for a different reason now, which the import caused.
+        window = self._window(
+            ExpansionStore(
+                sections=["Work"],
+                expansions=[Expansion("Work", ";a", "{VAR:one_missing}")],
+            )
+        )
+
+        error = self._import(
+            window,
+            '; @tem: {"replacement":"{VAR:another_missing}"}\n:C:;a::',
+            action="overwrite",
+        )
+
+        self.assertIn("another_missing", error)
+        self.assertEqual(
+            window.store.expansions[0].replacement, "{VAR:one_missing}"
+        )
+
     def test_a_library_that_already_cannot_generate_does_not_block_importing(self) -> None:
         # The check refuses what the import breaks. A library that was already
         # broken is the user's to repair, and barring imports until they had

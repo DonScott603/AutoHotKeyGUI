@@ -14,8 +14,9 @@ from ahk_manager import (
     generate_ahk,
     import_ahk,
     merge_imported_store,
-    placeholder_problem,
+    placeholder_problems,
     render_ahk,
+    validate_store_placeholders,
 )
 
 
@@ -173,25 +174,60 @@ class CandidateHelperTests(unittest.TestCase):
         self.assertEqual(store.templates[0].body, "body")
         self.assertEqual(len(store.expansions), 1)
 
-    def test_a_store_that_generates_has_no_problem(self) -> None:
+    def test_a_store_that_generates_has_no_problems(self) -> None:
         store = ExpansionStore(
             sections=["Work"],
             expansions=[Expansion("Work", ";a", "Dear {VAR:v}")],
             variables=[VariableDef("v", "text_input", "P", "", [], "")],
         )
 
-        self.assertIsNone(placeholder_problem(store))
+        self.assertEqual(placeholder_problems(store), {})
 
-    def test_a_store_that_cannot_generate_says_why(self) -> None:
+    def test_every_broken_record_is_reported_not_just_the_first(self) -> None:
+        # Reporting only the first made two stores indistinguishable as soon as
+        # they shared a fault, which is what let further broken records be
+        # imported into an already-broken library.
+        store = ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion("Work", ";a", "{VAR:missing_one}"),
+                Expansion("Work", ";b", "{VAR:missing_two}"),
+            ],
+            templates=[TemplateDef("T", body="{TPL:absent}")],
+        )
+
+        problems = placeholder_problems(store)
+
+        self.assertEqual(len(problems), 3)
+        joined = " ".join(problems.values())
+        self.assertIn("missing_one", joined)
+        self.assertIn("missing_two", joined)
+        self.assertIn("absent", joined)
+
+    def test_a_problem_is_keyed_to_its_record(self) -> None:
+        # Keyed by record rather than position, so the same fault is recognised
+        # as the same one after everything around it has moved.
+        store = ExpansionStore(
+            sections=["Work"], expansions=[Expansion("Work", ";a", "{VAR:missing}")]
+        )
+        moved = ExpansionStore(
+            sections=["Work"],
+            expansions=[
+                Expansion("Work", ";earlier", "fine"),
+                Expansion("Work", ";a", "{VAR:missing}"),
+            ],
+        )
+
+        self.assertEqual(placeholder_problems(store), placeholder_problems(moved))
+
+    def test_validate_store_placeholders_still_raises_the_first(self) -> None:
         store = ExpansionStore(
             sections=["Work"],
             expansions=[Expansion("Work", ";a", "{VAR:missing}")],
         )
 
-        problem = placeholder_problem(store)
-
-        self.assertIsNotNone(problem)
-        self.assertIn('Undefined variable "missing"', str(problem))
+        with self.assertRaisesRegex(ValueError, 'Undefined variable "missing"'):
+            validate_store_placeholders(store)
 
 
 class ImportedStoreValidationTests(unittest.TestCase):

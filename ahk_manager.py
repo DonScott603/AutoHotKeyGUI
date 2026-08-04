@@ -1217,19 +1217,6 @@ def copy_store(store: ExpansionStore) -> ExpansionStore:
     )
 
 
-def placeholder_problem(store: ExpansionStore) -> str | None:
-    """Why this store could not generate, or None if it could.
-
-    The question validate_store_placeholders answers by raising, phrased so a
-    caller can ask it of two stores and compare the answers.
-    """
-    try:
-        validate_store_placeholders(store)
-    except ValueError as exc:
-        return str(exc)
-    return None
-
-
 def merge_imported_store(
     target: ExpansionStore,
     imported: ExpansionStore,
@@ -1999,9 +1986,28 @@ def placeholder_to_text(placeholder: TemplatePlaceholder) -> str:
     return f"{{{placeholder.kind}:{placeholder.value}}}"
 
 
-def validate_store_placeholders(store: ExpansionStore) -> None:
-    validate_variables(store.variables)
-    validate_templates(store.templates)
+def placeholder_problems(store: ExpansionStore) -> dict[str, str]:
+    """Everything stopping this store generating, keyed by what it belongs to.
+
+    All of them, not the first: comparing two stores by whether each has "a
+    problem" cannot tell a fault the import introduced from one that was
+    already there, and collapses to "already broken, allow anything" as soon
+    as the library has a single fault of its own.
+
+    The keys identify a record rather than a position, so they survive
+    everything moving around them. Both the key and the message are compared,
+    so a record that was already broken and is now broken differently counts
+    as a new fault.
+    """
+    problems: dict[str, str] = {}
+    try:
+        validate_variables(store.variables)
+    except ValueError as exc:
+        problems["variables"] = str(exc)
+    try:
+        validate_templates(store.templates)
+    except ValueError as exc:
+        problems["templates"] = str(exc)
     for expansion in store.expansions:
         try:
             segments = resolve_template_segments(
@@ -2010,7 +2016,9 @@ def validate_store_placeholders(store: ExpansionStore) -> None:
             )
             resolve_variable_segments(segments, store.variables)
         except ValueError as exc:
-            raise ValueError(f'Invalid placeholder in trigger "{expansion.trigger}": {exc}') from exc
+            problems[f"expansion {expansion.section}\0{expansion.trigger}"] = (
+                f'Invalid placeholder in trigger "{expansion.trigger}": {exc}'
+            )
     for template in store.templates:
         try:
             segments = resolve_template_segments(
@@ -2020,7 +2028,20 @@ def validate_store_placeholders(store: ExpansionStore) -> None:
             )
             resolve_variable_segments(segments, store.variables)
         except ValueError as exc:
-            raise ValueError(f'Invalid placeholder in template "{template.name}": {exc}') from exc
+            problems[f"template {template.name}"] = (
+                f'Invalid placeholder in template "{template.name}": {exc}'
+            )
+    return problems
+
+
+def validate_store_placeholders(store: ExpansionStore) -> None:
+    """Raise on the first thing stopping this store generating.
+
+    The collector above decides the order, which is the order this function
+    used to check in: definitions, then expansions, then template bodies.
+    """
+    for message in placeholder_problems(store).values():
+        raise ValueError(message)
 
 
 def parse_replacement_template(text: str) -> list[str | TemplatePlaceholder]:
