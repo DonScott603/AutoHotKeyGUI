@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
 )
 
 from ahk_manager import (
+    AHK_CONFIG_DIR_NAME,
     DEFAULT_AHK,
     DEFAULT_DATE_FORMAT,
     DEFAULT_JSON,
@@ -116,10 +117,14 @@ def _resource_path(name: str) -> Path:
 
 APP_DIR = _app_dir()
 ICON_PATH = _resource_path("app.ico")
-JSON_PATH = APP_DIR / DEFAULT_JSON
+# The app's own files sit in a folder of their own, leaving the executable and
+# the generated script as the only two things loose in the install folder. The
+# script looks for its icon in the same folder, relative to itself.
+CONFIG_DIR = APP_DIR / AHK_CONFIG_DIR_NAME
+JSON_PATH = CONFIG_DIR / DEFAULT_JSON
 AHK_PATH = APP_DIR / DEFAULT_AHK
-SETTINGS_PATH = APP_DIR / DEFAULT_SETTINGS
-UI_PREFS_PATH = APP_DIR / "ui_prefs.json"
+SETTINGS_PATH = CONFIG_DIR / DEFAULT_SETTINGS
+UI_PREFS_PATH = CONFIG_DIR / "ui_prefs.json"
 # Backups are collected here rather than left beside the files they copy, which
 # scattered them through the working folders -- including wherever the user had
 # pointed the generated script, which may be a synced folder.
@@ -179,9 +184,15 @@ across many expansions; change the definition and every expansion using it
 changes too.</p>
 
 <h3>Saving and backups</h3>
-<p>Every change is written to <code>{DEFAULT_JSON}</code> the moment you apply
-it, so there is no save step and closing the window cannot lose work. Because of
-that, closing without saving is no longer a way to abandon a session's edits.</p>
+<p>Every change is written to <code>{AHK_CONFIG_DIR_NAME}\\{DEFAULT_JSON}</code>
+the moment you apply it, so there is no save step and closing the window cannot
+lose work. Because of that, closing without saving is no longer a way to abandon
+a session's edits.</p>
+<p>That <b>{AHK_CONFIG_DIR_NAME}</b> folder, beside the app, holds everything
+the app keeps: your library, your settings, and the icon the generated script
+puts on its tray and its prompts. The script looks for that icon there first and
+then next to itself, so a script copied to a machine without the app still runs
+either way.</p>
 <p>Instead, a copy of <code>{DEFAULT_JSON}</code> is kept the first time you
 change anything in a session, and a copy of the generated script each time you
 generate. Both live in a <b>backups</b> folder beside the app, and the
@@ -565,8 +576,41 @@ def load_theme_pref() -> str | None:
     return theme if theme in ("light", "dark") else None
 
 
+def migrate_config_files() -> tuple[list[str], list[str]]:
+    """Move the app's files into the config folder, once, on first run.
+
+    Returns what moved and what could not, for the status bar to report. A file
+    already in the config folder wins: the one left outside is then a leftover,
+    not the library, and moving it over the top would lose the real one.
+
+    One folder, one decision, taken from where the library is configured to
+    live. Deciding per file would let a caller that redirects only some of
+    these paths -- every test fixture here redirects the library -- leave the
+    rest pointing at the real install folder, and move the user's files during
+    a test run.
+    """
+    config_dir = JSON_PATH.parent
+    if config_dir.name != AHK_CONFIG_DIR_NAME:
+        return [], []
+    moved: list[str] = []
+    failed: list[str] = []
+    for path in (JSON_PATH, SETTINGS_PATH, UI_PREFS_PATH):
+        legacy = config_dir.parent / path.name
+        if path.parent != config_dir or path.exists() or not legacy.is_file():
+            continue
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy), str(path))
+        except OSError:
+            failed.append(legacy.name)
+            continue
+        moved.append(path.name)
+    return moved, failed
+
+
 def save_theme_pref(theme: str) -> None:
     try:
+        UI_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
         UI_PREFS_PATH.write_text(
             json.dumps({"theme": theme}, indent=2) + "\n", encoding="utf-8"
         )
@@ -951,6 +995,10 @@ class ExpansionApp(QMainWindow):
         # reaches disk as it is applied. Shown in the footer and checked on
         # close. _set_unsaved needs the footer, which does not exist yet.
         self._unsaved_changes = False
+        # Before anything is read: these files used to sit loose beside the
+        # executable, and loading first would find nothing and start empty with
+        # the real library one folder up.
+        self._config_migration = migrate_config_files()
         self.store = self._load_store()
         self.settings = self._load_settings()
         self.ahk_process: subprocess.Popen | None = None
@@ -975,6 +1023,7 @@ class ExpansionApp(QMainWindow):
         self.refresh_templates()
         # After the UI exists, so the count can be reported in the status bar.
         self._migrate_legacy_backups()
+        self._report_config_migration()
 
         # Derive the window's minimum size from what the widest page actually
         # needs so panels can never be shrunk into overlapping each other.
@@ -2472,6 +2521,21 @@ class ExpansionApp(QMainWindow):
                 )
             return None
         return target
+
+    def _report_config_migration(self) -> None:
+        """Say what the move into the config folder did, once, at startup."""
+        moved, failed = self._config_migration
+        if failed:
+            show_warning(
+                self,
+                "Config folder",
+                f"Could not move {', '.join(failed)} into "
+                f"{CONFIG_DIR.name}. They have been left where they were, and "
+                f"the app is using {CONFIG_DIR}. Move them across by hand to "
+                "keep what they held.",
+            )
+        elif moved:
+            self.set_status(f"Moved {', '.join(moved)} into {CONFIG_DIR.name}.")
 
     def _migrate_legacy_backups(self) -> None:
         """Collect backups left beside the files by earlier versions."""

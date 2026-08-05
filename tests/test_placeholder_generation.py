@@ -3,6 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from ahk_manager import (
+    AHK_CONFIG_DIR_NAME,
     AHK_ICON_NAME,
     AHK_THEME_COLORS,
     Expansion,
@@ -658,11 +659,38 @@ class PromptChromeTests(unittest.TestCase):
 
         self.assertIn('TEM_Form("Text Expansion Manager - dear"', output)
 
-    def test_script_points_the_tray_icon_at_the_copied_app_icon(self) -> None:
+    def test_script_looks_in_the_config_folder_then_beside_itself(self) -> None:
+        # Both paths hang off A_ScriptDir, so a script generated into another
+        # folder, or carried to a machine with no app on it, looks where it
+        # actually sits rather than where this app happens to be installed.
         output = render_ahk(self._prompt_store())
 
-        self.assertIn(f'if FileExist(A_ScriptDir "\\{AHK_ICON_NAME}")', output)
-        self.assertIn(f'TraySetIcon(A_ScriptDir "\\{AHK_ICON_NAME}")', output)
+        self.assertIn(
+            f'inConfig := A_ScriptDir "\\{AHK_CONFIG_DIR_NAME}\\{AHK_ICON_NAME}"', output
+        )
+        self.assertIn(f'beside := A_ScriptDir "\\{AHK_ICON_NAME}"', output)
+        self.assertLess(
+            output.index("inConfig :="),
+            output.index("beside :="),
+            "the config folder has to be searched first",
+        )
+
+    def test_the_tray_and_the_prompts_share_one_icon_search(self) -> None:
+        output = render_ahk(self._prompt_store())
+
+        self.assertIn("TEM_TrayIcon := TEM_IconPath()", output)
+        self.assertIn("    TraySetIcon(TEM_TrayIcon)", output)
+        self.assertIn("    iconPath := TEM_IconPath()", output)
+        self.assertEqual(output.count("TEM_IconPath() {"), 1)
+
+    def test_a_static_only_script_can_still_find_its_icon(self) -> None:
+        # The helper is emitted for every script, not only the ones with
+        # prompts: the tray line calls it unconditionally.
+        output = render_ahk(
+            ExpansionStore(sections=["Work"], expansions=[Expansion("Work", "brb", "back")])
+        )
+
+        self.assertIn("TEM_IconPath() {", output)
 
     def test_light_theme_uses_the_light_palette(self) -> None:
         output = render_ahk(self._prompt_store(), "light")
@@ -751,7 +779,7 @@ class PromptChromeTests(unittest.TestCase):
             render_ahk(self._prompt_store(), "light"),
         )
 
-    def test_generate_copies_the_icon_next_to_the_script(self) -> None:
+    def test_generate_copies_the_icon_into_the_scripts_config_folder(self) -> None:
         with TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "app.ico"
             source.write_bytes(b"icon-bytes")
@@ -761,9 +789,43 @@ class PromptChromeTests(unittest.TestCase):
                 self._prompt_store(), ahk_path, backup=False, icon_source=source
             )
 
-            copied = ahk_path.parent / AHK_ICON_NAME
-            self.assertTrue(copied.is_file())
+            copied = ahk_path.parent / AHK_CONFIG_DIR_NAME / AHK_ICON_NAME
+            self.assertTrue(copied.is_file(), "the config folder was not created")
             self.assertEqual(copied.read_bytes(), b"icon-bytes")
+
+    def test_generate_clears_away_the_copy_older_builds_left_loose(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "app.ico"
+            source.write_bytes(b"icon-bytes")
+            ahk_path = Path(temp_dir) / "gen.ahk"
+            stale = ahk_path.parent / AHK_ICON_NAME
+            stale.write_bytes(b"icon-bytes")
+
+            generate_ahk(
+                self._prompt_store(), ahk_path, backup=False, icon_source=source
+            )
+
+            self.assertFalse(stale.exists(), "the superseded copy was left behind")
+            self.assertTrue(
+                (ahk_path.parent / AHK_CONFIG_DIR_NAME / AHK_ICON_NAME).is_file()
+            )
+
+    def test_generate_leaves_an_icon_it_did_not_put_there(self) -> None:
+        # Only a byte-for-byte copy of what this app installs is ours to
+        # remove. Anything else the user put there, and the script still falls
+        # back to it.
+        with TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "app.ico"
+            source.write_bytes(b"icon-bytes")
+            ahk_path = Path(temp_dir) / "gen.ahk"
+            theirs = ahk_path.parent / AHK_ICON_NAME
+            theirs.write_bytes(b"a different icon")
+
+            generate_ahk(
+                self._prompt_store(), ahk_path, backup=False, icon_source=source
+            )
+
+            self.assertEqual(theirs.read_bytes(), b"a different icon")
 
     def test_generate_survives_a_missing_icon_source(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -777,7 +839,9 @@ class PromptChromeTests(unittest.TestCase):
             )
 
             self.assertTrue(ahk_path.is_file())
-            self.assertFalse((ahk_path.parent / AHK_ICON_NAME).exists())
+            self.assertFalse(
+                (ahk_path.parent / AHK_CONFIG_DIR_NAME / AHK_ICON_NAME).exists()
+            )
 
 
 if __name__ == "__main__":
