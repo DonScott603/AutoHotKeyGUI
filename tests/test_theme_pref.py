@@ -20,6 +20,7 @@ from PySide6.QtWidgets import QApplication
 
 import app as app_module
 from app import ExpansionApp, load_theme_pref, save_theme_pref
+from qt_cleanup import destroy_all_windows
 
 # A single QApplication must exist for the lifetime of the process.
 _qt_app = QApplication.instance() or QApplication([])
@@ -37,6 +38,7 @@ NON_OBJECT_JSON = [
 
 class ThemePrefTests(unittest.TestCase):
     def setUp(self) -> None:
+        destroy_all_windows()
         self._temp = TemporaryDirectory()
         self.path = Path(self._temp.name) / "ui_prefs.json"
         self._saved = app_module.UI_PREFS_PATH
@@ -85,6 +87,7 @@ class ThemePrefStartupTests(unittest.TestCase):
     """The payoff: the window opens whatever the file holds."""
 
     def setUp(self) -> None:
+        destroy_all_windows()
         self._temp = TemporaryDirectory()
         root = Path(self._temp.name)
         self._saved_paths = (
