@@ -1748,10 +1748,18 @@ class ExpansionApp(QMainWindow):
         self.section_list.setCurrentRow(index)
         self.section_list.blockSignals(False)
 
+        # The sidebar drives the form's section only while the form is not
+        # holding anything: adding, renaming or deleting a section rebuilds
+        # this list, and an open editor's unapplied choice of section is an
+        # answer to "where should this go", not a view of the list. Losing it
+        # here moved the expansion to the sidebar's section on the next Apply,
+        # with nothing on screen to say so.
+        chosen = self.section_combo.currentText()
+        keep = self.current_expansion is not None and chosen in self.store.sections
         self.section_combo.blockSignals(True)
         self.section_combo.clear()
         self.section_combo.addItems(self.store.sections)
-        self.section_combo.setCurrentText(selected)
+        self.section_combo.setCurrentText(chosen if keep else selected)
         self.section_combo.blockSignals(False)
 
     def refresh_expansions(self) -> None:
