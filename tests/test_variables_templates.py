@@ -20,6 +20,7 @@ from ahk_manager import (
     validate_variables,
 )
 from app import ExpansionApp
+from qt_cleanup import destroy_all_windows
 
 
 # A single QApplication must exist for the lifetime of the process.
@@ -27,6 +28,11 @@ _qt_app = QApplication.instance() or QApplication([])
 
 
 class VariableTemplateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These build their windows inside the tests rather than in a fixture,
+        # and closing one only hides it.
+        destroy_all_windows()
+
     def test_variable_and_template_storage_round_trip(self) -> None:
         store = ExpansionStore(
             sections=["General"],

@@ -7,7 +7,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt
+from PySide6.QtCore import QEvent, QItemSelectionModel, QObject, QRect, QSize, Qt
 from PySide6.QtGui import (
     QCloseEvent,
     QColor,
@@ -42,13 +42,16 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTableWidgetSelectionRange,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
 from ahk_manager import (
+    AHK_CONFIG_DIR_NAME,
     DEFAULT_AHK,
+    DEFAULT_DATE_FORMAT,
     DEFAULT_JSON,
     BACKUP_RETENTION_LIMIT,
     DEFAULT_SETTINGS,
@@ -114,10 +117,14 @@ def _resource_path(name: str) -> Path:
 
 APP_DIR = _app_dir()
 ICON_PATH = _resource_path("app.ico")
-JSON_PATH = APP_DIR / DEFAULT_JSON
+# The app's own files sit in a folder of their own, leaving the executable and
+# the generated script as the only two things loose in the install folder. The
+# script looks for its icon in the same folder, relative to itself.
+CONFIG_DIR = APP_DIR / AHK_CONFIG_DIR_NAME
+JSON_PATH = CONFIG_DIR / DEFAULT_JSON
 AHK_PATH = APP_DIR / DEFAULT_AHK
-SETTINGS_PATH = APP_DIR / DEFAULT_SETTINGS
-UI_PREFS_PATH = APP_DIR / "ui_prefs.json"
+SETTINGS_PATH = CONFIG_DIR / DEFAULT_SETTINGS
+UI_PREFS_PATH = CONFIG_DIR / "ui_prefs.json"
 # Backups are collected here rather than left beside the files they copy, which
 # scattered them through the working folders -- including wherever the user had
 # pointed the generated script, which may be a synced folder.
@@ -141,8 +148,11 @@ Sections are only for organising the list; they do not affect behaviour.</p>
 <li>A trigger cannot contain spaces or <code>::</code>.</li>
 <li>Triggers are case sensitive, and a leading character such as
 <code>;</code> makes accidental firing much less likely.</li>
-<li>Clear the <b>Enabled</b> box to keep an expansion but leave it out of the
+<li>Clear the <b>On</b> box to keep an expansion but leave it out of the
 generated script.</li>
+<li>Double-click a row, or select it and press <b>Edit</b>, to open it in the
+editor on the right. Ctrl-click and Shift-click select several rows at once,
+which <b>Delete</b> and <b>Toggle On/Off</b> then act on together.</li>
 <li>Duplicate triggers are flagged, and the last one generated wins.</li>
 </ul>
 
@@ -174,9 +184,15 @@ across many expansions; change the definition and every expansion using it
 changes too.</p>
 
 <h3>Saving and backups</h3>
-<p>Every change is written to <code>{DEFAULT_JSON}</code> the moment you apply
-it, so there is no save step and closing the window cannot lose work. Because of
-that, closing without saving is no longer a way to abandon a session's edits.</p>
+<p>Every change is written to <code>{AHK_CONFIG_DIR_NAME}\\{DEFAULT_JSON}</code>
+the moment you apply it, so there is no save step and closing the window cannot
+lose work. Because of that, closing without saving is no longer a way to abandon
+a session's edits.</p>
+<p>That <b>{AHK_CONFIG_DIR_NAME}</b> folder, beside the app, holds everything
+the app keeps: your library, your settings, and the icon the generated script
+puts on its tray and its prompts. The script looks for that icon there first and
+then next to itself, so a script copied to a machine without the app still runs
+either way.</p>
 <p>Instead, a copy of <code>{DEFAULT_JSON}</code> is kept the first time you
 change anything in a session, and a copy of the generated script each time you
 generate. Both live in a <b>backups</b> folder beside the app, and the
@@ -205,6 +221,28 @@ IMAGE_FILE_FILTER = (
 )
 AHK_FILE_FILTER = "AutoHotkey files (*.ahk);;All files (*.*)"
 AHK_PROCESS_NAMES = {"autohotkey.exe", "autohotkey64.exe", "autohotkey32.exe"}
+
+# Each variable type uses some of the value fields and ignores the rest, so the
+# Variables form shows only the ones that apply and puts one of these notes
+# where the box it dropped used to be. A fixed example date keeps the codes
+# concrete without the reference looking out of date next year.
+TEXT_INPUT_DEFAULT_NOTE = (
+    "Default is optional. Leave it blank and the box opens empty."
+)
+LIST_SELECTION_DEFAULT_NOTE = (
+    "The first list option below is the default. Put one option per line."
+)
+DATE_FORMAT_NOTE = (
+    "Codes, shown for Tuesday 4 August 2026 at 2:30 PM:\n"
+    "yyyy / yy  —  2026, 26\n"
+    "MMMM / MMM / MM / M  —  August, Aug, 08, 8\n"
+    "dddd / ddd / dd / d  —  Tuesday, Tue, 04, 4\n"
+    "HH / hh  —  14, 02\n"
+    "mm / ss / tt  —  30, 00, PM\n"
+    "Punctuation and spaces pass through, so yyyy-MM-dd h:mm tt gives "
+    "2026-08-04 2:30 PM.\n"
+    f"Blank uses {DEFAULT_DATE_FORMAT}. Braces and double quotes are rejected."
+)
 
 
 def has_reserved_placeholder_chars(value: str) -> bool:
@@ -538,8 +576,41 @@ def load_theme_pref() -> str | None:
     return theme if theme in ("light", "dark") else None
 
 
+def migrate_config_files() -> tuple[list[str], list[str]]:
+    """Move the app's files into the config folder, once, on first run.
+
+    Returns what moved and what could not, for the status bar to report. A file
+    already in the config folder wins: the one left outside is then a leftover,
+    not the library, and moving it over the top would lose the real one.
+
+    One folder, one decision, taken from where the library is configured to
+    live. Deciding per file would let a caller that redirects only some of
+    these paths -- every test fixture here redirects the library -- leave the
+    rest pointing at the real install folder, and move the user's files during
+    a test run.
+    """
+    config_dir = JSON_PATH.parent
+    if config_dir.name != AHK_CONFIG_DIR_NAME:
+        return [], []
+    moved: list[str] = []
+    failed: list[str] = []
+    for path in (JSON_PATH, SETTINGS_PATH, UI_PREFS_PATH):
+        legacy = config_dir.parent / path.name
+        if path.parent != config_dir or path.exists() or not legacy.is_file():
+            continue
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy), str(path))
+        except OSError:
+            failed.append(legacy.name)
+            continue
+        moved.append(path.name)
+    return moved, failed
+
+
 def save_theme_pref(theme: str) -> None:
     try:
+        UI_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
         UI_PREFS_PATH.write_text(
             json.dumps({"theme": theme}, indent=2) + "\n", encoding="utf-8"
         )
@@ -924,6 +995,10 @@ class ExpansionApp(QMainWindow):
         # reaches disk as it is applied. Shown in the footer and checked on
         # close. _set_unsaved needs the footer, which does not exist yet.
         self._unsaved_changes = False
+        # Before anything is read: these files used to sit loose beside the
+        # executable, and loading first would find nothing and start empty with
+        # the real library one folder up.
+        self._config_migration = migrate_config_files()
         self.store = self._load_store()
         self.settings = self._load_settings()
         self.ahk_process: subprocess.Popen | None = None
@@ -948,6 +1023,7 @@ class ExpansionApp(QMainWindow):
         self.refresh_templates()
         # After the UI exists, so the count can be reported in the status bar.
         self._migrate_legacy_backups()
+        self._report_config_migration()
 
         # Derive the window's minimum size from what the widest page actually
         # needs so panels can never be shrunk into overlapping each other.
@@ -1213,13 +1289,19 @@ class ExpansionApp(QMainWindow):
         self.tree = QTableWidget(0, 4)
         self.tree.setHorizontalHeaderLabels(["On", "Trigger", "Replacement", "Notes"])
         self._configure_table(self.tree)
+        # Delete and Toggle On/Off act on the whole selection, so Ctrl and
+        # Shift pick out more than one row here.
+        self.tree.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         header = self.tree.horizontalHeader()
         self.tree.setColumnWidth(0, 44)
         self.tree.setColumnWidth(1, 130)
         self.tree.setColumnWidth(2, 300)
         header.setStretchLastSection(True)
-        self.tree.itemSelectionChanged.connect(self.on_expansion_select)
-        self.tree.cellDoubleClicked.connect(lambda _r, _c: self.load_selected_expansion())
+        # Selecting a row no longer loads it: that would fight with building a
+        # multi-row selection, and it overwrote the form on a stray click.
+        self.tree.cellDoubleClicked.connect(
+            lambda row, _column: self.load_double_clicked_expansion(row)
+        )
         layout.addWidget(self.tree, 1)
 
         actions = QHBoxLayout()
@@ -1227,7 +1309,7 @@ class ExpansionApp(QMainWindow):
             ("New", self.new_expansion),
             ("Edit", self.load_selected_expansion),
             ("Delete", self.delete_expansion),
-            ("Toggle Enabled", self.toggle_enabled),
+            ("Toggle On/Off", self.toggle_enabled),
         ):
             button = QPushButton(text)
             button.clicked.connect(slot)
@@ -1265,7 +1347,7 @@ class ExpansionApp(QMainWindow):
         self.notes_text.setMaximumHeight(90)
         layout.addWidget(self.notes_text)
 
-        self.enabled_check = QCheckBox("Enabled")
+        self.enabled_check = QCheckBox("On")
         self.enabled_check.setChecked(True)
         layout.addWidget(self.enabled_check)
 
@@ -1334,20 +1416,37 @@ class ExpansionApp(QMainWindow):
         self.variable_name_edit = QLineEdit()
         self.variable_type_combo = QComboBox()
         self.variable_type_combo.addItems(sorted(VARIABLE_TYPES))
+        # Alphabetical order puts date_time first; an empty form should open on
+        # the same type New gives you, not on the one that hides the most.
+        self.variable_type_combo.setCurrentText("text_input")
         self.variable_prompt_edit = QLineEdit()
         self.variable_default_edit = QLineEdit()
         form_layout.addWidget(QLabel("Name"), 0, 0)
         form_layout.addWidget(self.variable_name_edit, 0, 1)
         form_layout.addWidget(QLabel("Type"), 1, 0)
         form_layout.addWidget(self.variable_type_combo, 1, 1)
-        form_layout.addWidget(QLabel("Prompt text"), 2, 0)
+        self.variable_prompt_label = QLabel("Prompt text")
+        form_layout.addWidget(self.variable_prompt_label, 2, 0)
         form_layout.addWidget(self.variable_prompt_edit, 2, 1)
-        form_layout.addWidget(QLabel("Default/format"), 3, 0)
-        form_layout.addWidget(self.variable_default_edit, 3, 1)
-        form_layout.addWidget(QLabel("List options"), 4, 0, Qt.AlignmentFlag.AlignTop)
+        # The field and the note that stands in for it share a row, in a box of
+        # their own so hiding either one cannot leave the other overlapping it.
+        self.variable_default_label = QLabel("Default")
+        form_layout.addWidget(self.variable_default_label, 3, 0)
+        self.variable_default_note = self._form_note()
+        form_layout.addWidget(
+            self._stacked_field(self.variable_default_edit, self.variable_default_note), 3, 1
+        )
+        self.variable_options_label = QLabel("List options")
+        form_layout.addWidget(self.variable_options_label, 4, 0, Qt.AlignmentFlag.AlignTop)
         self.variable_options_text = QPlainTextEdit()
         self.variable_options_text.setMaximumHeight(120)
-        form_layout.addWidget(self.variable_options_text, 4, 1)
+        self.variable_options_note = self._form_note()
+        form_layout.addWidget(
+            self._stacked_field(self.variable_options_text, self.variable_options_note), 4, 1
+        )
+        self.variable_type_combo.currentTextChanged.connect(
+            lambda _type: self.sync_variable_form_to_type()
+        )
         form_layout.addWidget(QLabel("Notes"), 5, 0, Qt.AlignmentFlag.AlignTop)
         self.variable_notes_text = QPlainTextEdit()
         form_layout.addWidget(self.variable_notes_text, 5, 1)
@@ -1363,6 +1462,7 @@ class ExpansionApp(QMainWindow):
         form_layout.addLayout(variable_actions, 6, 1)
         form_layout.setRowStretch(5, 1)
         form_layout.setColumnStretch(1, 1)
+        self.sync_variable_form_to_type()
 
         splitter.addWidget(left)
         splitter.addWidget(form)
@@ -1371,6 +1471,52 @@ class ExpansionApp(QMainWindow):
         splitter.setSizes([360, 620])
         outer.addWidget(splitter)
         return page
+
+    @staticmethod
+    def _form_note() -> QLabel:
+        """A muted explanation that stands in for a field the type never uses."""
+        note = QLabel()
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        note.setVisible(False)
+        return note
+
+    @staticmethod
+    def _stacked_field(field: QWidget, note: QLabel) -> QWidget:
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(field)
+        layout.addWidget(note)
+        return box
+
+    def sync_variable_form_to_type(self) -> None:
+        """Show only the value fields the selected variable type reads.
+
+        Each type ignores the others' fields entirely, so leaving them on
+        screen invited values that nothing would ever read -- a format typed
+        into a list_selection, options listed against a text_input.
+        """
+        kind = self.variable_type_combo.currentText().strip()
+        is_date = kind == "date_time"
+        is_list = kind == "list_selection"
+
+        # date_time asks nothing: it formats the clock as the expansion fires.
+        self.variable_prompt_label.setVisible(not is_date)
+        self.variable_prompt_edit.setVisible(not is_date)
+
+        self.variable_default_label.setText("Format" if is_date else "Default")
+        self.variable_default_edit.setVisible(not is_list)
+        self.variable_default_note.setText(LIST_SELECTION_DEFAULT_NOTE)
+        self.variable_default_note.setVisible(is_list)
+
+        self.variable_options_label.setVisible(is_list)
+        self.variable_options_text.setVisible(is_list)
+        self.variable_options_note.setText(
+            DATE_FORMAT_NOTE if is_date else TEXT_INPUT_DEFAULT_NOTE
+        )
+        self.variable_options_note.setVisible(not is_list)
 
     def _build_templates_page(self) -> QWidget:
         page = QWidget()
@@ -1524,13 +1670,67 @@ class ExpansionApp(QMainWindow):
     # -- table helpers -----------------------------------------------------
     @staticmethod
     def _table_selected_store_index(table: QTableWidget) -> int | None:
-        rows = table.selectionModel().selectedRows()
-        if not rows:
+        indexes = ExpansionApp._table_selected_store_indexes(table)
+        return indexes[0] if indexes else None
+
+    @staticmethod
+    def _table_store_index(table: QTableWidget, row: int) -> int | None:
+        """The store index a table row stands for, or None if there is no row."""
+        if row < 0:
             return None
-        item = table.item(rows[0].row(), 0)
+        item = table.item(row, 0)
         if item is None:
             return None
         return item.data(Qt.ItemDataRole.UserRole)
+
+    @staticmethod
+    def _table_selected_store_indexes(table: QTableWidget) -> list[int]:
+        """Every selected row's index into the store, in store order."""
+        indexes: list[int] = []
+        for row in table.selectionModel().selectedRows():
+            stored = ExpansionApp._table_store_index(table, row.row())
+            if stored is not None:
+                indexes.append(stored)
+        return sorted(indexes)
+
+    @staticmethod
+    def _table_rows_by_store_index(table: QTableWidget) -> dict[int, int]:
+        rows: dict[int, int] = {}
+        for row in range(table.rowCount()):
+            stored = ExpansionApp._table_store_index(table, row)
+            if stored is not None:
+                rows[stored] = row
+        return rows
+
+    @staticmethod
+    def _select_store_indexes(
+        table: QTableWidget, indexes: list[int], focus: int | None = None
+    ) -> None:
+        """Reselect rows by store index, after a refresh rebuilt the table.
+
+        setRangeSelected adds to the selection; selectRow would clear what the
+        previous row just selected. The focus rectangle has to be put back by
+        hand as well -- a rebuilt table has no current row, and Edit reads the
+        current row to decide which of several selected rows to open.
+        """
+        rows = ExpansionApp._table_rows_by_store_index(table)
+        table.clearSelection()
+        last_column = table.columnCount() - 1
+        for index in indexes:
+            row = rows.get(index)
+            if row is not None:
+                table.setRangeSelected(
+                    QTableWidgetSelectionRange(row, 0, row, last_column), True
+                )
+        wanted = focus if focus in rows else (indexes[0] if indexes else None)
+        focus_row = rows.get(wanted) if wanted is not None else None
+        if focus_row is not None:
+            # NoUpdate: move the focus rectangle without touching the selection
+            # that was just rebuilt.
+            table.selectionModel().setCurrentIndex(
+                table.model().index(focus_row, 0),
+                QItemSelectionModel.SelectionFlag.NoUpdate,
+            )
 
     # -- refresh -----------------------------------------------------------
     def refresh_sections(self) -> None:
@@ -1548,10 +1748,18 @@ class ExpansionApp(QMainWindow):
         self.section_list.setCurrentRow(index)
         self.section_list.blockSignals(False)
 
+        # The sidebar drives the form's section only while the form is not
+        # holding anything: adding, renaming or deleting a section rebuilds
+        # this list, and an open editor's unapplied choice of section is an
+        # answer to "where should this go", not a view of the list. Losing it
+        # here moved the expansion to the sidebar's section on the next Apply,
+        # with nothing on screen to say so.
+        chosen = self.section_combo.currentText()
+        keep = self.current_expansion is not None and chosen in self.store.sections
         self.section_combo.blockSignals(True)
         self.section_combo.clear()
         self.section_combo.addItems(self.store.sections)
-        self.section_combo.setCurrentText(selected)
+        self.section_combo.setCurrentText(chosen if keep else selected)
         self.section_combo.blockSignals(False)
 
     def refresh_expansions(self) -> None:
@@ -1615,7 +1823,16 @@ class ExpansionApp(QMainWindow):
         index = self._table_selected_store_index(self.variable_tree)
         if index is None:
             return
-        variable = self.store.variables[index]
+        self.load_variable(self.store.variables[index])
+
+    def load_variable(self, variable: VariableDef) -> None:
+        """Fill the form from a stored variable, every box of it.
+
+        Used after Apply as well as on selection: a type change hides the
+        fields the new type ignores without emptying them, so a form left as
+        typed still held the dropped value out of sight, ready to come back the
+        moment the type was changed back.
+        """
         self.current_variable = variable
         self.variable_name_edit.setText(variable.name)
         self.variable_type_combo.setCurrentText(variable.type)
@@ -1652,16 +1869,23 @@ class ExpansionApp(QMainWindow):
         self.template_notes_text.clear()
 
     def read_variable_form(self) -> VariableDef:
+        kind = self.variable_type_combo.currentText().strip()
+        # Only what this type reads is saved. A field the type ignores is
+        # hidden, so carrying its old contents through would store something
+        # the user can no longer see, to surface again on a later type change.
+        options = [
+            line.strip()
+            for line in self.variable_options_text.toPlainText().splitlines()
+            if line.strip()
+        ]
         variable = VariableDef(
             name=self.variable_name_edit.text().strip(),
-            type=self.variable_type_combo.currentText().strip(),
-            prompt_text=self.variable_prompt_edit.text().strip(),
-            default_value=self.variable_default_edit.text().strip(),
-            list_options=[
-                line.strip()
-                for line in self.variable_options_text.toPlainText().splitlines()
-                if line.strip()
-            ],
+            type=kind,
+            prompt_text="" if kind == "date_time" else self.variable_prompt_edit.text().strip(),
+            default_value=(
+                "" if kind == "list_selection" else self.variable_default_edit.text().strip()
+            ),
+            list_options=options if kind == "list_selection" else [],
             notes=self.variable_notes_text.toPlainText().strip(),
         )
         validate_variable(variable)
@@ -1739,6 +1963,10 @@ class ExpansionApp(QMainWindow):
             self.current_variable.notes = variable.notes
         self.refresh_variables()
         self._persist_reporting(f'Saved variable "{variable.name}".')
+        # Show what was actually saved. The fields this type ignores were
+        # dropped on the way in, and the boxes still holding them are hidden,
+        # so leaving the form as typed kept a dropped value alive off screen.
+        self.load_variable(self.current_variable)
 
     def preview_variable(self) -> None:
         try:
@@ -1919,11 +2147,23 @@ class ExpansionApp(QMainWindow):
         self.refresh_expansions()
         self.clear_form(keep_section=True)
 
-    def on_expansion_select(self) -> None:
-        self.load_selected_expansion()
-
     def selected_expansion_index(self) -> int | None:
-        return self._table_selected_store_index(self.tree)
+        """The one row Edit opens: the focused row, when it is selected.
+
+        Ctrl-clicking down the list leaves the focus rectangle on the last row
+        clicked, so always opening the topmost selected row opened something
+        the user was not pointing at. Falls back to the topmost when nothing is
+        focused -- a refresh rebuilds the rows and clears the current row --
+        or when the focus sits on a row outside the selection.
+        """
+        indexes = self.selected_expansion_indexes()
+        if not indexes:
+            return None
+        focused = self._table_store_index(self.tree, self.tree.currentRow())
+        return focused if focused in indexes else indexes[0]
+
+    def selected_expansion_indexes(self) -> list[int]:
+        return self._table_selected_store_indexes(self.tree)
 
     def add_section(self) -> None:
         name, ok = QInputDialog.getText(self, "Add section", "Section name:")
@@ -1958,14 +2198,20 @@ class ExpansionApp(QMainWindow):
 
     def delete_section(self) -> None:
         section = self.selected_section
-        count = sum(1 for expansion in self.store.expansions if expansion.section == section)
-        if not confirm(self, "Delete section", f'Delete "{section}" and {count} expansion(s)?'):
+        # Held on to because the store drops them, and the editor has to know
+        # whether what it is holding was one of them. Clearing it either way
+        # left it pointing at an expansion no longer in the library, which
+        # Apply would then edit and persist into nothing.
+        doomed = [expansion for expansion in self.store.expansions if expansion.section == section]
+        if not confirm(
+            self, "Delete section", f'Delete "{section}" and {len(doomed)} expansion(s)?'
+        ):
             return
         self.store.delete_section(section)
         self.selected_section = self.store.sections[0]
         self.refresh_sections()
         self.refresh_expansions()
-        self.clear_form()
+        self._forget_deleted_expansion(doomed)
         self._persist_reporting(f'Deleted section "{section}".')
 
     def new_expansion(self) -> None:
@@ -1976,7 +2222,27 @@ class ExpansionApp(QMainWindow):
     def load_selected_expansion(self) -> None:
         index = self.selected_expansion_index()
         if index is None:
+            # Selecting a row no longer fills the form, so Edit doing nothing
+            # at all would look like the button was broken.
+            show_info(self, "Edit expansion", "Select an expansion first.")
             return
+        self.load_expansion(index)
+
+    def load_double_clicked_expansion(self, row: int) -> None:
+        """Open the row that was double-clicked, whatever else is selected.
+
+        Pressing a row that is already part of a multi-row selection does not
+        collapse that selection: Qt defers that to the mouse release so the
+        selection can be dragged. The double click therefore arrives with
+        several rows still selected, and reading the selection instead of the
+        row under the pointer opened a different expansion from the one being
+        double-clicked.
+        """
+        index = self._table_store_index(self.tree, row)
+        if index is not None:
+            self.load_expansion(index)
+
+    def load_expansion(self, index: int) -> None:
         expansion = self.store.expansions[index]
         self.current_expansion = expansion
         self.section_combo.setCurrentText(expansion.section)
@@ -2065,6 +2331,9 @@ class ExpansionApp(QMainWindow):
         # first happened to survive a refusal only because persist overwrote
         # it, which is the wrong way round to depend on.
         self._persist_reporting(outcome)
+        # The applied expansion now lives in the list, so the form goes back to
+        # a blank new-expansion state rather than holding a stale copy of it.
+        self.new_expansion()
         self.warn_if_duplicate(expansion.trigger)
 
     def preview_expansion(self) -> None:
@@ -2098,31 +2367,66 @@ class ExpansionApp(QMainWindow):
 
         return Expansion(section, trigger, replacement, self.enabled_check.isChecked(), notes)
 
+    def _forget_deleted_expansion(self, deleted: list[Expansion]) -> None:
+        """Blank the editor only if what it holds is one of the deleted rows.
+
+        Selecting a row no longer loads it, so the selection and the open
+        expansion are now two different things: clearing regardless threw away
+        unapplied edits to an expansion nobody asked to delete. Identity, not
+        ==, because duplicate triggers are allowed and two records that compare
+        equal are still different rows.
+        """
+        if not any(expansion is self.current_expansion for expansion in deleted):
+            return
+        self.current_expansion = None
+        self.clear_form(keep_section=True)
+
     def delete_expansion(self) -> None:
-        index = self.selected_expansion_index()
-        if index is None:
+        indexes = self.selected_expansion_indexes()
+        if not indexes:
             show_info(self, "Delete expansion", "Select an expansion first.")
             return
-        expansion = self.store.expansions[index]
-        if not confirm(self, "Delete expansion", f'Delete trigger "{expansion.trigger}"?'):
+        expansions = [self.store.expansions[index] for index in indexes]
+        if len(expansions) == 1:
+            title = "Delete expansion"
+            question = f'Delete trigger "{expansions[0].trigger}"?'
+            outcome = f'Deleted trigger "{expansions[0].trigger}".'
+        else:
+            title = "Delete expansions"
+            question = f"Delete {len(expansions)} selected expansions?"
+            outcome = f"Deleted {len(expansions)} expansions."
+        if not confirm(self, title, question):
             return
-        del self.store.expansions[index]
-        self.current_expansion = None
+        # Highest index first, so each removal leaves the lower ones in place.
+        for index in reversed(indexes):
+            del self.store.expansions[index]
+        self._forget_deleted_expansion(expansions)
         self.refresh_expansions()
-        self.clear_form(keep_section=True)
-        self._persist_reporting(f'Deleted trigger "{expansion.trigger}".')
+        self._persist_reporting(outcome)
 
     def toggle_enabled(self) -> None:
-        index = self.selected_expansion_index()
-        if index is None:
-            show_info(self, "Toggle enabled", "Select an expansion first.")
+        indexes = self.selected_expansion_indexes()
+        if not indexes:
+            show_info(self, "Toggle On/Off", "Select an expansion first.")
             return
-        expansion = self.store.expansions[index]
-        expansion.enabled = not expansion.enabled
+        expansions = [self.store.expansions[index] for index in indexes]
+        focused = self._table_store_index(self.tree, self.tree.currentRow())
+        # One state for the whole selection rather than flipping each row in
+        # place, so a mixed selection comes out consistent instead of merely
+        # inverted. A single row still just flips.
+        enabled = not all(expansion.enabled for expansion in expansions)
+        for expansion in expansions:
+            expansion.enabled = enabled
         self.refresh_expansions()
-        self._persist_reporting(
-            f'{"Enabled" if expansion.enabled else "Disabled"} "{expansion.trigger}".'
-        )
+        # The refresh rebuilt the rows, so put the selection and the focus back
+        # for a second press.
+        self._select_store_indexes(self.tree, indexes, focused)
+        state = "Enabled" if enabled else "Disabled"
+        if len(expansions) == 1:
+            outcome = f'{state} "{expansions[0].trigger}".'
+        else:
+            outcome = f"{state} {len(expansions)} expansions."
+        self._persist_reporting(outcome)
 
     # -- AHK path / settings ----------------------------------------------
     def current_ahk_path(self) -> Path:
@@ -2225,6 +2529,21 @@ class ExpansionApp(QMainWindow):
                 )
             return None
         return target
+
+    def _report_config_migration(self) -> None:
+        """Say what the move into the config folder did, once, at startup."""
+        moved, failed = self._config_migration
+        if failed:
+            show_warning(
+                self,
+                "Config folder",
+                f"Could not move {', '.join(failed)} into "
+                f"{CONFIG_DIR.name}. They have been left where they were, and "
+                f"the app is using {CONFIG_DIR}. Move them across by hand to "
+                "keep what they held.",
+            )
+        elif moved:
+            self.set_status(f"Moved {', '.join(moved)} into {CONFIG_DIR.name}.")
 
     def _migrate_legacy_backups(self) -> None:
         """Collect backups left beside the files by earlier versions."""

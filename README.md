@@ -20,13 +20,14 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
-The app reads and writes `expansions.json` in the project folder. This file holds your personal expansions and is not tracked in git. To start from a sample, copy the bundled example:
+The app reads and writes `config\expansions.json`, creating the `config` folder on first save. This file holds your personal expansions and is not tracked in git. To start from a sample, copy the bundled example:
 
 ```powershell
-Copy-Item expansions.json.example expansions.json
+New-Item -ItemType Directory -Force config
+Copy-Item expansions.json.example config\expansions.json
 ```
 
-If `expansions.json` is absent, the app simply starts with an empty store. It also stores the generated-script path in `settings.json` and the light/dark theme choice in `ui_prefs.json` (both untracked).
+If `expansions.json` is absent, the app simply starts with an empty store. It also stores the generated-script path in `config\settings.json` and the light/dark theme choice in `config\ui_prefs.json` (both untracked). An install from before the `config` folder existed has these three files moved into it once, on first run.
 
 The window uses a left sidebar to switch between the **Expansions**, **Variables**, and **Templates** views, and a theme toggle at the bottom of the sidebar switches between light and dark mode (defaulting to your OS setting).
 
@@ -42,8 +43,25 @@ python -m PyInstaller AutoHotkeyExpansionManager.spec
 
 The executable is written to `dist\AutoHotkeyExpansionManager.exe`. It is
 portable: it reads and writes `expansions.json`, `settings.json`, and
-`ui_prefs.json` **in the same folder as the `.exe`**, so run it from a
-user-writable location (e.g. its own folder, not `C:\Program Files`).
+`ui_prefs.json` in a **`config` folder beside the `.exe`**, so run it from a
+user-writable location (e.g. its own folder, not `C:\Program Files`). A working
+install ends up as:
+
+```
+AutoHotkeyExpansionManager.exe
+text_expansions.ahk          generated; this is the file AutoHotkey runs
+config\
+    expansions.json          your library
+    settings.json            generated-script path, backup folder
+    ui_prefs.json            light/dark choice
+    TextExpansionManager.ico copied here for the script's tray and prompts
+backups\                     copies of the library and the generated script
+```
+
+The generated script looks for its icon in `config\` first and then next to
+itself, both relative to the script, so a `.ahk` copied to a machine with no app
+installed still runs -- with the icon if one travelled with it, and with
+AutoHotkey's default icon if not.
 
 The bundled `.spec` produces a one-file, windowed (no console) build with the
 app icon. Rebuild from scratch with:

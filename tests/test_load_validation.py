@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication
 import app as app_module
 from ahk_manager import AppSettings, Expansion, ExpansionStore
 from app import ExpansionApp
+from qt_cleanup import destroy_all_windows
 
 # A single QApplication must exist for the lifetime of the process.
 _qt_app = QApplication.instance() or QApplication([])
@@ -36,6 +37,7 @@ class LoadValidationTests(unittest.TestCase):
     """
 
     def setUp(self) -> None:
+        destroy_all_windows()
         self._temp = TemporaryDirectory()
         self.dir = Path(self._temp.name)
         self.path = self.dir / "expansions.json"
@@ -338,6 +340,7 @@ class _RedirectedPaths:
     """
 
     def setUp(self) -> None:
+        destroy_all_windows()
         self._temp = TemporaryDirectory()
         root = Path(self._temp.name)
         self.json_path = root / "expansions.json"

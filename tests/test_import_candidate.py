@@ -28,6 +28,7 @@ from ahk_manager import (
     render_ahk,
 )
 from app import ExpansionApp
+from qt_cleanup import destroy_all_windows
 
 # A single QApplication must exist for the lifetime of the process.
 _qt_app = QApplication.instance() or QApplication([])
@@ -35,6 +36,7 @@ _qt_app = QApplication.instance() or QApplication([])
 
 class ImportCandidateTests(unittest.TestCase):
     def setUp(self) -> None:
+        destroy_all_windows()
         self._temp = TemporaryDirectory()
         self.root = Path(self._temp.name)
         self._saved_paths = (

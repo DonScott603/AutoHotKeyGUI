@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 import app as app_module
 from ahk_manager import Expansion, ExpansionStore, TemplateDef, VariableDef
 from app import ExpansionApp
+from qt_cleanup import destroy_all_windows
 
 # A single QApplication must exist for the lifetime of the process.
 _qt_app = QApplication.instance() or QApplication([])
@@ -27,6 +28,7 @@ class AutoSaveTests(unittest.TestCase):
     """
 
     def setUp(self) -> None:
+        destroy_all_windows()
         self._temp = TemporaryDirectory()
         root = Path(self._temp.name)
         self.json_path = root / "expansions.json"

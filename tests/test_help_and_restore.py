@@ -20,6 +20,7 @@ from ahk_manager import (
     restore_backup,
 )
 from app import ExpansionApp
+from qt_cleanup import destroy_all_windows
 
 # A single QApplication must exist for the lifetime of the process.
 _qt_app = QApplication.instance() or QApplication([])
@@ -27,6 +28,7 @@ _qt_app = QApplication.instance() or QApplication([])
 
 class BackupRestoreTests(unittest.TestCase):
     def setUp(self) -> None:
+        destroy_all_windows()
         self._temp = TemporaryDirectory()
         self.dir = Path(self._temp.name)
         self.target = self.dir / "expansions.json"
@@ -179,6 +181,7 @@ class BackupRestoreTests(unittest.TestCase):
 
 class HelpPageTests(unittest.TestCase):
     def setUp(self) -> None:
+        destroy_all_windows()
         self._temp = TemporaryDirectory()
         root = Path(self._temp.name)
         self.json_path = root / "expansions.json"
