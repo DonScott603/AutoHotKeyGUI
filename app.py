@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -211,6 +212,15 @@ the one to press after making changes.</li>
 <li><b>Import .ahk</b> reads expansions out of an AutoHotkey file and merges
 them in, asking what to do about any that clash.</li>
 </ul>
+
+<h3>Running scripts</h3>
+<p><b>Generate &amp; Run AHK</b> stops the script this app started before
+starting the new one, including one left running from an earlier script path.
+AutoHotkey scripts this app did not generate are left alone; if any are
+running it says so, and <b>Settings &gt; Running AHK Scripts</b> lists every
+AutoHotkey process so you can stop the ones you choose.</p>
+<p>Two copies of the same script running at once is worth ruling out first if
+a trigger ever expands twice.</p>
 """
 
 # Qt file-dialog filter strings (";;"-separated) rather than tkinter tuples.
@@ -275,6 +285,47 @@ def extract_ahk_script_paths(command_line: str) -> list[str]:
     for token in re.findall(r"[^\s]+?\.ahk", stripped, re.IGNORECASE):
         paths.append(token.strip('"'))
     return paths
+
+
+@dataclass
+class RunningScript:
+    """One running AutoHotkey process, as the stop list shows it."""
+
+    pid: int
+    name: str
+    scripts: list[str]
+    # Whether this app is answerable for the process: it runs a script at a
+    # path this app has generated to. Only these are ever stopped without
+    # being asked; anything else belongs to the user.
+    owned: bool
+
+    def label(self) -> str:
+        where = ", ".join(self.scripts) if self.scripts else "(no script path found)"
+        suffix = "  --  this app's script" if self.owned else ""
+        return f"{self.name} (PID {self.pid})  --  {where}{suffix}"
+
+
+def classify_running_scripts(
+    processes: list[dict[str, object]], owned_paths: set[str], current_pid: int
+) -> list[RunningScript]:
+    """The AutoHotkey processes worth listing, each marked as ours or not.
+
+    Kept separate from the process query so the ownership rule -- the part
+    that decides what may be stopped unasked -- can be tested without a
+    running AutoHotkey.
+    """
+    found: list[RunningScript] = []
+    for process in processes:
+        pid = process.get("ProcessId")
+        name = str(process.get("Name") or "")
+        if name.lower() not in AHK_PROCESS_NAMES or not isinstance(pid, int):
+            continue
+        if pid == current_pid:
+            continue
+        scripts = extract_ahk_script_paths(str(process.get("CommandLine") or ""))
+        owned = any(normalized_path_for_compare(script) in owned_paths for script in scripts)
+        found.append(RunningScript(pid, name, scripts, owned))
+    return sorted(found, key=lambda item: (not item.owned, item.pid))
 
 
 # ---------------------------------------------------------------------------
@@ -955,6 +1006,82 @@ INSERTION_ACTIONS = (
 )
 
 
+class RunningScriptsDialog(QDialog):
+    """Every running AutoHotkey process, with the ones to stop ticked.
+
+    Opened on demand rather than on the way to a run: an unrelated script of
+    the user's own is not this app's to close, and a prompt on every Generate
+    & Run would be one. Nothing here is stopped without a tick and a
+    confirmation.
+    """
+
+    def __init__(self, parent, scripts: list[RunningScript]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Running AHK Scripts")
+        self.resize(680, 360)
+        self.chosen_pids: list[int] = []
+        self.refresh_requested = False
+
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            "AutoHotkey processes running now. Tick the ones to stop. Scripts "
+            "this app generated are marked; the rest are your own and are "
+            "never stopped on their own."
+            if scripts
+            else "No AutoHotkey processes are running."
+        )
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self._list = QListWidget()
+        for script in scripts:
+            item = QListWidgetItem(script.label())
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, script.pid)
+            self._list.addItem(item)
+        layout.addWidget(self._list, 1)
+
+        buttons = QDialogButtonBox()
+        stop_button = buttons.addButton("Stop Selected", QDialogButtonBox.ButtonRole.ActionRole)
+        stop_button.clicked.connect(self._stop_selected)
+        stop_button.setEnabled(bool(scripts))
+        refresh_button = buttons.addButton("Refresh", QDialogButtonBox.ButtonRole.ActionRole)
+        refresh_button.clicked.connect(self._request_refresh)
+        close_button = buttons.addButton(QDialogButtonBox.StandardButton.Close)
+        close_button.clicked.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _checked_pids(self) -> list[int]:
+        pids: list[int] = []
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item.checkState() == Qt.CheckState.Checked:
+                pids.append(int(item.data(Qt.ItemDataRole.UserRole)))
+        return pids
+
+    def _request_refresh(self) -> None:
+        self.refresh_requested = True
+        self.accept()
+
+    def _stop_selected(self) -> None:
+        pids = self._checked_pids()
+        if not pids:
+            show_info(self, "Running AHK Scripts", "Tick at least one script to stop.")
+            return
+        # Force-stopping is not undoable and an unsaved script of the user's
+        # own could be behind any of these, so the count is confirmed first.
+        if not confirm(
+            self,
+            "Stop scripts",
+            f"Stop {len(pids)} running AutoHotkey process(es)? This force-closes them.",
+        ):
+            return
+        self.chosen_pids = pids
+        self.accept()
+
+
 class PreviewDialog(QDialog):
     def __init__(self, parent, title: str, content: str) -> None:
         super().__init__(parent)
@@ -1006,6 +1133,12 @@ class ExpansionApp(QMainWindow):
         self.store = self._load_store()
         self.settings = self._load_settings()
         self.ahk_process: subprocess.Popen | None = None
+        # Every path this app has generated to this session, not just the one
+        # configured now. A run used to stop only the script it was about to
+        # launch, so changing the path left the script at the old path running
+        # alongside the new one -- two copies of every trigger.
+        self._owned_ahk_paths: set[str] = set()
+        self._remember_owned_ahk_path(self.settings.generated_ahk_path or AHK_PATH)
         self.theme = load_theme_pref() or detect_system_theme()
         # One backup per session, taken before the first write. See _backup_once.
         self._session_backed_up = False
@@ -1169,6 +1302,16 @@ class ExpansionApp(QMainWindow):
         ahk_browse.clicked.connect(self.browse_ahk_path)
         path_row.addWidget(ahk_browse)
         layout.addLayout(path_row)
+
+        running_row = QHBoxLayout()
+        running_button = QPushButton("Running AHK Scripts...")
+        running_button.setToolTip(
+            "List every running AutoHotkey process and stop the ones you choose."
+        )
+        running_button.clicked.connect(self.show_running_scripts)
+        running_row.addWidget(running_button)
+        running_row.addStretch(1)
+        layout.addLayout(running_row)
 
         self._settings_group(
             layout, "Appearance", "The same toggle as the one in the sidebar."
@@ -2480,8 +2623,13 @@ class ExpansionApp(QMainWindow):
         the setting pointing at one folder and the backups sitting in another,
         so the restore lists would come up empty.
         """
+        # The outgoing path stays on the owned list. It is the one this app was
+        # last generating to, so a script may well still be running from it,
+        # and after this line nothing else remembers where that was.
+        self._remember_owned_ahk_path(self.settings.generated_ahk_path)
         self.settings.generated_ahk_path = str(self.current_ahk_path())
         self.ahk_path_edit.setText(self.settings.generated_ahk_path)
+        self._remember_owned_ahk_path(self.settings.generated_ahk_path)
         self.settings.backup_directory = self.backup_dir_edit.text().strip()
         try:
             self.settings.save(SETTINGS_PATH)
@@ -2907,8 +3055,30 @@ class ExpansionApp(QMainWindow):
             message += f" Stopped {terminated} matching running script process(es)."
         elif inspect_warning:
             message += f" Warning: {inspect_warning}"
+        # Reported, not acted on: an AutoHotkey script this app did not
+        # generate is the user's own, and one of them may well be what they
+        # want running. Settings > Running AHK Scripts is where they are
+        # stopped, one tick at a time.
+        others = self._count_foreign_running_scripts()
+        if others:
+            message += (
+                f" {others} other AutoHotkey script(s) are running; review them "
+                "under Settings > Running AHK Scripts."
+            )
         self.set_status(message)
         show_info(self, "Generate & Run AHK", message)
+
+    def _count_foreign_running_scripts(self) -> int:
+        """How many running scripts are not this app's, or 0 if unknowable.
+
+        Only ever used to add a sentence to a message that has already been
+        earned, so a failed query says nothing rather than turning a
+        successful run into an error.
+        """
+        try:
+            return sum(1 for script in self._classified_running_scripts() if not script.owned)
+        except ProcessLookupError:
+            return 0
 
     def run_ahk(self) -> None:
         if self.ahk_process is not None and self.ahk_process.poll() is None:
@@ -2934,9 +3104,11 @@ class ExpansionApp(QMainWindow):
             )
 
         try:
-            return subprocess.Popen([str(executable), str(ahk_path)], creationflags=_NO_WINDOW)
+            process = subprocess.Popen([str(executable), str(ahk_path)], creationflags=_NO_WINDOW)
         except OSError as exc:
             raise ValueError(f"Could not launch AutoHotkey: {exc}") from exc
+        self._remember_owned_ahk_path(ahk_path)
+        return process
 
     def _find_autohotkey(self) -> Path | None:
         for name in ("AutoHotkey64.exe", "AutoHotkey.exe"):
@@ -2956,32 +3128,105 @@ class ExpansionApp(QMainWindow):
                 return candidate
         return None
 
-    def _terminate_matching_ahk_processes(self, ahk_path: Path) -> int:
-        processes = self._running_autohotkey_processes()
-        target_path = ahk_path.resolve(strict=False)
-        current_pid = os.getpid()
-        terminated = 0
+    def _remember_owned_ahk_path(self, path: Path | str) -> None:
+        text = str(path).strip()
+        if text:
+            self._owned_ahk_paths.add(normalized_path_for_compare(text))
 
-        for process in processes:
-            pid = process.get("ProcessId")
-            command_line = str(process.get("CommandLine") or "")
-            name = str(process.get("Name") or "").lower()
-            if name not in AHK_PROCESS_NAMES or not isinstance(pid, int) or pid == current_pid:
-                continue
-            if not command_line_references_script(command_line, target_path):
-                continue
+    def _stop_own_ahk_process(self) -> int:
+        """Stop the script this app launched, by handle rather than by path.
+
+        The path match below cannot see a process whose command line the
+        process query failed to return, and this app's own child is the one
+        process it can always identify. Overwriting the handle without this
+        left that process running for the life of the session.
+        """
+        process = self.ahk_process
+        self.ahk_process = None
+        if process is None or process.poll() is not None:
+            return 0
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
             try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/T", "/F"],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    creationflags=_NO_WINDOW,
-                )
-                terminated += 1
-            except (OSError, subprocess.CalledProcessError) as exc:
-                raise ValueError(f"Could not stop matching AutoHotkey process {pid}: {exc}") from exc
+                process.kill()
+            except OSError:
+                return 0
+        return 1
+
+    def _terminate_matching_ahk_processes(self, ahk_path: Path) -> int:
+        """Stop every running script this app is answerable for.
+
+        Matched against every path this app has generated to this session, not
+        only the one about to be launched: changing the script path otherwise
+        left the previous script running beside the new one, so every trigger
+        fired twice.
+        """
+        self._remember_owned_ahk_path(ahk_path)
+        terminated = self._stop_own_ahk_process()
+        for script in self._classified_running_scripts():
+            if not script.owned:
+                # Someone else's script. Listed by the Running AHK Scripts
+                # dialog, stopped only when ticked there.
+                continue
+            terminated += self._stop_process(script.pid)
         return terminated
+
+    def _stop_process(self, pid: int) -> int:
+        if pid == os.getpid():
+            return 0
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=True,
+                capture_output=True,
+                text=True,
+                creationflags=_NO_WINDOW,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise ValueError(f"Could not stop matching AutoHotkey process {pid}: {exc}") from exc
+        return 1
+
+    def _classified_running_scripts(self) -> list[RunningScript]:
+        return classify_running_scripts(
+            self._running_autohotkey_processes(), self._owned_ahk_paths, os.getpid()
+        )
+
+    def show_running_scripts(self) -> None:
+        """The stop list, opened from Settings.
+
+        Loops so Refresh and a completed stop both re-query rather than
+        leaving the window showing a list that is already out of date.
+        """
+        while True:
+            try:
+                scripts = self._classified_running_scripts()
+            except ProcessLookupError as exc:
+                show_error(self, "Running AHK Scripts", str(exc))
+                return
+
+            dialog = RunningScriptsDialog(self, scripts)
+            if not dialog.exec():
+                return
+            if dialog.refresh_requested:
+                continue
+
+            stopped = 0
+            try:
+                for pid in dialog.chosen_pids:
+                    stopped += self._stop_process(pid)
+            except ValueError as exc:
+                show_error(self, "Running AHK Scripts", str(exc))
+                return
+            finally:
+                # The app's own handle is stale once its process was among the
+                # ones stopped, and a stale handle makes Run AHK refuse to
+                # start on the grounds that a script is already running.
+                own = self.ahk_process
+                if own is not None and own.pid in dialog.chosen_pids:
+                    self.ahk_process = None
+            self.set_status(f"Stopped {stopped} running AutoHotkey process(es).")
 
     def _running_autohotkey_processes(self) -> list[dict[str, object]]:
         command = [
