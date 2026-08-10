@@ -150,6 +150,10 @@ Sections are only for organising the list; they do not affect behaviour.</p>
 <code>;</code> makes accidental firing much less likely.</li>
 <li>Clear the <b>On</b> box to keep an expansion but leave it out of the
 generated script.</li>
+<li>An expansion fires when you type its trigger followed by a space, a tab or
+punctuation, and that character is kept: <code>;ty</code> and a space give
+&quot;Thank you! &quot;. Tick <b>Drop the character that triggered it</b> to
+have the expansion end exactly where its replacement does.</li>
 <li>Double-click a row, or select it and press <b>Edit</b>, to open it in the
 editor on the right. Ctrl-click and Shift-click select several rows at once,
 which <b>Delete</b> and <b>Toggle On/Off</b> then act on together.</li>
@@ -1351,6 +1355,14 @@ class ExpansionApp(QMainWindow):
         self.enabled_check.setChecked(True)
         layout.addWidget(self.enabled_check)
 
+        self.omit_end_char_check = QCheckBox("Drop the character that triggered it")
+        self.omit_end_char_check.setToolTip(
+            "Typing the trigger followed by a space normally leaves that space "
+            "after the replacement. Tick this to end the expansion exactly "
+            "where its replacement does."
+        )
+        layout.addWidget(self.omit_end_char_check)
+
         form_actions = QHBoxLayout()
         apply_button = QPushButton("Apply")
         apply_button.setObjectName("Primary")
@@ -2248,6 +2260,7 @@ class ExpansionApp(QMainWindow):
         self.section_combo.setCurrentText(expansion.section)
         self.trigger_edit.setText(expansion.trigger)
         self.enabled_check.setChecked(expansion.enabled)
+        self.omit_end_char_check.setChecked(expansion.omit_end_char)
         self.replacement_text.setPlainText(expansion.replacement)
         self.notes_text.setPlainText(expansion.notes)
 
@@ -2322,6 +2335,7 @@ class ExpansionApp(QMainWindow):
             self.current_expansion.replacement = expansion.replacement
             self.current_expansion.enabled = expansion.enabled
             self.current_expansion.notes = expansion.notes
+            self.current_expansion.omit_end_char = expansion.omit_end_char
             outcome = f'Updated trigger "{expansion.trigger}".'
 
         self.selected_section = expansion.section
@@ -2365,7 +2379,14 @@ class ExpansionApp(QMainWindow):
         except ValueError as exc:
             raise ValueError(f"Replacement placeholder is invalid: {exc}") from exc
 
-        return Expansion(section, trigger, replacement, self.enabled_check.isChecked(), notes)
+        return Expansion(
+            section,
+            trigger,
+            replacement,
+            self.enabled_check.isChecked(),
+            notes,
+            self.omit_end_char_check.isChecked(),
+        )
 
     def _forget_deleted_expansion(self, deleted: list[Expansion]) -> None:
         """Blank the editor only if what it holds is one of the deleted rows.
@@ -3095,6 +3116,7 @@ class ExpansionApp(QMainWindow):
             self.section_combo.setCurrentText(self.selected_section)
         self.trigger_edit.clear()
         self.enabled_check.setChecked(True)
+        self.omit_end_char_check.setChecked(False)
         self.replacement_text.clear()
         self.notes_text.clear()
 
