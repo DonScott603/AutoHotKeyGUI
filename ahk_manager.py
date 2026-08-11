@@ -554,7 +554,10 @@ SKIPPED_MARKER_RE = re.compile(r"^\s*;\s*@tem-skipped:\s*(?P<json>.*)$")
 PLACEHOLDER_RE = re.compile(r"\{(AHK_EXPR|AHK_INPUT|AHK_SELECT|AHK_KEY|AHK_IMAGE|VAR|TPL):([^{}]*)\}")
 PLACEHOLDER_START_RE = re.compile(r"\{(?:AHK_(?:EXPR|INPUT|SELECT|KEY|IMAGE)|VAR|TPL):")
 VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-SUPPORTED_KEYS = {"Tab"}
+# Sent through SendEvent as {Tab} / {Enter}, which is why the set is small: a
+# name that is not a key AutoHotkey knows would be sent as literal text, and the
+# expansion would silently gain a word instead of pressing something.
+SUPPORTED_KEYS = {"Tab", "Enter"}
 HOTSTRING_OPTIONS = "C"
 # Static auto-replace hotstrings add "T" (Text mode) so the replacement is sent
 # literally. Without it AutoHotkey interprets ^ + ! # { } as Send modifiers/keys
@@ -2180,7 +2183,8 @@ def _parse_placeholder(kind: str, body: str) -> TemplatePlaceholder:
         if not key_name:
             raise ValueError("AHK_KEY requires a key name.")
         if key_name not in SUPPORTED_KEYS:
-            raise ValueError("AHK_KEY currently supports only Tab.")
+            supported = ", ".join(sorted(SUPPORTED_KEYS))
+            raise ValueError(f"AHK_KEY currently supports only {supported}.")
         return TemplatePlaceholder(kind, key_name, [])
 
     if kind == "AHK_IMAGE":

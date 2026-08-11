@@ -19,6 +19,7 @@ from ahk_manager import (
     validate_variable,
     validate_variables,
 )
+import app as app_module
 from app import ExpansionApp
 from qt_cleanup import destroy_all_windows
 
@@ -301,9 +302,37 @@ class VariableTemplateTests(unittest.TestCase):
                 "Input Box",
                 "List Selection",
                 "Tab",
+                "Enter",
                 "Image",
             }:
                 self.assertIn(label, labels)
+        finally:
+            app.close()
+
+    def test_the_insertion_buttons_read_down_the_grid_in_order(self) -> None:
+        # Two to a row, so the order of INSERTION_ACTIONS is what the user
+        # reads: Image with the other content, then the two key presses
+        # together on a row of their own.
+        self.assertEqual(
+            [label for label, _handler in app_module.INSERTION_ACTIONS],
+            [
+                "Date/Time",
+                "Input Box",
+                "List Selection",
+                "Image",
+                "Tab",
+                "Enter",
+                "Variable",
+                "Template",
+            ],
+        )
+
+    def test_the_enter_button_inserts_an_enter_key(self) -> None:
+        app = ExpansionApp()
+        try:
+            app.replacement_text.setPlainText("")
+            app.insert_enter(app.replacement_text)
+            self.assertEqual(app.replacement_text.toPlainText(), "{AHK_KEY:Enter}")
         finally:
             app.close()
 

@@ -170,7 +170,7 @@ rather than typing the syntax by hand.</p>
 <li><code>{{AHK_SELECT:...}}</code> offers a dropdown of fixed choices.</li>
 <li><code>{{AHK_EXPR:...}}</code> inserts a date or time, evaluated as it
 fires.</li>
-<li><code>{{AHK_KEY:...}}</code> presses a key, such as Tab.</li>
+<li><code>{{AHK_KEY:...}}</code> presses a key: Tab or Enter.</li>
 <li><code>{{AHK_IMAGE:...}}</code> pastes an image from a file.</li>
 <li><code>{{VAR:name}}</code> and <code>{{TPL:name}}</code> pull in a variable
 or a template.</li>
@@ -995,12 +995,16 @@ class LibrarySelectionDialog(QDialog):
 # Insertion toolbar entries: (button label, handler attribute name). The label
 # drops the repetitive "Insert " prefix (kept as a tooltip) so the toolbar stays
 # compact and the form panels fit in a reasonably sized window.
+# Laid out two to a row, so the order here is the order down the grid. The two
+# key presses sit together on their own row rather than either of them sharing
+# one with Image, which is a different kind of thing entirely.
 INSERTION_ACTIONS = (
     ("Date/Time", "insert_date_time"),
     ("Input Box", "insert_input_box"),
     ("List Selection", "insert_list_selection"),
-    ("Tab", "insert_tab"),
     ("Image", "insert_image"),
+    ("Tab", "insert_tab"),
+    ("Enter", "insert_enter"),
     ("Variable", "insert_variable"),
     ("Template", "insert_template"),
 )
@@ -2425,6 +2429,9 @@ class ExpansionApp(QMainWindow):
 
     def insert_tab(self, target: QPlainTextEdit | None = None) -> None:
         self.insert_snippet("{AHK_KEY:Tab}", target)
+
+    def insert_enter(self, target: QPlainTextEdit | None = None) -> None:
+        self.insert_snippet("{AHK_KEY:Enter}", target)
 
     def insert_image(self, target: QPlainTextEdit | None = None) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
