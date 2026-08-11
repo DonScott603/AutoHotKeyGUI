@@ -11,6 +11,7 @@ from ahk_manager import (
     TemplateDef,
     TemplatePlaceholder,
     generate_ahk,
+    import_ahk,
     parse_replacement_template,
     render_ahk,
 )
@@ -445,13 +446,44 @@ class PlaceholderGenerationTests(unittest.TestCase):
         self.assertIn(":C:Dyn::\n{", output)
 
     def test_unsupported_key_raises_clear_error(self) -> None:
+        # A name AutoHotkey does not know would be sent as literal text, so the
+        # expansion would quietly gain a word instead of pressing something.
         store = ExpansionStore(
             sections=["Keys"],
-            expansions=[Expansion("Keys", "badkey", "{AHK_KEY:Enter}")],
+            expansions=[Expansion("Keys", "badkey", "{AHK_KEY:F5}")],
         )
 
-        with self.assertRaisesRegex(ValueError, "supports only Tab"):
+        with self.assertRaisesRegex(ValueError, "supports only Enter, Tab"):
             render_ahk(store)
+
+    def test_enter_key_generates_a_send_event(self) -> None:
+        store = ExpansionStore(
+            sections=["Keys"],
+            expansions=[Expansion("Keys", "para", "Line one{AHK_KEY:Enter}Line two")],
+        )
+
+        output = render_ahk(store)
+
+        self.assertIn('SendEvent("{Enter}")', output)
+        self.assertIn('__tem_result .= "Line one"', output)
+        self.assertIn('__tem_result .= "Line two"', output)
+
+    def test_an_enter_key_round_trips_through_an_import(self) -> None:
+        # The importer reads SendEvent back out of a generated script, so a key
+        # it cannot recognise would come home as literal text.
+        store = ExpansionStore(
+            sections=["Keys"],
+            expansions=[Expansion("Keys", ";para", "Line one{AHK_KEY:Enter}Line two")],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "generated.ahk"
+            generate_ahk(store, path, backup=False)
+            imported = import_ahk(path)
+
+        self.assertEqual(
+            imported.expansions[0].replacement, "Line one{AHK_KEY:Enter}Line two"
+        )
 
     def test_image_placeholder_parses(self) -> None:
         segments = parse_replacement_template(r"{AHK_IMAGE:C:\Users\Scott\Pictures\logo.png}")

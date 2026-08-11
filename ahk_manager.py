@@ -107,6 +107,11 @@ class Expansion:
     replacement: str
     enabled: bool = True
     notes: str = ""
+    # Whether to swallow the character that triggered the expansion. Typing
+    # ";ty " normally leaves "Thank you! " -- AutoHotkey reproduces the ending
+    # space so the sentence continues where the user was typing. Set here, the
+    # expansion ends exactly where its replacement does.
+    omit_end_char: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], fallback_section: str = "General") -> "Expansion":
@@ -116,6 +121,7 @@ class Expansion:
             replacement=str(data.get("replacement") or ""),
             enabled=bool(data.get("enabled", True)),
             notes=str(data.get("notes") or ""),
+            omit_end_char=bool(data.get("omit_end_char", False)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -125,6 +131,7 @@ class Expansion:
             "replacement": self.replacement,
             "enabled": self.enabled,
             "notes": self.notes,
+            "omit_end_char": self.omit_end_char,
         }
 
 
@@ -224,7 +231,7 @@ _FIELD_TYPES = {
     },
     "expansions": {
         "section": "text", "trigger": "text", "replacement": "text",
-        "enabled": "bool", "notes": "text",
+        "enabled": "bool", "notes": "text", "omit_end_char": "bool",
     },
     "variables": {
         "name": "text", "type": "text", "prompt_text": "text",
@@ -547,12 +554,20 @@ SKIPPED_MARKER_RE = re.compile(r"^\s*;\s*@tem-skipped:\s*(?P<json>.*)$")
 PLACEHOLDER_RE = re.compile(r"\{(AHK_EXPR|AHK_INPUT|AHK_SELECT|AHK_KEY|AHK_IMAGE|VAR|TPL):([^{}]*)\}")
 PLACEHOLDER_START_RE = re.compile(r"\{(?:AHK_(?:EXPR|INPUT|SELECT|KEY|IMAGE)|VAR|TPL):")
 VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-SUPPORTED_KEYS = {"Tab"}
+# Sent through SendEvent as {Tab} / {Enter}, which is why the set is small: a
+# name that is not a key AutoHotkey knows would be sent as literal text, and the
+# expansion would silently gain a word instead of pressing something.
+SUPPORTED_KEYS = {"Tab", "Enter"}
 HOTSTRING_OPTIONS = "C"
 # Static auto-replace hotstrings add "T" (Text mode) so the replacement is sent
 # literally. Without it AutoHotkey interprets ^ + ! # { } as Send modifiers/keys
 # (e.g. a leading/trailing "!" becomes Alt), corrupting the expansion.
 STATIC_HOTSTRING_OPTIONS = "CT"
+# Appended for an expansion with omit_end_char set. Only a static auto-replace
+# hotstring needs it: AutoHotkey reproduces the ending character itself there,
+# and "O" is what tells it not to. The block forms never reproduce it -- they
+# re-send it explicitly -- so they drop those lines instead.
+OMIT_END_CHAR_OPTION = "O"
 VARIABLE_TYPES = {"text_input", "list_selection", "date_time"}
 # What a date_time variable formats with when its format is left blank. Shared
 # so the preview cannot claim one thing and the generator emit another.
@@ -689,6 +704,13 @@ def import_ahk(path: Path) -> ExpansionStore:
                 sections.append(current_section)
             trigger = hotstring_match.group("trigger").strip()
             enabled = not bool(hotstring_match.group("disabled"))
+            # "O" on the hotstring line is AutoHotkey's own spelling of "swallow
+            # the ending character", so a hand-written script carries the
+            # setting without needing one of our markers. Options are
+            # case-insensitive to AutoHotkey, so match them that way.
+            omits_end_char = OMIT_END_CHAR_OPTION in (
+                hotstring_match.group("options") or ""
+            ).upper()
             if pending_source is not None:
                 # Generated file: the marker holds the authoritative template, so
                 # dynamic (variable/input/date) expansions round-trip correctly.
@@ -699,6 +721,12 @@ def import_ahk(path: Path) -> ExpansionStore:
                         replacement=str(pending_source.get("replacement", "")),
                         enabled=enabled,
                         notes=str(pending_source.get("notes", "")),
+                        # The marker is authoritative for a block hotstring,
+                        # whose options cannot express the setting; for a static
+                        # one the two agree, since both came from this field.
+                        omit_end_char=bool(
+                            pending_source.get("omit_end_char", omits_end_char)
+                        ),
                     )
                 )
             elif hotstring_match.group("replacement") == "" and (
@@ -716,6 +744,7 @@ def import_ahk(path: Path) -> ExpansionStore:
                             trigger=trigger,
                             replacement=reconstructed,
                             enabled=enabled,
+                            omit_end_char=omits_end_char,
                         )
                     )
             else:
@@ -728,6 +757,7 @@ def import_ahk(path: Path) -> ExpansionStore:
                         # own output and for a hand-written script.
                         replacement=_unescape_ahk(hotstring_match.group("replacement")),
                         enabled=enabled,
+                        omit_end_char=omits_end_char,
                     )
                 )
             pending_source = None
@@ -1263,6 +1293,7 @@ def merge_imported_store(
             existing.replacement = expansion.replacement
             existing.enabled = expansion.enabled
             existing.notes = expansion.notes
+            existing.omit_end_char = expansion.omit_end_char
             result.overwritten += 1
         else:
             expansion.trigger = _renamed_trigger(target, expansion.section, expansion.trigger)
@@ -1678,11 +1709,14 @@ def render_expansion(
             send = "TEM_Paste" if use_paste else "SendText"
             lines = [f":{HOTSTRING_OPTIONS}:{expansion.trigger}::", "{"]
             lines.append(f"    {send}({_ahk_string(resolved)})")
-            lines.extend(_end_char_lines())
+            lines.extend(_end_char_lines(expansion))
             lines.append("}")
         else:
+            options = STATIC_HOTSTRING_OPTIONS + (
+                OMIT_END_CHAR_OPTION if expansion.omit_end_char else ""
+            )
             lines = [
-                f":{STATIC_HOTSTRING_OPTIONS}:{expansion.trigger}::{_single_line_replacement(resolved)}"
+                f":{options}:{expansion.trigger}::{_single_line_replacement(resolved)}"
             ]
         if expansion.notes:
             lines.extend(_notes_lines(expansion.notes))
@@ -1775,7 +1809,7 @@ def render_expansion(
 
     flush_result()
     if not _ends_with_key(segments):
-        lines.extend(_end_char_lines())
+        lines.extend(_end_char_lines(expansion))
     lines.append("}")
     if expansion.notes:
         lines.extend(_notes_lines(expansion.notes))
@@ -1801,6 +1835,7 @@ def resolve_expansion_preview(expansion: Expansion, store: ExpansionStore) -> Pr
             f"Section: {expansion.section}",
             f"Trigger: {expansion.trigger}",
             f"Enabled: {'Yes' if expansion.enabled else 'No'}",
+            f"Keeps ending character: {'No' if expansion.omit_end_char else 'Yes'}",
             "",
             "Raw Replacement Text",
             "--------------------",
@@ -2148,7 +2183,8 @@ def _parse_placeholder(kind: str, body: str) -> TemplatePlaceholder:
         if not key_name:
             raise ValueError("AHK_KEY requires a key name.")
         if key_name not in SUPPORTED_KEYS:
-            raise ValueError("AHK_KEY currently supports only Tab.")
+            supported = ", ".join(sorted(SUPPORTED_KEYS))
+            raise ValueError(f"AHK_KEY currently supports only {supported}.")
         return TemplatePlaceholder(kind, key_name, [])
 
     if kind == "AHK_IMAGE":
@@ -2441,9 +2477,14 @@ def _skipped(expansion: Expansion, reason: str) -> RenderedExpansion:
 
 
 def _source_marker(expansion: Expansion) -> str:
-    payload: dict[str, str] = {"replacement": expansion.replacement}
+    payload: dict[str, Any] = {"replacement": expansion.replacement}
     if expansion.notes:
         payload["notes"] = expansion.notes
+    # Recoverable from the hotstring line's own options in the static case, but
+    # not in the block case, where the setting shows up only as the absence of
+    # the A_EndChar lines. Carried here so both round-trip the same way.
+    if expansion.omit_end_char:
+        payload["omit_end_char"] = True
     return "; @tem: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -2781,7 +2822,7 @@ def _ends_with_key(segments: list[Any]) -> bool:
     return False
 
 
-def _end_char_lines() -> list[str]:
+def _end_char_lines(expansion: Expansion) -> list[str]:
     # Dynamic hotstrings run code instead of auto-replacing, so AutoHotkey does
     # not reproduce the ending character (space/Enter/Tab) that triggered them.
     # Re-send A_EndChar so it is preserved, matching plain-text hotstrings.
@@ -2789,6 +2830,13 @@ def _end_char_lines() -> list[str]:
     # Omitted for an expansion that ends on a key press: the caret has moved on
     # by then -- a trailing Tab lands it in the next field -- so replaying the
     # character would type it somewhere the user did not expand into.
+    #
+    # Also omitted when the expansion asks to swallow its ending character.
+    # Nothing else is needed here -- these lines are the only thing that would
+    # have reproduced it -- so the "O" option a static hotstring needs has no
+    # counterpart on this branch.
+    if expansion.omit_end_char:
+        return []
     return [
         '    if (A_EndChar = "`r" || A_EndChar = "`n") {',
         '        Send("{Enter}")',

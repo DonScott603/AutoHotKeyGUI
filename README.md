@@ -232,19 +232,24 @@ The fields are:
 
 The generated AutoHotkey script includes a small selection GUI only when a list selection placeholder is used.
 
-### Tab
+### Tab and Enter
 
-Use **Insert Tab** to insert a Tab keystroke at that point in the expansion:
+Use **Tab** or **Enter** to insert that keystroke at that point in the expansion:
 
 ```text
 First column{AHK_KEY:Tab}Second column
+Line one{AHK_KEY:Enter}Line two
 ```
 
 For now, `AHK_KEY` supports only:
 
 ```text
 {AHK_KEY:Tab}
+{AHK_KEY:Enter}
 ```
+
+Any other key name is refused when the script is generated, rather than sent as
+literal text.
 
 Any expansion containing `AHK_KEY` is generated as a dynamic multi-line hotstring.
 
