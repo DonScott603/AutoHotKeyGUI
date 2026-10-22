@@ -95,6 +95,27 @@ class AhkSyntaxTests(unittest.TestCase):
                     result.returncode, 0, f"{theme} script failed to parse:\n{result.stderr}"
                 )
 
+    def test_hotkeys_parse(self) -> None:
+        # Both forms of each, plus a repeated combination: AutoHotkey refuses a
+        # script defining one hotkey twice, so the generator must settle it.
+        store = ExpansionStore(
+            sections=["Work", "Keys"],
+            expansions=[
+                Expansion("Work", "^j", "hello ; there", hotkey=True),
+                Expansion("Work", "!l", "Dear {AHK_INPUT:name|Name ; here|Name|}", hotkey=True),
+                Expansion("Keys", "^+F5", "line one\nline two", hotkey=True),
+                Expansion("Keys", "#Numpad3", "off", enabled=False, hotkey=True),
+                Expansion("Keys", "^J", "again", hotkey=True),
+                Expansion("Keys", "^j", "typed, not a hotkey"),
+            ],
+        )
+        with TemporaryDirectory() as temp_dir:
+            script = Path(temp_dir) / "hotkeys.ahk"
+            generate_ahk(store, script, backup=False)
+
+            result = self._validate(script)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_static_only_script_parses(self) -> None:
         store = ExpansionStore(
             sections=["General"],

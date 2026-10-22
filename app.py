@@ -8,7 +8,15 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QItemSelectionModel, QObject, QRect, QSize, Qt
+from PySide6.QtCore import (
+    QEvent,
+    QItemSelectionModel,
+    QKeyCombination,
+    QObject,
+    QRect,
+    QSize,
+    Qt,
+)
 from PySide6.QtGui import (
     QCloseEvent,
     QColor,
@@ -16,6 +24,7 @@ from PySide6.QtGui import (
     QFontDatabase,
     QGuiApplication,
     QIcon,
+    QKeySequence,
     QPainter,
     QPixmap,
 )
@@ -30,6 +39,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QInputDialog,
+    QKeySequenceEdit,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -74,6 +84,7 @@ from ahk_manager import (
     list_backups,
     merge_imported_store,
     migrate_backups,
+    normalize_hotkey,
     restore_backup,
     parse_replacement_template,
     placeholder_problems,
@@ -84,6 +95,8 @@ from ahk_manager import (
     resolve_template_segments,
     resolve_variable_preview,
     resolve_variable_segments,
+    trigger_key,
+    trigger_label,
     validate_template,
     validate_variable,
 )
@@ -96,6 +109,102 @@ if sys.platform == "win32":
     _NO_WINDOW = subprocess.CREATE_NO_WINDOW
 else:
     _NO_WINDOW = 0
+
+# The keys a captured combination can end on, as AutoHotkey names them. The
+# same set ahk_manager accepts; a key outside it is refused when the form is
+# read rather than written into a script AutoHotkey would reject.
+_QT_HOTKEY_KEYS: dict[Qt.Key, str] = {
+    **{getattr(Qt.Key, f"Key_{letter}"): letter.lower() for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+    **{getattr(Qt.Key, f"Key_{digit}"): digit for digit in "0123456789"},
+    **{getattr(Qt.Key, f"Key_F{number}"): f"F{number}" for number in range(1, 25)},
+    Qt.Key.Key_Space: "Space",
+    Qt.Key.Key_Tab: "Tab",
+    Qt.Key.Key_Return: "Enter",
+    Qt.Key.Key_Enter: "Enter",
+    Qt.Key.Key_Escape: "Escape",
+    Qt.Key.Key_Backspace: "Backspace",
+    Qt.Key.Key_Delete: "Delete",
+    Qt.Key.Key_Insert: "Insert",
+    Qt.Key.Key_Home: "Home",
+    Qt.Key.Key_End: "End",
+    Qt.Key.Key_PageUp: "PgUp",
+    Qt.Key.Key_PageDown: "PgDn",
+    Qt.Key.Key_Up: "Up",
+    Qt.Key.Key_Down: "Down",
+    Qt.Key.Key_Left: "Left",
+    Qt.Key.Key_Right: "Right",
+}
+# First spelling wins, so Enter goes back to the main Return key.
+_AHK_HOTKEY_KEYS: dict[str, Qt.Key] = {}
+for _qt_key, _ahk_name in _QT_HOTKEY_KEYS.items():
+    _AHK_HOTKEY_KEYS.setdefault(_ahk_name, _qt_key)
+_QT_HOTKEY_MODIFIERS = (
+    (Qt.KeyboardModifier.ControlModifier, "^"),
+    (Qt.KeyboardModifier.AltModifier, "!"),
+    (Qt.KeyboardModifier.ShiftModifier, "+"),
+    (Qt.KeyboardModifier.MetaModifier, "#"),
+)
+# Combinations that already do something in nearly every application. Still
+# allowed -- someone may want exactly that -- but worth a word, because while
+# the script runs the expansion replaces the shortcut everywhere.
+COMMON_SHORTCUTS = {
+    "^a": "Select All",
+    "^c": "Copy",
+    "^f": "Find",
+    "^n": "New",
+    "^o": "Open",
+    "^p": "Print",
+    "^s": "Save",
+    "^t": "New Tab",
+    "^v": "Paste",
+    "^w": "Close Tab",
+    "^x": "Cut",
+    "^y": "Redo",
+    "^z": "Undo",
+    "!F4": "Close Window",
+    "!Tab": "Switch Windows",
+    "#d": "Show Desktop",
+    "#e": "File Explorer",
+    "#l": "Lock",
+    "#r": "Run",
+}
+
+
+def hotkey_from_sequence(sequence: QKeySequence) -> str | None:
+    """A captured key combination in AutoHotkey notation, or None.
+
+    None for an empty capture and for a key with no AutoHotkey name here --
+    punctuation, or a shifted digit, which Qt reports as the symbol it types.
+    Whether the result is a usable combination is normalize_hotkey's call.
+    """
+    if sequence.isEmpty():
+        return None
+    combination = sequence[0]  # pyright: ignore[reportIndexIssue]
+    modifiers = combination.keyboardModifiers()
+    key = _QT_HOTKEY_KEYS.get(combination.key())
+    if key is None:
+        return None
+    if modifiers & Qt.KeyboardModifier.KeypadModifier and key in "0123456789":
+        key = f"Numpad{key}"
+    symbols = "".join(symbol for flag, symbol in _QT_HOTKEY_MODIFIERS if modifiers & flag)
+    return symbols + key
+
+
+def sequence_from_hotkey(trigger: str) -> QKeySequence:
+    """The capture widget's value for a stored combination; empty if it does not parse."""
+    try:
+        canonical = normalize_hotkey(trigger)
+    except ValueError:
+        return QKeySequence()
+    key_name = canonical.lstrip("^!+#")
+    modifiers = Qt.KeyboardModifier.NoModifier
+    for flag, symbol in _QT_HOTKEY_MODIFIERS:
+        if symbol in canonical[: len(canonical) - len(key_name)]:
+            modifiers |= flag
+    if key_name.startswith("Numpad"):
+        modifiers |= Qt.KeyboardModifier.KeypadModifier
+        key_name = key_name.removeprefix("Numpad")
+    return QKeySequence(QKeyCombination(modifiers, _AHK_HOTKEY_KEYS[key_name]))
 
 
 def _app_dir() -> Path:
@@ -159,6 +268,11 @@ have the expansion end exactly where its replacement does.</li>
 editor on the right. Ctrl-click and Shift-click select several rows at once,
 which <b>Delete</b> and <b>Toggle On/Off</b> then act on together.</li>
 <li>Duplicate triggers are flagged, and the last one generated wins.</li>
+<li>Choose <b>Key combination</b> to fire an expansion on a shortcut such as
+Ctrl+J or Alt+L instead of on typed text: click the box and press the keys. A
+combination needs Ctrl, Alt or Win (Shift alone only with a function key), and
+Windows keeps some Win combinations, such as Win+L, for itself. The same
+combination on two expansions keeps only the last one generated.</li>
 </ul>
 
 <h3>Placeholders</h3>
@@ -1484,8 +1598,28 @@ class ExpansionApp(QMainWindow):
         layout.addWidget(self.section_combo)
 
         layout.addWidget(QLabel("Trigger"))
+        trigger_kind = QHBoxLayout()
+        self.typed_trigger_radio = QRadioButton("Typed text")
+        self.typed_trigger_radio.setChecked(True)
+        self.hotkey_trigger_radio = QRadioButton("Key combination")
+        self.hotkey_trigger_radio.setToolTip(
+            "Fire on a key combination such as Ctrl+J instead of on typed text."
+        )
+        trigger_kind.addWidget(self.typed_trigger_radio)
+        trigger_kind.addWidget(self.hotkey_trigger_radio)
+        trigger_kind.addStretch(1)
+        layout.addLayout(trigger_kind)
         self.trigger_edit = QLineEdit()
         layout.addWidget(self.trigger_edit)
+        self.hotkey_edit = QKeySequenceEdit()
+        self.hotkey_edit.setMaximumSequenceLength(1)
+        self.hotkey_edit.setClearButtonEnabled(True)
+        self.hotkey_edit.setToolTip(
+            "Click here and press the combination, for example Ctrl+J or Alt+L. "
+            "It needs Ctrl, Alt or Win, or Shift with a function key."
+        )
+        layout.addWidget(self.hotkey_edit)
+        self.hotkey_trigger_radio.toggled.connect(self._show_trigger_kind)
 
         layout.addWidget(QLabel("Replacement text"))
         toolbar = self._build_insertion_toolbar(lambda: self.replacement_text)
@@ -1509,6 +1643,7 @@ class ExpansionApp(QMainWindow):
             "where its replacement does."
         )
         layout.addWidget(self.omit_end_char_check)
+        self._show_trigger_kind(False)
 
         form_actions = QHBoxLayout()
         apply_button = QPushButton("Apply")
@@ -1933,7 +2068,7 @@ class ExpansionApp(QMainWindow):
             self.tree.insertRow(row)
             values = (
                 "Yes" if expansion.enabled else "No",
-                expansion.trigger,
+                trigger_label(expansion),
                 self._preview(expansion.replacement),
                 self._preview(expansion.notes),
             )
@@ -2284,7 +2419,12 @@ class ExpansionApp(QMainWindow):
         if not query:
             return True
         haystack = " ".join(
-            [expansion.section, expansion.trigger, expansion.replacement, expansion.notes]
+            [
+                expansion.section,
+                trigger_label(expansion),
+                expansion.replacement,
+                expansion.notes,
+            ]
         ).lower()
         return query in haystack
 
@@ -2405,7 +2545,14 @@ class ExpansionApp(QMainWindow):
         expansion = self.store.expansions[index]
         self.current_expansion = expansion
         self.section_combo.setCurrentText(expansion.section)
-        self.trigger_edit.setText(expansion.trigger)
+        if expansion.hotkey:
+            self.hotkey_trigger_radio.setChecked(True)
+            self.trigger_edit.clear()
+            self.hotkey_edit.setKeySequence(sequence_from_hotkey(expansion.trigger))
+        else:
+            self.typed_trigger_radio.setChecked(True)
+            self.trigger_edit.setText(expansion.trigger)
+            self.hotkey_edit.clear()
         self.enabled_check.setChecked(expansion.enabled)
         self.omit_end_char_check.setChecked(expansion.omit_end_char)
         self.replacement_text.setPlainText(expansion.replacement)
@@ -2478,15 +2625,16 @@ class ExpansionApp(QMainWindow):
         if self.current_expansion is None:
             self.store.expansions.append(expansion)
             self.current_expansion = expansion
-            outcome = f'Added trigger "{expansion.trigger}".'
+            outcome = f'Added trigger "{trigger_label(expansion)}".'
         else:
             self.current_expansion.section = expansion.section
             self.current_expansion.trigger = expansion.trigger
+            self.current_expansion.hotkey = expansion.hotkey
             self.current_expansion.replacement = expansion.replacement
             self.current_expansion.enabled = expansion.enabled
             self.current_expansion.notes = expansion.notes
             self.current_expansion.omit_end_char = expansion.omit_end_char
-            outcome = f'Updated trigger "{expansion.trigger}".'
+            outcome = f'Updated trigger "{trigger_label(expansion)}".'
 
         self.selected_section = expansion.section
         self.refresh_sections()
@@ -2498,7 +2646,8 @@ class ExpansionApp(QMainWindow):
         # The applied expansion now lives in the list, so the form goes back to
         # a blank new-expansion state rather than holding a stale copy of it.
         self.new_expansion()
-        self.warn_if_duplicate(expansion.trigger)
+        self.warn_if_duplicate(expansion)
+        self.warn_if_common_shortcut(expansion)
 
     def preview_expansion(self) -> None:
         try:
@@ -2511,16 +2660,30 @@ class ExpansionApp(QMainWindow):
 
     def read_form(self) -> Expansion:
         section = self.section_combo.currentText().strip()
-        trigger = self.trigger_edit.text().strip()
+        hotkey = self.hotkey_trigger_radio.isChecked()
         replacement = self.replacement_text.toPlainText()
         notes = self.notes_text.toPlainText().strip()
 
         if not section:
             raise ValueError("Choose a section.")
-        if not trigger:
-            raise ValueError("Trigger cannot be blank.")
-        if "::" in trigger or any(char.isspace() for char in trigger):
-            raise ValueError('Trigger cannot contain whitespace or "::".')
+        if hotkey:
+            sequence = self.hotkey_edit.keySequence()
+            if sequence.isEmpty():
+                raise ValueError("Press a key combination for the trigger.")
+            captured = hotkey_from_sequence(sequence)
+            if captured is None:
+                raise ValueError(
+                    f"{sequence.toString(QKeySequence.SequenceFormat.NativeText)} "
+                    "cannot be used. A combination ends on a letter, a digit, a "
+                    "function key or a named key such as Enter or PgUp."
+                )
+            trigger = normalize_hotkey(captured)
+        else:
+            trigger = self.trigger_edit.text().strip()
+            if not trigger:
+                raise ValueError("Trigger cannot be blank.")
+            if "::" in trigger or any(char.isspace() for char in trigger):
+                raise ValueError('Trigger cannot contain whitespace or "::".')
         if not replacement:
             raise ValueError("Replacement text cannot be blank.")
         try:
@@ -2535,7 +2698,10 @@ class ExpansionApp(QMainWindow):
             replacement,
             self.enabled_check.isChecked(),
             notes,
-            self.omit_end_char_check.isChecked(),
+            # Nothing is typed to fire a hotkey, so there is no character to
+            # drop; the box is disabled for one and its state means nothing.
+            self.omit_end_char_check.isChecked() and not hotkey,
+            hotkey,
         )
 
     def _forget_deleted_expansion(self, deleted: list[Expansion]) -> None:
@@ -2560,8 +2726,8 @@ class ExpansionApp(QMainWindow):
         expansions = [self.store.expansions[index] for index in indexes]
         if len(expansions) == 1:
             title = "Delete expansion"
-            question = f'Delete trigger "{expansions[0].trigger}"?'
-            outcome = f'Deleted trigger "{expansions[0].trigger}".'
+            question = f'Delete trigger "{trigger_label(expansions[0])}"?'
+            outcome = f'Deleted trigger "{trigger_label(expansions[0])}".'
         else:
             title = "Delete expansions"
             question = f"Delete {len(expansions)} selected expansions?"
@@ -2594,7 +2760,7 @@ class ExpansionApp(QMainWindow):
         self._select_store_indexes(self.tree, indexes, focused)
         state = "Enabled" if enabled else "Disabled"
         if len(expansions) == 1:
-            outcome = f'{state} "{expansions[0].trigger}".'
+            outcome = f'{state} "{trigger_label(expansions[0])}".'
         else:
             outcome = f"{state} {len(expansions)} expansions."
         self._persist_reporting(outcome)
@@ -3367,20 +3533,56 @@ class ExpansionApp(QMainWindow):
         if not keep_section:
             self.section_combo.setCurrentText(self.selected_section)
         self.trigger_edit.clear()
+        self.hotkey_edit.clear()
+        self.typed_trigger_radio.setChecked(True)
         self.enabled_check.setChecked(True)
         self.omit_end_char_check.setChecked(False)
         self.replacement_text.clear()
         self.notes_text.clear()
 
-    def warn_if_duplicate(self, trigger: str) -> None:
+    def _show_trigger_kind(self, hotkey: bool) -> None:
+        """Swap the trigger field for the key capture, and back."""
+        self.trigger_edit.setVisible(not hotkey)
+        self.hotkey_edit.setVisible(hotkey)
+        self.omit_end_char_check.setEnabled(not hotkey)
+
+    def warn_if_duplicate(self, expansion: Expansion) -> None:
         duplicates = self.store.duplicate_triggers()
-        if trigger in duplicates:
-            sections = ", ".join(expansion.section for expansion in duplicates[trigger])
+        matches = duplicates.get(trigger_key(expansion))
+        if not matches:
+            return
+        sections = ", ".join(match.section for match in matches)
+        label = trigger_label(expansion)
+        if expansion.hotkey:
+            # Not the same consequence as a repeated hotstring: AutoHotkey
+            # refuses the whole script over a repeated hotkey, so the
+            # generator keeps only one of them.
             show_warning(
                 self,
-                "Duplicate trigger",
-                f'Trigger "{trigger}" appears in multiple expansions: {sections}.',
+                "Duplicate key combination",
+                f"{label} is set on more than one expansion: {sections}. "
+                "Only the last one generated is kept; the others are left "
+                "out of the script.",
             )
+            return
+        show_warning(
+            self,
+            "Duplicate trigger",
+            f'Trigger "{label}" appears in multiple expansions: {sections}.',
+        )
+
+    def warn_if_common_shortcut(self, expansion: Expansion) -> None:
+        if not expansion.hotkey:
+            return
+        action = COMMON_SHORTCUTS.get(expansion.trigger)
+        if action is None:
+            return
+        show_warning(
+            self,
+            "Common shortcut",
+            f"{trigger_label(expansion)} is usually {action}. While the script "
+            "runs it will expand instead, in every application.",
+        )
 
     def set_status(self, message: str) -> None:
         self.status_label.setText(message)
