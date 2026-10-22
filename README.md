@@ -274,6 +274,17 @@ Image files are stored as file paths only. The image binary is not embedded in `
 
 Image insertion is implemented as a clipboard paste helper in the generated AutoHotkey v2 script. It checks that the file exists, uses PowerShell/.NET to place the image on the Windows clipboard, then sends `Ctrl+V`. This works best in rich-text targets that accept pasted images, such as Word, Outlook, Teams, or browser editors. Plain text editors such as Notepad cannot accept pasted images.
 
+## Key-combination triggers
+
+Choose **Key combination** under **Trigger** to fire an expansion on a shortcut such as `Ctrl+J` or `Alt+L` instead of on typed text. Click the box and press the keys. The expansion is generated as an AutoHotkey hotkey (`^j::`) rather than a hotstring, and can use the same replacement text and placeholders.
+
+- A combination needs Ctrl, Alt or Win. Shift alone is allowed only with a function key, because anything less would stop that key typing.
+- The last key can be a letter, a digit, `F1`-`F24`, a numpad digit, or one of Space, Tab, Enter, Escape, Backspace, Delete, Insert, Home, End, PgUp, PgDn and the arrow keys.
+- Windows reserves some Win combinations, such as `Win+L`, for itself, so they never reach the script.
+- The app warns when a combination is a common shortcut such as `Ctrl+C`, because while the script runs the expansion replaces it in every application.
+- AutoHotkey refuses to load a script that defines the same hotkey twice. When two expansions share a combination, only the last enabled one generated is kept; the others are written to the script as skipped, and come back on import.
+- **Drop the character that triggered it** does not apply, since nothing is typed.
+
 ## Previews
 
 Use preview buttons to inspect app data without writing files:
@@ -299,7 +310,7 @@ Use **Import .ahk** to parse basic section comments and single-line hotstrings l
 ::brb::Be right back.
 ```
 
-Import merges parsed sections and expansions into the current data. Existing sections are reused, and imported expansions are appended. If a trigger already exists in the target section, the app asks whether to skip duplicates, overwrite existing expansions, or keep both by renaming imported triggers.
+Import merges parsed sections and expansions into the current data. Existing sections are reused, and imported expansions are appended. If a trigger already exists in the target section, the app asks whether to skip duplicates, overwrite existing expansions, or keep both by renaming imported triggers. A key combination cannot be renamed, so with that choice a clashing one is imported switched off instead.
 
 The importer is intentionally conservative. It handles simple one-line hotstrings and section comments, but not complex script logic.
 
@@ -314,6 +325,8 @@ Each expansion has:
 - `replacement`
 - `enabled`
 - `notes`
+- `omit_end_char`: drop the character that triggered the expansion
+- `hotkey`: `true` when `trigger` is a key combination in AutoHotkey notation, such as `^j` for Ctrl+J
 
 Generated hotstrings are case-sensitive by default. Triggers such as `Hsa` and `hsa` are treated as distinct triggers and can have different replacements.
 

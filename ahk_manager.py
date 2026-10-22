@@ -112,6 +112,10 @@ class Expansion:
     # space so the sentence continues where the user was typing. Set here, the
     # expansion ends exactly where its replacement does.
     omit_end_char: bool = False
+    # Whether the trigger is a key combination rather than typed text. The
+    # trigger then holds AutoHotkey's hotkey notation -- "^j" for Ctrl+J -- and
+    # the expansion becomes a hotkey instead of a hotstring.
+    hotkey: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], fallback_section: str = "General") -> "Expansion":
@@ -122,6 +126,7 @@ class Expansion:
             enabled=bool(data.get("enabled", True)),
             notes=str(data.get("notes") or ""),
             omit_end_char=bool(data.get("omit_end_char", False)),
+            hotkey=bool(data.get("hotkey", False)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -132,6 +137,7 @@ class Expansion:
             "enabled": self.enabled,
             "notes": self.notes,
             "omit_end_char": self.omit_end_char,
+            "hotkey": self.hotkey,
         }
 
 
@@ -232,6 +238,7 @@ _FIELD_TYPES = {
     "expansions": {
         "section": "text", "trigger": "text", "replacement": "text",
         "enabled": "bool", "notes": "text", "omit_end_char": "bool",
+        "hotkey": "bool",
     },
     "variables": {
         "name": "text", "type": "text", "prompt_text": "text",
@@ -437,7 +444,7 @@ class ExpansionStore:
         for expansion in self.expansions:
             if not expansion.trigger:
                 continue
-            grouped.setdefault(expansion.trigger, []).append(expansion)
+            grouped.setdefault(trigger_key(expansion), []).append(expansion)
         return {
             trigger: matches
             for trigger, matches in grouped.items()
@@ -568,10 +575,104 @@ STATIC_HOTSTRING_OPTIONS = "CT"
 # and "O" is what tells it not to. The block forms never reproduce it -- they
 # re-send it explicitly -- so they drop those lines instead.
 OMIT_END_CHAR_OPTION = "O"
+# AutoHotkey's modifier symbols, in the order a stored key combination is
+# normalised to, and the name each one is shown under.
+HOTKEY_MODIFIERS = {"^": "Ctrl", "!": "Alt", "+": "Shift", "#": "Win"}
+_FUNCTION_KEYS = tuple(f"F{number}" for number in range(1, 25))
+# The keys a combination may end on, by lowercase name, spelled the way the
+# generated script writes them. Kept to names made of letters and digits:
+# punctuation keys would need escaping on the hotkey line, and a ";" there
+# reads back on import as the start of a disabled line.
+_HOTKEY_KEYS = {
+    **{letter: letter for letter in "abcdefghijklmnopqrstuvwxyz"},
+    **{digit: digit for digit in "0123456789"},
+    **{name.lower(): name for name in _FUNCTION_KEYS},
+    **{f"numpad{digit}": f"Numpad{digit}" for digit in "0123456789"},
+    **{
+        name.lower(): name
+        for name in (
+            "Space", "Tab", "Enter", "Escape", "Backspace", "Delete", "Insert",
+            "Home", "End", "PgUp", "PgDn", "Up", "Down", "Left", "Right",
+        )
+    },
+    # AutoHotkey's own alternative spellings, accepted from a hand-edited file.
+    "esc": "Escape", "del": "Delete", "ins": "Insert", "bs": "Backspace",
+    "return": "Enter",
+}
+HOTKEY_LINE_RE = re.compile(r"^\s*(?P<disabled>;\s*)?(?P<trigger>[\^!+#]+[A-Za-z0-9]+)::\s*$")
 VARIABLE_TYPES = {"text_input", "list_selection", "date_time"}
 # What a date_time variable formats with when its format is left blank. Shared
 # so the preview cannot claim one thing and the generator emit another.
 DEFAULT_DATE_FORMAT = "yyyy-MM-dd"
+
+
+def normalize_hotkey(trigger: str) -> str:
+    """The canonical AutoHotkey spelling of a key combination, or ValueError.
+
+    Canonical so that two spellings of one combination compare equal: "!^J"
+    and "^!j" are the same hotkey to AutoHotkey, which refuses to load a
+    script defining it twice.
+
+    A combination has to hold Ctrl, Alt or Win. A bare key, or Shift with a
+    letter, is ordinary typing -- defined as a hotkey it would stop that
+    character reaching any application. A function key is the exception,
+    since nothing is typed with Shift+F5.
+    """
+    text = trigger.strip()
+    position = 0
+    modifiers: set[str] = set()
+    while position < len(text) and text[position] in HOTKEY_MODIFIERS:
+        if text[position] in modifiers:
+            raise ValueError(f'Key combination "{trigger}" repeats a modifier.')
+        modifiers.add(text[position])
+        position += 1
+    key = _HOTKEY_KEYS.get(text[position:].lower())
+    if key is None:
+        raise ValueError(
+            f'Key combination "{trigger}" must end on a letter, a digit, a '
+            "function key or a named key such as Enter or PgUp."
+        )
+    if not modifiers & {"^", "!", "#"} and not (modifiers and key in _FUNCTION_KEYS):
+        raise ValueError(
+            f'Key combination "{trigger}" needs Ctrl, Alt or Win, or Shift '
+            "with a function key: anything less would stop that key typing."
+        )
+    return "".join(symbol for symbol in HOTKEY_MODIFIERS if symbol in modifiers) + key
+
+
+def hotkey_display(trigger: str) -> str:
+    """A key combination as the user reads it: "^!j" becomes "Ctrl+Alt+J".
+
+    Falls back to the stored text for one that does not parse, so a broken
+    record still shows what is actually there.
+    """
+    try:
+        canonical = normalize_hotkey(trigger)
+    except ValueError:
+        return trigger
+    names = [HOTKEY_MODIFIERS[symbol] for symbol in canonical if symbol in HOTKEY_MODIFIERS]
+    key = canonical.lstrip("".join(HOTKEY_MODIFIERS))
+    return "+".join([*names, key.upper() if len(key) == 1 else key])
+
+
+def trigger_label(expansion: "Expansion") -> str:
+    """The trigger as shown to the user and in the prompt window titles."""
+    return hotkey_display(expansion.trigger) if expansion.hotkey else expansion.trigger
+
+
+def trigger_key(expansion: "Expansion") -> str:
+    """What two expansions must share to fire on the same thing.
+
+    A key combination is compared by its canonical form. Its key carries a
+    space, which a typed trigger cannot contain, so a hotstring spelled "^j"
+    never collides with Ctrl+J.
+    """
+    if not expansion.hotkey:
+        return expansion.trigger
+    try:
+        return f"keys {normalize_hotkey(expansion.trigger)}"
+    except ValueError:
+        return f"keys {expansion.trigger}"
 
 
 def _marker_record(
@@ -695,6 +796,35 @@ def import_ahk(path: Path) -> ExpansionStore:
             current_section = section_match.group("section").strip() or "General"
             if current_section not in sections:
                 sections.append(current_section)
+            pending_source = None
+            continue
+
+        hotkey_match = HOTKEY_LINE_RE.match(line)
+        if hotkey_match:
+            # Only a hotkey this app generated is taken. Its marker holds the
+            # replacement; a hand-written hotkey's block is arbitrary code with
+            # no template to read back out of it, so it is left behind the way
+            # an unrecognised hotstring block is.
+            if pending_source is not None and pending_source.get("hotkey") is True:
+                trigger = hotkey_match.group("trigger")
+                try:
+                    normalize_hotkey(trigger)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Could not import {path.name}: line {index + 1}: {exc}"
+                    ) from exc
+                if current_section not in sections:
+                    sections.append(current_section)
+                expansions.append(
+                    Expansion(
+                        section=current_section,
+                        trigger=trigger,
+                        replacement=str(pending_source.get("replacement", "")),
+                        enabled=not bool(hotkey_match.group("disabled")),
+                        notes=str(pending_source.get("notes", "")),
+                        hotkey=True,
+                    )
+                )
             pending_source = None
             continue
 
@@ -1110,7 +1240,10 @@ def count_import_conflicts(
         triggers=sum(
             1
             for expansion in imported.expansions
-            if _find_expansion(target, expansion.section, expansion.trigger) is not None
+            if _find_expansion(
+                target, expansion.section, expansion.trigger, expansion.hotkey
+            )
+            is not None
         ),
         definitions=(
             sum(
@@ -1278,7 +1411,12 @@ def merge_imported_store(
     _merge_definitions(target, imported, conflict_action, renames, result)
 
     for imported_expansion in imported.expansions:
-        existing = _find_expansion(target, imported_expansion.section, imported_expansion.trigger)
+        existing = _find_expansion(
+            target,
+            imported_expansion.section,
+            imported_expansion.trigger,
+            imported_expansion.hotkey,
+        )
         expansion = Expansion.from_dict(imported_expansion.to_dict())
         expansion.replacement = _apply_renames(expansion.replacement, renames)
         if existing is None:
@@ -1295,6 +1433,13 @@ def merge_imported_store(
             existing.notes = expansion.notes
             existing.omit_end_char = expansion.omit_end_char
             result.overwritten += 1
+        elif expansion.hotkey:
+            # A key combination has no free variant to rename to -- "^j_imported"
+            # is not a key. It comes in switched off instead, so it clashes
+            # with nothing and waits for a combination of its own.
+            expansion.enabled = False
+            target.expansions.append(expansion)
+            result.renamed += 1
         else:
             expansion.trigger = _renamed_trigger(target, expansion.section, expansion.trigger)
             target.expansions.append(expansion)
@@ -1491,10 +1636,17 @@ def render_ahk(store: ExpansionStore, theme: str = DEFAULT_THEME) -> str:
     needs_image_helper = False
     needs_paste_helper = False
     needs_form_helper = False
+    superseded = _superseded_hotkeys(store)
 
     for section in store.sections:
         rendered_expansions = [
-            render_expansion(expansion, store.variables, store.templates)
+            _skipped(
+                expansion,
+                f"key combination {trigger_label(expansion)} is also used by a "
+                "later expansion, which takes it.",
+            )
+            if id(expansion) in superseded
+            else render_expansion(expansion, store.variables, store.templates)
             for expansion in store.expansions
             if expansion.section == section
         ]
@@ -1548,6 +1700,35 @@ def render_ahk(store: ExpansionStore, theme: str = DEFAULT_THEME) -> str:
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _superseded_hotkeys(store: ExpansionStore) -> set[int]:
+    """The ids of enabled hotkeys that a later one of the same combination replaces.
+
+    AutoHotkey refuses to load a script that defines one hotkey twice -- not
+    just that hotkey, every expansion in the file -- where a repeated hotstring
+    loads and the last definition wins. So the generator settles it the same
+    way a hotstring would: the last enabled one generated keeps the
+    combination and the earlier ones are written as skipped. A disabled hotkey
+    is only a comment and clashes with nothing, and neither does one that
+    renders as skipped already -- an empty replacement, say -- which would
+    otherwise win and leave the combination with no expansion at all.
+    """
+    winners: dict[str, Expansion] = {}
+    enabled_hotkeys: list[Expansion] = []
+    for section in store.sections:
+        for expansion in store.expansions:
+            if not (expansion.section == section and expansion.hotkey and expansion.enabled):
+                continue
+            rendered = render_expansion(expansion, store.variables, store.templates)
+            if _block_header(expansion) in rendered.lines:
+                enabled_hotkeys.append(expansion)
+                winners[trigger_key(expansion)] = expansion
+    return {
+        id(expansion)
+        for expansion in enabled_hotkeys
+        if winners[trigger_key(expansion)] is not expansion
+    }
 
 
 def _form_fields(segments: list[str | TemplatePlaceholder]) -> list[FormField]:
@@ -1705,9 +1886,12 @@ def render_expansion(
         # when the text happened to hold no placeholder: the same paragraph
         # kept its breaks as soon as a variable was added to it. Text with
         # breaks takes the block form instead, where _ahk_string encodes them.
-        if use_paste or _is_multiline(resolved):
+        #
+        # A hotkey has no auto-replace form at all -- "^j::text" would be read
+        # as code -- so it always takes the block.
+        if expansion.hotkey or use_paste or _is_multiline(resolved):
             send = "TEM_Paste" if use_paste else "SendText"
-            lines = [f":{HOTSTRING_OPTIONS}:{expansion.trigger}::", "{"]
+            lines = [_block_header(expansion), "{"]
             lines.append(f"    {send}({_ahk_string(resolved)})")
             lines.extend(_end_char_lines(expansion))
             lines.append("}")
@@ -1723,7 +1907,7 @@ def render_expansion(
         body = [_source_marker(expansion), *_maybe_disable_lines(lines, expansion.enabled)]
         return RenderedExpansion(body, needs_paste_helper=use_paste)
 
-    lines = [f":{HOTSTRING_OPTIONS}:{expansion.trigger}::", "{"]
+    lines = [_block_header(expansion), "{"]
     lines.append("    __tem_result := \"\"")
     needs_select_helper = False
     needs_image_helper = False
@@ -1737,7 +1921,7 @@ def render_expansion(
         lines.append(f"    __tem_fields := {_form_fields_literal(fields)}")
         lines.append(f"    __tem_parts := {_form_parts_literal(segments)}")
         lines.append(
-            f"    __tem_vals := TEM_Form({_ahk_string(_prompt_title(expansion.trigger))}, __tem_fields, __tem_parts)"
+            f"    __tem_vals := TEM_Form({_ahk_string(_prompt_title(trigger_label(expansion)))}, __tem_fields, __tem_parts)"
         )
         lines.append("    if (!IsObject(__tem_vals))")
         lines.append("        return")
@@ -1784,7 +1968,7 @@ def render_expansion(
                 lines.append(f"    __tem_result .= __tem_vals[{_ahk_string(variable)}]")
             else:
                 option_list = ", ".join(_ahk_string(option) for option in options)
-                window_title = _ahk_string(_prompt_title(expansion.trigger))
+                window_title = _ahk_string(_prompt_title(trigger_label(expansion)))
                 lines.append(
                     f"    __tem_select_{variable} := TEM_Select({_ahk_string(prompt)}, "
                     f"{_ahk_string(title)}, [{option_list}], {window_title})"
@@ -1833,9 +2017,14 @@ def resolve_expansion_preview(expansion: Expansion, store: ExpansionStore) -> Pr
             "=================",
             "",
             f"Section: {expansion.section}",
-            f"Trigger: {expansion.trigger}",
+            f"Trigger: {trigger_label(expansion)}"
+            + (" (key combination)" if expansion.hotkey else ""),
             f"Enabled: {'Yes' if expansion.enabled else 'No'}",
-            f"Keeps ending character: {'No' if expansion.omit_end_char else 'Yes'}",
+            *(
+                []
+                if expansion.hotkey
+                else [f"Keeps ending character: {'No' if expansion.omit_end_char else 'Yes'}"]
+            ),
             "",
             "Raw Replacement Text",
             "--------------------",
@@ -1854,7 +2043,7 @@ def resolve_expansion_preview(expansion: Expansion, store: ExpansionStore) -> Pr
             "\n".join(generated.lines),
         ]
     )
-    return PreviewResult(f"Expansion: {expansion.trigger}", content)
+    return PreviewResult(f"Expansion: {trigger_label(expansion)}", content)
 
 
 def resolve_variable_preview(variable: VariableDef) -> PreviewResult:
@@ -2086,6 +2275,14 @@ def placeholder_problems(store: ExpansionStore) -> dict[str, str]:
     except ValueError as exc:
         problems["templates"] = str(exc)
     for expansion in store.expansions:
+        if expansion.hotkey:
+            # Written straight onto the hotkey line, so a combination that
+            # does not parse would break the whole script rather than one
+            # expansion.
+            try:
+                normalize_hotkey(expansion.trigger)
+            except ValueError as exc:
+                problems[f"hotkey {expansion.section}\0{expansion.trigger}"] = str(exc)
         try:
             segments = resolve_template_segments(
                 parse_replacement_template(expansion.replacement),
@@ -2094,7 +2291,7 @@ def placeholder_problems(store: ExpansionStore) -> dict[str, str]:
             resolve_variable_segments(segments, store.variables)
         except ValueError as exc:
             problems[f"expansion {expansion.section}\0{expansion.trigger}"] = (
-                f'Invalid placeholder in trigger "{expansion.trigger}": {exc}'
+                f'Invalid placeholder in trigger "{trigger_label(expansion)}": {exc}'
             )
     for template in store.templates:
         try:
@@ -2485,6 +2682,10 @@ def _source_marker(expansion: Expansion) -> str:
     # the A_EndChar lines. Carried here so both round-trip the same way.
     if expansion.omit_end_char:
         payload["omit_end_char"] = True
+    # The hotkey line is no different in shape from code a user might have
+    # written by hand, so this is what tells import the expansion is ours.
+    if expansion.hotkey:
+        payload["hotkey"] = True
     return "; @tem: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -2822,6 +3023,13 @@ def _ends_with_key(segments: list[Any]) -> bool:
     return False
 
 
+def _block_header(expansion: Expansion) -> str:
+    """The line that opens an expansion's code block."""
+    if expansion.hotkey:
+        return f"{expansion.trigger}::"
+    return f":{HOTSTRING_OPTIONS}:{expansion.trigger}::"
+
+
 def _end_char_lines(expansion: Expansion) -> list[str]:
     # Dynamic hotstrings run code instead of auto-replacing, so AutoHotkey does
     # not reproduce the ending character (space/Enter/Tab) that triggered them.
@@ -2835,7 +3043,9 @@ def _end_char_lines(expansion: Expansion) -> list[str]:
     # Nothing else is needed here -- these lines are the only thing that would
     # have reproduced it -- so the "O" option a static hotstring needs has no
     # counterpart on this branch.
-    if expansion.omit_end_char:
+    #
+    # A hotkey has no ending character to replay: nothing was typed to fire it.
+    if expansion.omit_end_char or expansion.hotkey:
         return []
     return [
         '    if (A_EndChar = "`r" || A_EndChar = "`n") {',
@@ -2968,9 +3178,12 @@ def _existing_backup_suffixes(
     return suffixes
 
 
-def _find_expansion(store: ExpansionStore, section: str, trigger: str) -> Expansion | None:
+def _find_expansion(
+    store: ExpansionStore, section: str, trigger: str, hotkey: bool = False
+) -> Expansion | None:
+    key = trigger_key(Expansion(section, trigger, "", hotkey=hotkey))
     for expansion in store.expansions:
-        if expansion.section == section and expansion.trigger == trigger:
+        if expansion.section == section and trigger_key(expansion) == key:
             return expansion
     return None
 
