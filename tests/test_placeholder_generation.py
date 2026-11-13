@@ -450,10 +450,10 @@ class PlaceholderGenerationTests(unittest.TestCase):
         # expansion would quietly gain a word instead of pressing something.
         store = ExpansionStore(
             sections=["Keys"],
-            expansions=[Expansion("Keys", "badkey", "{AHK_KEY:F5}")],
+            expansions=[Expansion("Keys", "badkey", "{AHK_KEY:Bogus}")],
         )
 
-        with self.assertRaisesRegex(ValueError, "supports only Enter, Tab"):
+        with self.assertRaisesRegex(ValueError, "not a key that can be pressed"):
             render_ahk(store)
 
     def test_enter_key_generates_a_send_event(self) -> None:

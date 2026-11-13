@@ -311,8 +311,7 @@ class VariableTemplateTests(unittest.TestCase):
 
     def test_the_insertion_buttons_read_down_the_grid_in_order(self) -> None:
         # Two to a row, so the order of INSERTION_ACTIONS is what the user
-        # reads: Image with the other content, then the two key presses
-        # together on a row of their own.
+        # reads: Image with the other content, then the key presses together.
         self.assertEqual(
             [label for label, _handler in app_module.INSERTION_ACTIONS],
             [
@@ -322,6 +321,7 @@ class VariableTemplateTests(unittest.TestCase):
                 "Image",
                 "Tab",
                 "Enter",
+                "Key Combo",
                 "Variable",
                 "Template",
             ],

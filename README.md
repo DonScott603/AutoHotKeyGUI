@@ -241,15 +241,32 @@ First column{AHK_KEY:Tab}Second column
 Line one{AHK_KEY:Enter}Line two
 ```
 
-For now, `AHK_KEY` supports only:
+### Key combinations
+
+Use **Key Combo** to have the expansion press any other key or combination:
+click the box and press the keys. The placeholder holds AutoHotkey's notation,
+with `^` for Ctrl, `!` for Alt, `+` for Shift and `#` for Win:
 
 ```text
-{AHK_KEY:Tab}
-{AHK_KEY:Enter}
+{AHK_KEY:^+n}Sample Name{AHK_KEY:Enter}
+{AHK_KEY:+Tab}
+{AHK_KEY:F5}
 ```
 
-Any other key name is refused when the script is generated, rather than sent as
-literal text.
+The first line presses Ctrl+Shift+N, types "Sample Name" and presses Enter.
+Paired with a **Key combination** trigger, one shortcut can drive another.
+
+A key ends on a letter, a digit, a function key or a named key such as `Enter`,
+`Escape`, `PgUp` or `Down`. A letter or digit on its own is refused, since that
+is just text, and so is any name that is not a known key, rather than being
+sent as literal text.
+
+Each key press is followed by a 100 ms pause. An application that takes longer
+than that to open a window after a shortcut may miss the text that follows.
+
+The generated script handles its own key combinations through the keyboard
+hook (`#UseHook`), so a combination an expansion presses never fires another
+expansion that uses the same combination as its trigger.
 
 Any expansion containing `AHK_KEY` is generated as a dynamic multi-line hotstring.
 
