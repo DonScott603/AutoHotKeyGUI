@@ -85,6 +85,7 @@ from ahk_manager import (
     merge_imported_store,
     migrate_backups,
     normalize_hotkey,
+    normalize_key_press,
     restore_backup,
     parse_replacement_template,
     placeholder_problems,
@@ -284,7 +285,12 @@ rather than typing the syntax by hand.</p>
 <li><code>{{AHK_SELECT:...}}</code> offers a dropdown of fixed choices.</li>
 <li><code>{{AHK_EXPR:...}}</code> inserts a date or time, evaluated as it
 fires.</li>
-<li><code>{{AHK_KEY:...}}</code> presses a key: Tab or Enter.</li>
+<li><code>{{AHK_KEY:...}}</code> presses a key. <b>Tab</b> and <b>Enter</b> have
+their own buttons; <b>Key Combo</b> captures any other key or combination, such
+as Ctrl+Shift+N, Shift+Tab or F5. So an expansion can press Ctrl+Shift+N, type
+a name and press Enter:
+<code>{{AHK_KEY:^+n}}Sample Name{{AHK_KEY:Enter}}</code>. Each key press is
+followed by a short pause so the application can keep up.</li>
 <li><code>{{AHK_IMAGE:...}}</code> pastes an image from a file.</li>
 <li><code>{{VAR:name}}</code> and <code>{{TPL:name}}</code> pull in a variable
 or a template.</li>
@@ -999,6 +1005,58 @@ class InputPlaceholderDialog(QDialog):
         super().accept()
 
 
+class KeyPressDialog(QDialog):
+    """Capture a key combination for the expansion to press, such as Ctrl+Shift+N."""
+
+    def __init__(self, parent) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Insert Key Combination")
+        self.choice: str | None = None
+
+        layout = QVBoxLayout(self)
+        prompt = QLabel(
+            "Click the box and press the keys the expansion should press, "
+            "for example Ctrl+Shift+N."
+        )
+        prompt.setWordWrap(True)
+        layout.addWidget(prompt)
+        self.key_edit = QKeySequenceEdit()
+        self.key_edit.setMaximumSequenceLength(1)
+        self.key_edit.setClearButtonEnabled(True)
+        self.key_edit.setMinimumWidth(240)
+        layout.addWidget(self.key_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def accept(self) -> None:
+        sequence = self.key_edit.keySequence()
+        if sequence.isEmpty():
+            show_error(self, "Key combination", "Press a key combination first.")
+            return
+        captured = hotkey_from_sequence(sequence)
+        if captured is None:
+            show_error(
+                self,
+                "Key combination",
+                f"{sequence.toString(QKeySequence.SequenceFormat.NativeText)} "
+                "cannot be used. A combination ends on a letter, a digit, a "
+                "function key or a named key such as Enter or PgUp.",
+            )
+            return
+        try:
+            key = normalize_key_press(captured)
+        except ValueError as exc:
+            show_error(self, "Key combination", str(exc))
+            return
+        self.choice = f"{{AHK_KEY:{key}}}"
+        super().accept()
+
+
 class SelectPlaceholderDialog(QDialog):
     def __init__(self, parent) -> None:
         super().__init__(parent)
@@ -1109,9 +1167,10 @@ class LibrarySelectionDialog(QDialog):
 # Insertion toolbar entries: (button label, handler attribute name). The label
 # drops the repetitive "Insert " prefix (kept as a tooltip) so the toolbar stays
 # compact and the form panels fit in a reasonably sized window.
-# Laid out two to a row, so the order here is the order down the grid. The two
-# key presses sit together on their own row rather than either of them sharing
-# one with Image, which is a different kind of thing entirely.
+# Laid out two to a row, so the order here is the order down the grid. The
+# key presses sit together -- Tab and Enter on a row of their own, Key Combo
+# straight after them -- rather than any of them sharing a row with Image,
+# which is a different kind of thing entirely.
 INSERTION_ACTIONS = (
     ("Date/Time", "insert_date_time"),
     ("Input Box", "insert_input_box"),
@@ -1119,6 +1178,7 @@ INSERTION_ACTIONS = (
     ("Image", "insert_image"),
     ("Tab", "insert_tab"),
     ("Enter", "insert_enter"),
+    ("Key Combo", "insert_key_combination"),
     ("Variable", "insert_variable"),
     ("Template", "insert_template"),
 )
@@ -2579,6 +2639,11 @@ class ExpansionApp(QMainWindow):
 
     def insert_enter(self, target: QPlainTextEdit | None = None) -> None:
         self.insert_snippet("{AHK_KEY:Enter}", target)
+
+    def insert_key_combination(self, target: QPlainTextEdit | None = None) -> None:
+        dialog = KeyPressDialog(self)
+        if dialog.exec() and dialog.choice:
+            self.insert_snippet(dialog.choice, target)
 
     def insert_image(self, target: QPlainTextEdit | None = None) -> None:
         file_path, _ = QFileDialog.getOpenFileName(

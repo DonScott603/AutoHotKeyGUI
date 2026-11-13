@@ -116,6 +116,24 @@ class AhkSyntaxTests(unittest.TestCase):
             result = self._validate(script)
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_pressed_key_combinations_parse(self) -> None:
+        # Every modifier, a named key behind one, and a combination that is
+        # also another expansion's trigger.
+        store = ExpansionStore(
+            sections=["Keys"],
+            expansions=[
+                Expansion("Keys", "^+l", "{AHK_KEY:^+n}Sample ; Name{AHK_KEY:Enter}", hotkey=True),
+                Expansion("Keys", "^+n", "new", hotkey=True),
+                Expansion("Keys", ";keys", "a{AHK_KEY:+Tab}b{AHK_KEY:^!#Delete}{AHK_KEY:F5}"),
+            ],
+        )
+        with TemporaryDirectory() as temp_dir:
+            script = Path(temp_dir) / "keys.ahk"
+            generate_ahk(store, script, backup=False)
+
+            result = self._validate(script)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_static_only_script_parses(self) -> None:
         store = ExpansionStore(
             sections=["General"],

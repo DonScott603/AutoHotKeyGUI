@@ -561,10 +561,6 @@ SKIPPED_MARKER_RE = re.compile(r"^\s*;\s*@tem-skipped:\s*(?P<json>.*)$")
 PLACEHOLDER_RE = re.compile(r"\{(AHK_EXPR|AHK_INPUT|AHK_SELECT|AHK_KEY|AHK_IMAGE|VAR|TPL):([^{}]*)\}")
 PLACEHOLDER_START_RE = re.compile(r"\{(?:AHK_(?:EXPR|INPUT|SELECT|KEY|IMAGE)|VAR|TPL):")
 VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-# Sent through SendEvent as {Tab} / {Enter}, which is why the set is small: a
-# name that is not a key AutoHotkey knows would be sent as literal text, and the
-# expansion would silently gain a word instead of pressing something.
-SUPPORTED_KEYS = {"Tab", "Enter"}
 HOTSTRING_OPTIONS = "C"
 # Static auto-replace hotstrings add "T" (Text mode) so the replacement is sent
 # literally. Without it AutoHotkey interprets ^ + ! # { } as Send modifiers/keys
@@ -618,15 +614,7 @@ def normalize_hotkey(trigger: str) -> str:
     character reaching any application. A function key is the exception,
     since nothing is typed with Shift+F5.
     """
-    text = trigger.strip()
-    position = 0
-    modifiers: set[str] = set()
-    while position < len(text) and text[position] in HOTKEY_MODIFIERS:
-        if text[position] in modifiers:
-            raise ValueError(f'Key combination "{trigger}" repeats a modifier.')
-        modifiers.add(text[position])
-        position += 1
-    key = _HOTKEY_KEYS.get(text[position:].lower())
+    modifiers, key = _split_combination(trigger)
     if key is None:
         raise ValueError(
             f'Key combination "{trigger}" must end on a letter, a digit, a '
@@ -637,7 +625,30 @@ def normalize_hotkey(trigger: str) -> str:
             f'Key combination "{trigger}" needs Ctrl, Alt or Win, or Shift '
             "with a function key: anything less would stop that key typing."
         )
+    return _join_combination(modifiers, key)
+
+
+def _split_combination(text: str) -> tuple[set[str], str | None]:
+    """The modifiers of a combination and its key, None for a key not known here."""
+    stripped = text.strip()
+    position = 0
+    modifiers: set[str] = set()
+    while position < len(stripped) and stripped[position] in HOTKEY_MODIFIERS:
+        if stripped[position] in modifiers:
+            raise ValueError(f'Key combination "{text}" repeats a modifier.')
+        modifiers.add(stripped[position])
+        position += 1
+    return modifiers, _HOTKEY_KEYS.get(stripped[position:].lower())
+
+
+def _join_combination(modifiers: set[str], key: str) -> str:
     return "".join(symbol for symbol in HOTKEY_MODIFIERS if symbol in modifiers) + key
+
+
+def _combination_display(canonical: str) -> str:
+    names = [HOTKEY_MODIFIERS[symbol] for symbol in canonical if symbol in HOTKEY_MODIFIERS]
+    key = canonical.lstrip("".join(HOTKEY_MODIFIERS))
+    return "+".join([*names, key.upper() if len(key) == 1 else key])
 
 
 def hotkey_display(trigger: str) -> str:
@@ -650,9 +661,53 @@ def hotkey_display(trigger: str) -> str:
         canonical = normalize_hotkey(trigger)
     except ValueError:
         return trigger
-    names = [HOTKEY_MODIFIERS[symbol] for symbol in canonical if symbol in HOTKEY_MODIFIERS]
-    key = canonical.lstrip("".join(HOTKEY_MODIFIERS))
-    return "+".join([*names, key.upper() if len(key) == 1 else key])
+    return _combination_display(canonical)
+
+
+def normalize_key_press(value: str) -> str:
+    """The canonical spelling of a key an expansion presses, or ValueError.
+
+    The same notation as a trigger -- "^+n" for Ctrl+Shift+N -- but looser
+    about modifiers: a trigger without Ctrl, Alt or Win would swallow ordinary
+    typing, where pressing Tab, Shift+Tab or F5 from inside an expansion is the
+    whole point. Only a bare letter or digit is refused, because that is text
+    and belongs in the replacement itself.
+
+    Limited to the keys named here because the result is sent as "{name}": a
+    name AutoHotkey does not know would be typed as literal text, and the
+    expansion would silently gain a word instead of pressing something.
+    """
+    modifiers, key = _split_combination(value)
+    if key is None:
+        raise ValueError(
+            f'AHK_KEY "{value.strip()}" is not a key that can be pressed: use a '
+            "letter, a digit, a function key or a named key such as Enter or "
+            "PgUp, with ^ ! + # in front for Ctrl, Alt, Shift and Win."
+        )
+    if not modifiers and len(key) == 1:
+        raise ValueError(
+            f'AHK_KEY "{value.strip()}" is ordinary typing: put the character '
+            "in the text, or add a modifier such as ^ for Ctrl."
+        )
+    return _join_combination(modifiers, key)
+
+
+def key_press_display(value: str) -> str:
+    """A pressed key as the user reads it: "^+n" becomes "Ctrl+Shift+N"."""
+    try:
+        return _combination_display(normalize_key_press(value))
+    except ValueError:
+        return value
+
+
+def _key_press_send(value: str) -> str:
+    """What Send is given to press a canonical key: "^+n" becomes "^+{n}".
+
+    The key always goes in braces, a letter included, so one pattern covers
+    every key and the importer has one shape to read back.
+    """
+    key = value.lstrip("".join(HOTKEY_MODIFIERS))
+    return f"{value[: len(value) - len(key)]}{{{key}}}"
 
 
 def trigger_label(expansion: "Expansion") -> str:
@@ -1159,10 +1214,11 @@ def _reconstruct_replacement(lines: list[str], open_index: int) -> str | None:
             parts.append(f"{{AHK_SELECT:{var}|{prompt}|{title}|{'||'.join(options)}}}")
             i += 1
             continue
-        # Key press: SendEvent("{Tab}") followed by Sleep(...).
-        key = re.fullmatch(r'SendEvent\("\{(\w+)\}"\)', line)
+        # Key press: SendEvent("{Tab}") or SendEvent("^+{n}"), followed by
+        # Sleep(...).
+        key = re.fullmatch(r'SendEvent\("([\^!+#]*)\{(\w+)\}"\)', line)
         if key:
-            parts.append(f"{{AHK_KEY:{key.group(1)}}}")
+            parts.append(f"{{AHK_KEY:{key.group(1)}{key.group(2)}}}")
             i += 1
             if i < len(body) and body[i].startswith("Sleep("):
                 i += 1
@@ -1615,6 +1671,12 @@ def render_ahk(store: ExpansionStore, theme: str = DEFAULT_THEME) -> str:
     lines = [
         "#Requires AutoHotkey v2.0",
         "#SingleInstance Force",
+        # An expansion can press a key combination, and so can the paste
+        # helper (Ctrl+V). Without the hook a combination that is also some
+        # expansion's trigger would fire that expansion -- or, when it is the
+        # expansion's own trigger, fire itself without end. A hotkey handled
+        # by the keyboard hook ignores keys the script sends.
+        "#UseHook",
         "; Generated by AutoHotkey Text Expansion Manager.",
         "; Edit expansions.json through the GUI, then regenerate this file.",
         "",
@@ -1831,7 +1893,7 @@ def _form_parts_literal(segments: list[str | TemplatePlaceholder]) -> str:
         elif segment.kind in ("AHK_INPUT", "AHK_SELECT"):
             items.append(f'Map("var", {_ahk_string(segment.args[0])})')
         elif segment.kind == "AHK_KEY":
-            items.append(_ahk_string(f"[{segment.value}]"))
+            items.append(_ahk_string(f"[{key_press_display(segment.value)}]"))
         elif segment.kind == "AHK_IMAGE":
             items.append(_ahk_string("[image]"))
     return "[" + ", ".join(items) + "]"
@@ -1980,9 +2042,8 @@ def render_expansion(
                 lines.append(f"    __tem_result .= __tem_select_{variable}.value")
                 needs_select_helper = True
         elif segment.kind == "AHK_KEY":
-            key_name = segment.value
             flush_result()
-            lines.append(f"    SendEvent(\"{{{key_name}}}\")")
+            lines.append(f'    SendEvent("{_key_press_send(segment.value)}")')
             lines.append("    Sleep(100)")
         elif segment.kind == "AHK_IMAGE":
             image_path = segment.value
@@ -2229,7 +2290,7 @@ def _collect_placeholder_summary(
         elif segment.kind == "AHK_SELECT":
             found["List selections"] += 1
         elif segment.kind == "AHK_KEY":
-            found["Keystrokes"].append(segment.value)
+            found["Keystrokes"].append(key_press_display(segment.value))
         elif segment.kind == "AHK_IMAGE":
             found["Images"].append(segment.value)
 
@@ -2376,13 +2437,9 @@ def _parse_placeholder(kind: str, body: str) -> TemplatePlaceholder:
         return TemplatePlaceholder(kind, body, [variable, prompt, title, *options])
 
     if kind == "AHK_KEY":
-        key_name = body.strip()
-        if not key_name:
+        if not body.strip():
             raise ValueError("AHK_KEY requires a key name.")
-        if key_name not in SUPPORTED_KEYS:
-            supported = ", ".join(sorted(SUPPORTED_KEYS))
-            raise ValueError(f"AHK_KEY currently supports only {supported}.")
-        return TemplatePlaceholder(kind, key_name, [])
+        return TemplatePlaceholder(kind, normalize_key_press(body), [])
 
     if kind == "AHK_IMAGE":
         image_path = body.strip()
